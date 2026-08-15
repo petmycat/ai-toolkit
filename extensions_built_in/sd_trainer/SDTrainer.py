@@ -342,6 +342,7 @@ class SDTrainer(BaseSDTrainProcess):
             te_alpha=te_config.alpha,
             te_dropout=te_config.dropout,
             te_target_modules=getattr(te_config, 'target_modules', te_config.child_modules),
+            te_parent_modules=getattr(te_config, 'parent_modules', ()),
             te_layers=te_config.layers,
             tap_layers=tap_config.tap_layers,
             tap_rank=tap_config.rank,
@@ -373,9 +374,13 @@ class SDTrainer(BaseSDTrainProcess):
         }
         configured_paths = [path for path in component_paths.values() if path is not None]
         if configured_paths:
+            te_artifact_module = getattr(self.text_activator, 'te_adapter_artifact_module', None)
+            te_artifact_module = (
+                te_artifact_module() if callable(te_artifact_module) else self.text_activator.te_adapter
+            )
             component_modules = {
                 'embedding': self.text_activator.embedding,
-                'te_adapter': self.text_activator.te_adapter,
+                'te_adapter': te_artifact_module,
                 'tap_adapters': self.text_activator.tap_adapters,
             }
             for name, checkpoint in component_paths.items():
@@ -447,6 +452,10 @@ class SDTrainer(BaseSDTrainProcess):
                 ),
                 self.text_activator,
             )
+        module_lora_installer = getattr(self.text_activator, 'install_module_lora', None)
+        language_model = getattr(getattr(self.sd, 'text_encoder', None), 'language_model', None)
+        if callable(module_lora_installer) and language_model is not None:
+            module_lora_installer(language_model)
         self._load_activator_source(modules)
         installer = getattr(self.sd, 'install_text_activator', None) or getattr(self.sd, 'set_text_activator', None)
         if not callable(installer):
@@ -2171,6 +2180,9 @@ class SDTrainer(BaseSDTrainProcess):
         config = self._conditional_response_config()
         loss_module = self._load_trigger_binding_modules()['losses']
         source_weights = self._phase_caption_source_weights() or {'primary': 1.0}
+        if self.runtime_phase == 'a1' and source_weights != {'primary': 1.0}:
+            structured_name = 'structured' if 'structured' in source_weights else next(iter(source_weights))
+            source_weights = {structured_name: 1.0}
         if source_weights == {'primary': 1.0}:
             source_prompts = {'primary': [
                 getattr(item, 'caption_template', None) or item.raw_caption
@@ -2182,18 +2194,31 @@ class SDTrainer(BaseSDTrainProcess):
                 for name in source_weights
             }
         target = shared_loss_target(self, noise, batch, timesteps)
-        rhos = self._v8_response_rhos(config)
+        configured_rhos = self._v8_response_rhos(config)
+        rho_schedule = config.get('rho_schedule')
+        if self.runtime_phase == 'a1' and rho_schedule:
+            configured_rhos['trigger'] = loss_module.interpolate_schedule(
+                rho_schedule.get('keyframes', []),
+                self.step_num,
+                rho_schedule.get('interpolation', 'smoothstep'),
+            )
+        category_names = (
+            ('trigger', 'hard', 'neutral', 'far')
+            if self.runtime_phase == 'b'
+            else ('trigger',)
+        )
+        rhos = {name: configured_rhos[name] for name in category_names}
         category_phrases = config.get('category_phrases', {})
-        category_predictions = {name: [] for name in rhos}
-        category_bases = {name: [] for name in rhos}
-        category_targets = {name: [] for name in rhos}
+        category_predictions = {name: [] for name in category_names}
+        category_bases = {name: [] for name in category_names}
+        category_targets = {name: [] for name in category_names}
         source_objectives = {}
         source_local_alphas = {}
         metrics = {}
         for source_name, templates in source_prompts.items():
             source_losses = []
             source_trigger_alphas = []
-            for category_name in ('trigger', 'hard', 'neutral', 'far'):
+            for category_name in category_names:
                 if category_name == 'trigger':
                     prompts = list(templates)
                 else:
@@ -2273,13 +2298,14 @@ class SDTrainer(BaseSDTrainProcess):
         aggregate, _, effective_weights = loss_module.aggregate_paired_source_losses(
             source_objectives, source_weights
         )
-        reference_prediction = torch.cat(category_predictions['neutral'], dim=0)
-        reference_base = torch.cat(category_bases['neutral'], dim=0)
-        reference_target = torch.cat(category_targets['neutral'], dim=0)
+        reference_category = 'neutral' if self.runtime_phase == 'b' else 'trigger'
+        reference_prediction = torch.cat(category_predictions[reference_category], dim=0)
+        reference_base = torch.cat(category_bases[reference_category], dim=0)
+        reference_target = torch.cat(category_targets[reference_category], dim=0)
         shared_direction = (reference_target - reference_base).detach().mean(dim=0)
         shared_alphas = {}
         off_direction = []
-        for category_name in rhos:
+        for category_name in category_names:
             diagnostics = loss_module.causal_response_decomposition(
                 torch.cat(category_predictions[category_name], dim=0),
                 torch.cat(category_bases[category_name], dim=0),
@@ -2291,11 +2317,15 @@ class SDTrainer(BaseSDTrainProcess):
             metrics[f'{self.runtime_phase}/category/{category_name}/alpha_shared'] = float(
                 diagnostics.alpha.detach().mean().item()
             )
-        hierarchy = loss_module.adjacent_response_hierarchy_loss(
-            shared_alphas,
-            margins=config.get('hierarchy_margins', 0.0),
-            mode=config.get('hierarchy_mode', 'soft'),
-        )
+        if self.runtime_phase == 'b':
+            hierarchy = loss_module.adjacent_response_hierarchy_loss(
+                shared_alphas,
+                margins=config.get('hierarchy_margins', 0.0),
+                mode=config.get('hierarchy_mode', 'soft'),
+            )
+            hierarchy_loss = hierarchy.loss
+        else:
+            hierarchy_loss = aggregate.new_zeros(())
         response_weight = float(config.get('response_weight', 1.0))
         hierarchy_weight = float(config.get('hierarchy_weight', 0.05 if self.runtime_phase == 'b' else 0.0))
         omega_weight = float(config.get('omega_weight', 0.01))
@@ -2330,14 +2360,14 @@ class SDTrainer(BaseSDTrainProcess):
         per_item = response_weight * aggregate
         loss = (
             per_item.mean()
-            + hierarchy_weight * hierarchy.loss
+            + hierarchy_weight * hierarchy_loss
             + omega_weight * torch.stack(off_direction).mean()
             + alpha_floor_weight * alpha_floor_loss
             + consistency_weight * consistency_loss
             + gamma_regularization_weight * gamma_regularization
         )
         metrics[f'{self.runtime_phase}/response_objective'] = float(aggregate.detach().mean().item())
-        metrics[f'{self.runtime_phase}/hierarchy_loss'] = float(hierarchy.loss.detach().item())
+        metrics[f'{self.runtime_phase}/hierarchy_loss'] = float(hierarchy_loss.detach().item())
         metrics[f'{self.runtime_phase}/off_direction_loss'] = float(torch.stack(off_direction).detach().mean().item())
         metrics[f'{self.runtime_phase}/alpha_floor_loss'] = float(alpha_floor_loss.detach().item())
         metrics[f'{self.runtime_phase}/effect_consistency_loss'] = float(consistency_loss.detach().item())
@@ -3596,9 +3626,13 @@ class SDTrainer(BaseSDTrainProcess):
         if self.step_num < self._phase_config().steps:
             output_dir = os.path.join(output_dir, str(self.step_num))
         os.makedirs(output_dir, exist_ok=True)
+        te_artifact_module = getattr(self.text_activator, 'te_adapter_artifact_module', None)
+        te_artifact_module = (
+            te_artifact_module() if callable(te_artifact_module) else self.text_activator.te_adapter
+        )
         component_specs = (
             ('embedding', self.text_activator.embedding, artifact_config.embedding_filename),
-            ('te_adapter', self.text_activator.te_adapter, artifact_config.te_adapter_filename),
+            ('te_adapter', te_artifact_module, artifact_config.te_adapter_filename),
             ('tap_adapter', self.text_activator.tap_adapters, artifact_config.tap_adapter_filename),
         )
         for artifact_type, component, filename in component_specs:

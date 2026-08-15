@@ -2581,7 +2581,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # if is even step and we have a reg dataset, use that
                 # todo improve this logic to send one of each through if we can buckets and batch size might be an issue
                 is_reg_step = False
-                is_save_step = self.save_config.save_every and self.step_num % self.save_config.save_every == 0
+                configured_save_steps = set(getattr(self.save_config, 'save_steps', ()) or ())
+                is_save_step = (
+                    self.step_num in configured_save_steps
+                    if configured_save_steps
+                    else bool(self.save_config.save_every and self.step_num % self.save_config.save_every == 0)
+                )
                 is_sample_step = (
                     self.sample_config.sample_every
                     and self.step_num >= self.sample_config.sample_start_step
