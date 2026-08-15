@@ -453,6 +453,7 @@ class ThreePhaseRuntimeTest(unittest.TestCase):
             trainer._check_first_trigger_gradient(loss, torch.ones(1), torch.zeros(1))
         self.assertEqual(len(calls), 1)
         self.assertTrue(calls[0][1]['raise_on_error'])
+        self.assertTrue(calls[0][1]['require_output_difference'])
 
         trainer._trigger_gradient_reachability_checked = False
         fake_module.check_gradient_reachability = lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError('unreachable'))
@@ -460,6 +461,24 @@ class ThreePhaseRuntimeTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'unreachable'):
                 trainer._check_first_trigger_gradient(loss, torch.ones(1), torch.zeros(1))
         self.assertFalse(trainer._trigger_gradient_reachability_checked)
+
+    def test_v8_zero_initialized_reachability_does_not_require_initial_output_difference(self):
+        trainer = self._trainer('a1')
+        trainer.three_phase_trigger_training.schema_version = 8
+        trainer.three_phase_trigger_training.objective_mode = 'conditional_response_v8'
+        trainer.params = list(trainer.text_activator.parameters())
+        trainer.optimizer = torch.optim.SGD(trainer.params, lr=0.1)
+        trainer._trigger_gradient_reachability_checked = False
+        loss = trainer.text_activator.embedding.weight.square().mean()
+        calls = []
+        fake_module = SimpleNamespace(
+            check_gradient_reachability=lambda *args, **kwargs: calls.append(kwargs)
+        )
+        with patch('importlib.import_module', return_value=fake_module):
+            trainer._check_first_trigger_gradient(loss, torch.ones(1), torch.ones(1))
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(calls[0]['require_output_difference'])
+        self.assertTrue(calls[0]['raise_on_error'])
 
     def test_context_enabled_fails_fast_without_paired_sources(self):
         trainer = self._trainer('a2')
