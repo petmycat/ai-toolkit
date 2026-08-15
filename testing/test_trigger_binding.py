@@ -192,6 +192,31 @@ class TriggerBindingTest(unittest.TestCase):
             [0, 0, 0, 0, 1, 1, 1, 1],
         )
 
+    def test_virtual_token_expansion_reserves_space_before_tokenizer_truncation(self):
+        raw_text = "[trigger]" + ("x" * 40)
+        binding = bind_trigger_prompt(
+            self.tokenizer,
+            raw_text,
+            self.literal,
+            max_length=20,
+            require_atomic=True,
+            virtual_tokens=4,
+        )
+        self.assertEqual(len(binding.input_ids), 20)
+        self.assertEqual(sum(binding.trigger_mask), 4)
+        self.assertEqual(len(binding.token_indices), 4)
+
+    def test_virtual_token_reservation_still_rejects_truncated_trigger(self):
+        with self.assertRaises(TriggerTruncationError):
+            bind_trigger_prompt(
+                self.tokenizer,
+                ("x" * 40) + "[trigger]",
+                self.literal,
+                max_length=20,
+                require_atomic=True,
+                virtual_tokens=4,
+            )
+
     def test_runtime_metadata_is_json_serializable(self):
         batch = bind_trigger_batch(
             self.tokenizer,

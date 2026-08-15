@@ -365,7 +365,17 @@ def bind_trigger_prompt(
             "chat template changed or duplicated literal-trigger occurrences; offset mapping is ambiguous"
         )
 
-    tokenizer_max_length = max_length if virtual_tokens == 1 else None
+    selected_occurrence_count = (
+        resolved.occurrence_count if mask_all_occurrences else min(1, resolved.occurrence_count)
+    )
+    expansion_slots = selected_occurrence_count * (virtual_tokens - 1)
+    tokenizer_max_length = max_length
+    if max_length is not None and expansion_slots:
+        tokenizer_max_length = max_length - expansion_slots
+        if tokenizer_max_length < selected_occurrence_count:
+            raise TriggerTruncationError(
+                "max_length cannot fit the configured virtual trigger tokens"
+            )
     input_ids, attention_mask, offsets = _tokenize_with_offsets(
         tokenizer, rendered, tokenizer_max_length
     )
