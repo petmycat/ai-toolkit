@@ -1,7 +1,23 @@
+import copy
 import os
 import torch
 from safetensors import safe_open
 from safetensors.torch import load_file, save_file
+
+
+def _transform_value(value, tensor_transform):
+    if isinstance(value, torch.Tensor):
+        return tensor_transform(value)
+    if isinstance(value, list):
+        return [_transform_value(item, tensor_transform) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_transform_value(item, tensor_transform) for item in value)
+    if isinstance(value, dict):
+        return {
+            key: _transform_value(item, tensor_transform)
+            for key, item in value.items()
+        }
+    return copy.deepcopy(value)
 
 
 class AdvancedPromptEmbeds:
@@ -100,25 +116,29 @@ class AdvancedPromptEmbeds:
         new_pe._frozen_dtype_keys = list(self._frozen_dtype_keys)
         for key, value in self._store.items():
             if key in frozen:
-                new_pe._store[key] = [
-                    v.to(*no_dtype_args, **no_dtype_kwargs) for v in value
-                ]
+                new_pe._store[key] = _transform_value(
+                    value,
+                    lambda tensor: tensor.to(*no_dtype_args, **no_dtype_kwargs),
+                )
             else:
-                new_pe._store[key] = [v.to(*args, **kwargs) for v in value]
+                new_pe._store[key] = _transform_value(
+                    value,
+                    lambda tensor: tensor.to(*args, **kwargs),
+                )
         return new_pe
 
     def detach(self):
         new_pe = AdvancedPromptEmbeds()
         new_pe._frozen_dtype_keys = list(self._frozen_dtype_keys)
         for key, value in self._store.items():
-            new_pe._store[key] = [v.detach() for v in value]
+            new_pe._store[key] = _transform_value(value, lambda tensor: tensor.detach())
         return new_pe
 
     def clone(self):
         new_pe = AdvancedPromptEmbeds()
         new_pe._frozen_dtype_keys = list(self._frozen_dtype_keys)
         for key, value in self._store.items():
-            new_pe._store[key] = [v.clone() for v in value]
+            new_pe._store[key] = _transform_value(value, lambda tensor: tensor.clone())
         return new_pe
 
     def expand_to_batch(self, batch_size):
