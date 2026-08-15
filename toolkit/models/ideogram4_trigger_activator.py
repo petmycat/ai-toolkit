@@ -314,7 +314,14 @@ class MaskedModuleLoRA(nn.Module):
         token_mask: Optional[Tensor] = None,
         gamma: Optional[Tensor] = None,
     ) -> Tensor:
-        if not self.active:
+        runtime_mode = _runtime_value("runtime_mode")
+        runtime_active = None
+        if runtime_mode is not None:
+            runtime = _runtime_module()
+            resolver = getattr(runtime, "get_activator_runtime_state", None)
+            if callable(resolver):
+                runtime_active = bool(resolver(runtime_mode).internal_enabled)
+        if not (self.active if runtime_active is None else runtime_active):
             return module_output
         mask = _normalize_mask(
             token_mask if token_mask is not None else _runtime_value("token_mask"), module_output
