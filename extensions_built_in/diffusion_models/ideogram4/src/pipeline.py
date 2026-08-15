@@ -331,14 +331,39 @@ def get_qwen3_vl_features(
         )
         for layer_idx, decoder_layer in enumerate(language_model.layers):
             if use_gradient_checkpointing:
-                def layer_forward(states, layer=decoder_layer):
-                    return layer(
-                        states,
-                        attention_mask=causal_mask,
-                        position_ids=text_position_ids,
-                        past_key_values=None,
-                        position_embeddings=position_embeddings,
-                    )
+                checkpoint_mode = runtime_mode
+                checkpoint_mask = trigger_mask
+                checkpoint_indices = token_indices
+                checkpoint_metadata = runtime_metadata
+
+                def layer_forward(
+                    states,
+                    layer=decoder_layer,
+                    mode=checkpoint_mode,
+                    mask=checkpoint_mask,
+                    indices=checkpoint_indices,
+                    metadata=checkpoint_metadata,
+                ):
+                    # Non-reentrant checkpoint recomputation happens after the
+                    # surrounding branch context has exited. Re-enter the exact
+                    # activator state so module-LoRA hooks save the same tensors.
+                    with _activator_runtime_context(
+                        text_activator,
+                        mode,
+                        mask,
+                        token_indices=indices,
+                        runtime_metadata=metadata,
+                    ):
+                        setter = getattr(text_activator, "set_runtime_mode", None)
+                        if callable(setter):
+                            setter(mode)
+                        return layer(
+                            states,
+                            attention_mask=causal_mask,
+                            position_ids=text_position_ids,
+                            past_key_values=None,
+                            position_embeddings=position_embeddings,
+                        )
 
                 hidden_states = checkpoint(
                     layer_forward,

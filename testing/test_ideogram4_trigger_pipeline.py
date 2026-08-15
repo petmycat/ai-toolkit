@@ -14,8 +14,12 @@ class _FakeRotary(nn.Module):
 
 
 class _FakeLayer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.scale = nn.Parameter(torch.ones(()))
+
     def forward(self, hidden_states, **kwargs):
-        return hidden_states
+        return hidden_states * self.scale
 
 
 class _FakeLanguageModel(nn.Module):
@@ -127,6 +131,32 @@ class Ideogram4TriggerPipelineTest(unittest.TestCase):
         self.assertIn("full", activator.runtime_modes)
         self.assertTrue(torch.equal(features[0, 1, :2], torch.tensor([1.0, 1.0])))
         self.assertTrue(torch.equal(features[0, 2, :2], torch.tensor([2.0, 2.0])))
+
+    def test_gradient_checkpoint_recomputation_restores_branch_runtime_mode(self):
+        text_encoder = _FakeTextEncoder()
+        text_encoder.is_gradient_checkpointing = True
+        activator = _FakeActivator()
+        token_ids = torch.tensor([[5, 99, 6]])
+        attention_mask = torch.ones_like(token_ids)
+        trigger_mask = torch.tensor([[0, 1, 0]], dtype=torch.bool)
+        token_indices = torch.tensor([[0, 0, 0]])
+        pos_2d = torch.arange(3).unsqueeze(0)
+
+        features = self.pipeline.get_qwen3_vl_features(
+            text_encoder,
+            token_ids,
+            attention_mask,
+            pos_2d,
+            trigger_mask=trigger_mask,
+            token_indices=token_indices,
+            text_activator=activator,
+            runtime_mode="full",
+        )
+        activator.set_runtime_mode("activator_bypass")
+        features.sum().backward()
+
+        self.assertGreaterEqual(activator.runtime_modes.count("full"), 2)
+        self.assertIsNotNone(text_encoder.language_model.layers[0].scale.grad)
 
     def test_plain_path_without_activator_is_unchanged(self):
         text_encoder = _FakeTextEncoder()
