@@ -1975,6 +1975,11 @@ class SDTrainer(BaseSDTrainProcess):
         if getattr(self, '_trigger_gradient_reachability_checked', False):
             return
         reachability = importlib.import_module('toolkit.trigger_reachability')
+        schema_version = getattr(self.three_phase_trigger_training, 'schema_version', 7)
+        objective_mode = getattr(self.three_phase_trigger_training, 'objective_mode', None)
+        zero_initialized_v8 = bool(
+            schema_version == 8 and objective_mode == 'conditional_response_v8'
+        )
         reachability.check_gradient_reachability(
             self.text_activator,
             self.network,
@@ -1984,7 +1989,11 @@ class SDTrainer(BaseSDTrainProcess):
             loss=loss,
             active_output=active_pred,
             bypass_output=bypass_pred,
-            require_output_difference=self.runtime_phase != 'b',
+            # Standard LoRA initializes the up projection to zero and the
+            # learned embedding starts from its frozen initializer. At step 0,
+            # v8 active/bypass outputs may therefore be exactly equal even
+            # though real, finite gradients already reach every component.
+            require_output_difference=(self.runtime_phase != 'b' and not zero_initialized_v8),
             raise_on_error=True,
         )
         self._trigger_gradient_reachability_checked = True
