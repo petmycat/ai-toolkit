@@ -22,7 +22,8 @@ else:
 
 class SaveConfig:
     def __init__(self, **kwargs):
-        self.save_every: int = kwargs.get('save_every', 1000)
+        self.save_every: Optional[int] = kwargs.get('save_every', 1000)
+        self.save_steps: List[int] = [int(step) for step in kwargs.get('save_steps', [])]
         self.dtype: str = kwargs.get('dtype', 'float16')
         self.max_step_saves_to_keep: int = kwargs.get('max_step_saves_to_keep', 5)
         self.save_format: SaveFormat = kwargs.get('save_format', 'safetensors')
@@ -906,6 +907,28 @@ def validate_three_phase_trigger_training_config(
     )
 
     phases = {name: config.get_phase(name) for name in config.PHASE_NAMES}
+    if is_v8:
+        a1_sources = phases['a1'].caption_sources or {}
+        if a1_sources.get('enabled', False):
+            a1_source_names = [
+                str(source.get('name', '')).strip().lower()
+                for source in a1_sources.get('sources', [])
+            ]
+            if len(a1_source_names) != 1 or a1_source_names[0] not in ('structured', 'json'):
+                raise ValueError(
+                    'three_phase_trigger_training.phase_a1.caption_sources must contain only '
+                    'the structured/json source; natural captions are introduced in phase_a2'
+                )
+        a1_response = phases['a1'].losses.get('conditional_response_v8', {})
+        configured_a1_categories = set(
+            a1_response.get('responses', a1_response.get('categories', {}))
+        )
+        invalid_a1_categories = configured_a1_categories - {'trigger'}
+        if invalid_a1_categories:
+            raise ValueError(
+                'three_phase_trigger_training.phase_a1 conditional response supports only '
+                'the trigger category; hard, neutral and far belong to phase_b'
+            )
     enabled_phases = {name: phase.enabled for name, phase in phases.items()}
     execution_phases = config.execution_phase_names() if is_v8 else config.PHASE_NAMES
     if not is_v8 and not all(enabled_phases.values()):

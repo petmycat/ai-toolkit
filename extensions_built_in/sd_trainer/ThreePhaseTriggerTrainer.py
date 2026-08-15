@@ -249,7 +249,14 @@ class ThreePhaseTriggerTrainer(BaseExtensionProcess):
         child['train']['optimizer_params'] = copy.deepcopy(phase.optimizer_params)
         child['save'] = copy.deepcopy(child.get('save', {}))
         if phase.save_steps:
-            child['save']['save_every'] = min(phase.save_steps)
+            child['save']['save_steps'] = list(phase.save_steps)
+            child['save']['save_every'] = None
+        if self.three_phase_config.schema_version == 8 and self.three_phase_config.data_split.enabled:
+            for dataset in child.get('datasets', []):
+                if dataset.get('is_reg', False):
+                    continue
+                dataset['trigger_data_split_manifest'] = self.three_phase_config.data_split.manifest_path
+                dataset['trigger_data_split_name'] = 'train'
 
         learning_rate_aliases = {
             'lr': 'lr',

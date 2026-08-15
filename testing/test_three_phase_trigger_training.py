@@ -280,6 +280,34 @@ class ThreePhaseTriggerTrainingConfigTest(unittest.TestCase):
         validate_three_phase_trigger_training_config(config, '<r1X1dOn9mA2>')
         self.assertEqual(config.execution_phase_names(), ('a1',))
 
+    def test_v8_a1_rejects_natural_caption_source(self):
+        raw = _v8_block('a1', 'a1')
+        raw['phase_a1']['caption_sources']['sources'].append({
+            'name': 'natural',
+            'path': '/tmp/natural',
+            'caption_ext': '.txt',
+            'format': 'text',
+        })
+        with self.assertRaisesRegex(ValueError, 'natural captions are introduced in phase_a2'):
+            validate_three_phase_trigger_training_config(
+                ThreePhaseTriggerTrainingConfig(**raw), '<r1X1dOn9mA2>'
+            )
+
+    def test_v8_a1_rejects_hierarchy_response_categories(self):
+        raw = _v8_block('a1', 'a1')
+        raw['phase_a1']['losses'] = {
+            'conditional_response_v8': {
+                'responses': {
+                    'trigger': {'rho': 1.0},
+                    'hard': {'rho': 0.55},
+                },
+            },
+        }
+        with self.assertRaisesRegex(ValueError, 'hard, neutral and far belong to phase_b'):
+            validate_three_phase_trigger_training_config(
+                ThreePhaseTriggerTrainingConfig(**raw), '<r1X1dOn9mA2>'
+            )
+
     def test_v8_b_only_accepts_external_a1_artifact(self):
         raw = _v8_block('b', 'b')
         raw['phase_a1']['enabled'] = False
@@ -383,6 +411,8 @@ class ThreePhaseTriggerTrainerTest(unittest.TestCase):
             self.assertEqual(child['train']['optimizer'], 'adamw')
             self.assertAlmostEqual(child['train']['embedding_lr'], 0.0001)
             self.assertTrue(child['train']['train_embedding'])
+            self.assertEqual(child['save']['save_steps'], [4, 8])
+            self.assertIsNone(child['save']['save_every'])
             runtime = child['three_phase_trigger_training']['runtime']
             self.assertEqual(runtime['active_phase'], 'a2')
             self.assertTrue(runtime['orchestrated'])

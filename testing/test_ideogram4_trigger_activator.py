@@ -189,6 +189,54 @@ class Ideogram4TriggerActivatorTest(unittest.TestCase):
         self.assertFalse(torch.equal(activated[:, 0], hidden[:, 0]))
         self.assertTrue(torch.equal(activated[:, 1], hidden[:, 1]))
 
+    def test_module_lora_respects_parent_module_filter(self):
+        qwen = _FakeLanguageModel(4, layers=2)
+        activator = TextActivator(
+            4,
+            te_adapter_mode="module_lora",
+            te_rank=2,
+            te_target_modules=("down_proj",),
+            te_parent_modules=("_FakeMLP",),
+        )
+        activator.install_module_lora(qwen)
+        self.assertEqual(len(activator.module_lora_adapters), 2)
+
+        rejected = TextActivator(
+            4,
+            te_adapter_mode="module_lora",
+            te_rank=2,
+            te_target_modules=("down_proj",),
+            te_parent_modules=("OtherMLP",),
+        )
+        with self.assertRaisesRegex(ValueError, "no target modules"):
+            rejected.install_module_lora(qwen)
+
+    def test_module_lora_artifact_module_round_trips(self):
+        source_model = _FakeLanguageModel(4, layers=2)
+        source = TextActivator(
+            4,
+            te_adapter_mode="module_lora",
+            te_rank=2,
+            te_target_modules=("down_proj",),
+        )
+        source.install_module_lora(source_model)
+        for parameter in source.module_lora_adapters.parameters():
+            parameter.data.uniform_(-0.5, 0.5)
+        state = source.te_adapter_artifact_module().state_dict()
+
+        clone_model = _FakeLanguageModel(4, layers=2)
+        clone = TextActivator(
+            4,
+            te_adapter_mode="module_lora",
+            te_rank=2,
+            te_target_modules=("down_proj",),
+        )
+        clone.install_module_lora(clone_model)
+        clone.te_adapter_artifact_module().load_state_dict(state, strict=True)
+
+        for key, tensor in state.items():
+            torch.testing.assert_close(clone.te_adapter_artifact_module().state_dict()[key], tensor)
+
     def test_qwen_internal_hooks_apply_and_are_removable(self):
         qwen = _FakeQwen(4)
         activator = TextActivator(4)

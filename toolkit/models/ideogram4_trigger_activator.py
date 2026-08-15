@@ -385,6 +385,7 @@ class TextActivator(nn.Module):
         te_alpha: Optional[float] = None,
         te_dropout: float = 0.0,
         te_target_modules: Sequence[str] = ("down_proj",),
+        te_parent_modules: Sequence[str] = (),
         te_layers: Any = "all",
         tap_layers: Sequence[int] = DEFAULT_TAP_LAYERS,
         tap_rank: int = 1,
@@ -419,6 +420,7 @@ class TextActivator(nn.Module):
         self.te_alpha = float(te_rank if te_alpha is None else te_alpha)
         self.te_dropout = float(te_dropout)
         self.te_target_modules = tuple(str(name) for name in te_target_modules)
+        self.te_parent_modules = tuple(str(name) for name in te_parent_modules)
         self.te_layers = te_layers
         self.module_lora_adapters = nn.ModuleDict()
         self._module_lora_installed_on: Optional[int] = None
@@ -596,12 +598,22 @@ class TextActivator(nn.Module):
         for layer_idx in self._selected_te_layers(len(layers)):
             layer = layers[layer_idx]
             matched = 0
-            for module_name, module in layer.named_modules():
+            module_lookup = dict(layer.named_modules())
+            for module_name, module in module_lookup.items():
                 if not isinstance(module, nn.Linear):
                     continue
                 leaf = module_name.rsplit(".", 1)[-1]
                 if leaf not in self.te_target_modules:
                     continue
+                if self.te_parent_modules:
+                    parent_name = module_name.rsplit(".", 1)[0] if "." in module_name else ""
+                    parent = module_lookup.get(parent_name, layer if not parent_name else None)
+                    if parent is None or not any(
+                        parent.__class__.__name__ == expected
+                        or f"{parent.__class__.__module__}.{parent.__class__.__name__}" == expected
+                        for expected in self.te_parent_modules
+                    ):
+                        continue
                 key = f"layer_{layer_idx}__{module_name.replace('.', '__')}"
                 adapter = MaskedModuleLoRA(
                     module.in_features,
@@ -635,6 +647,11 @@ class TextActivator(nn.Module):
             handle.remove()
         self._module_lora_handles.clear()
         self._module_lora_installed_on = None
+
+    def te_adapter_artifact_module(self) -> Optional[nn.Module]:
+        if self.te_adapter_mode == "module_lora":
+            return self.module_lora_adapters
+        return self.te_adapter
 
     def parameter_groups(self, learning_rates: Optional[Mapping[str, float]] = None) -> List[Dict[str, Any]]:
         learning_rates = learning_rates or {}
