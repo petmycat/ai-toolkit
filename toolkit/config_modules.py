@@ -625,6 +625,7 @@ class SemanticScaffoldCalibrationConfig:
         )
         self.min_mean_gain = float(kwargs.get('min_mean_gain', -1.0e9))
         self.max_mean_gain_regression = float(kwargs.get('max_mean_gain_regression', 1.0e9))
+        self.min_pairwise_compatibility = float(kwargs.get('min_pairwise_compatibility', -1.0))
         self.probe_limit = int(kwargs.get('probe_limit', 0))
         self.noise_seeds = [int(value) for value in kwargs.get('noise_seeds', [])]
         self.fixed_timesteps = [int(value) for value in kwargs.get('fixed_timesteps', [])]
@@ -1112,6 +1113,8 @@ def validate_three_phase_trigger_training_config(
                 raise ValueError('semantic scaffold calibration.min_conditioning_relative_rms must be finite and non-negative')
             if not -1.0 <= calibration.min_conditioning_direction_consistency <= 1.0:
                 raise ValueError('semantic scaffold calibration.min_conditioning_direction_consistency must be in [-1, 1]')
+            if not -1.0 <= calibration.min_pairwise_compatibility <= 1.0:
+                raise ValueError('semantic scaffold calibration.min_pairwise_compatibility must be in [-1, 1]')
             if not calibration.noise_seeds:
                 raise ValueError('semantic scaffold calibration.noise_seeds must not be empty')
             if bool(calibration.fixed_timesteps) == bool(calibration.fixed_sigmas):

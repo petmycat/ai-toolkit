@@ -63,6 +63,38 @@ class SemanticScaffoldCalibrationTest(unittest.TestCase):
         )
         self.assertEqual(result['selected_helpers'], ['Ghibli anime'])
 
+    def test_helper_selection_reports_compatibility_and_rejects_conflicting_pair(self):
+        records = {
+            'good': [
+                {'split': 'train', 'gain': 0.1, 'conditioning_relative_rms': 1.0},
+                {'split': 'heldout', 'gain': 0.1, 'conditioning_relative_rms': 1.0},
+            ],
+            'conflict': [
+                {'split': 'train', 'gain': 0.0, 'conditioning_relative_rms': 1.0},
+                {'split': 'heldout', 'gain': 0.0, 'conditioning_relative_rms': 1.0},
+            ],
+        }
+        result = select_helpers(
+            records,
+            min_median_gain=-1.0,
+            min_positive_fraction=0.0,
+            min_heldout_positive_fraction=0.0,
+            min_p10_gain=-1.0,
+            max_train_heldout_gap=1.0,
+            max_helpers=2,
+            sampling_floor=0.05,
+            selection_mode='conditioning_space',
+            min_conditioning_relative_rms=0.0,
+            min_conditioning_direction_consistency=-1.0,
+            min_pairwise_compatibility=0.5,
+            helper_conditioning_vectors={
+                'good': [torch.tensor([1.0, 0.0]), torch.tensor([1.0, 0.0])],
+                'conflict': [torch.tensor([-1.0, 0.0]), torch.tensor([-1.0, 0.0])],
+            },
+        )
+        self.assertEqual(result['selected_helpers'], ['good'])
+        self.assertAlmostEqual(result['compatibility_matrix']['good||conflict'], -1.0)
+
     def test_helper_selection_requires_both_splits_and_applies_thresholds(self):
         records = {
             'good': [

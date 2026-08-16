@@ -166,17 +166,52 @@ def summarize_gains(values: Sequence[float]) -> Dict[str, float]:
     }
 
 
-def _conditioning_summary(records: Sequence[Mapping[str, Any]]) -> Dict[str, float]:
+def _pairwise_cosine(vectors: Sequence[torch.Tensor]) -> float:
+    if len(vectors) < 2:
+        return 0.0
+    normalized = []
+    for vector in vectors:
+        vector = vector.float().reshape(-1)
+        norm = torch.linalg.vector_norm(vector)
+        if float(norm.item()) <= 1.0e-12:
+            continue
+        normalized.append(vector / norm)
+    if len(normalized) < 2:
+        return 0.0
+    stacked = torch.stack(normalized)
+    count = stacked.shape[0]
+    resultant = stacked.sum(dim=0)
+    value = (resultant.square().sum() - count) / (count * (count - 1))
+    return float(value.detach().cpu().item())
+
+
+def _conditioning_summary(
+    records: Sequence[Mapping[str, Any]],
+    conditioning_vectors: Optional[Sequence[torch.Tensor]] = None,
+) -> Dict[str, float]:
     rms_values = [float(record['conditioning_relative_rms']) for record in records if 'conditioning_relative_rms' in record]
-    consistency_values = [float(record['conditioning_direction_consistency']) for record in records if 'conditioning_direction_consistency' in record]
-    if not rms_values or not consistency_values:
-        return {'count': 0, 'mean_relative_rms': 0.0, 'median_relative_rms': 0.0, 'mean_direction_consistency': -1.0}
+    if not rms_values:
+        return {'count': 0, 'mean_relative_rms': 0.0, 'median_relative_rms': 0.0, 'pairwise_direction_consistency': 0.0}
+    if conditioning_vectors:
+        consistency = _pairwise_cosine(conditioning_vectors)
+    else:
+        consistency_values = [
+            float(record['conditioning_direction_consistency'])
+            for record in records
+            if 'conditioning_direction_consistency' in record
+        ]
+        consistency = statistics.fmean(consistency_values) if consistency_values else 0.0
     return {
         'count': len(rms_values),
         'mean_relative_rms': statistics.fmean(rms_values),
         'median_relative_rms': statistics.median(rms_values),
-        'mean_direction_consistency': statistics.fmean(consistency_values),
+        'pairwise_direction_consistency': consistency,
     }
+
+
+def _record_stats(records: Sequence[Mapping[str, Any]], field: str) -> Dict[str, float]:
+    values = [float(record[field]) for record in records if field in record]
+    return summarize_gains(values) if values else {'count': 0, 'mean': 0.0, 'median': 0.0, 'p10': 0.0, 'p90': 0.0, 'std': 0.0, 'positive_fraction': 0.0}
 
 
 def select_helpers(
@@ -194,24 +229,40 @@ def select_helpers(
     min_conditioning_direction_consistency: float = -1.0,
     min_mean_gain: float = -1.0e9,
     max_mean_gain_regression: float = 1.0e9,
+    min_pairwise_compatibility: float = -1.0,
+    helper_conditioning_vectors: Optional[Mapping[str, Sequence[torch.Tensor]]] = None,
 ) -> Dict[str, Any]:
     candidates = {}
     eligible = []
+    helper_vectors = {
+        phrase: list((helper_conditioning_vectors or {}).get(phrase, ()))
+        for phrase in helper_records
+    }
+    compatibility = {}
+    for left_index, left in enumerate(helper_records):
+        for right in list(helper_records)[left_index + 1:]:
+            left_vectors = helper_vectors[left]
+            right_vectors = helper_vectors[right]
+            pair_values = []
+            for left_vector, right_vector in zip(left_vectors, right_vectors):
+                pair_values.append(_pairwise_cosine([left_vector, right_vector]))
+            compatibility[f'{left}||{right}'] = statistics.fmean(pair_values) if pair_values else 0.0
     for phrase, records in helper_records.items():
-        train = [float(record['gain']) for record in records if record['split'] in ('train', 'all')]
-        heldout = [float(record['gain']) for record in records if record['split'] in ('heldout', 'all')]
-        if not train or not heldout:
+        all_scope = all(record['split'] == 'all' for record in records)
+        train = [float(record['gain']) for record in records if record['split'] == 'train']
+        heldout = [float(record['gain']) for record in records if record['split'] == 'heldout']
+        combined_values = [float(record['gain']) for record in records]
+        if not combined_values:
             raise ValueError(f'helper {phrase!r} requires calibration observations')
-        train_stats = summarize_gains(train)
-        heldout_stats = summarize_gains(heldout)
-        combined_values = train if all(record['split'] == 'all' for record in records) else train + heldout
         combined_stats = summarize_gains(combined_values)
-        gap = abs(train_stats['mean'] - heldout_stats['mean'])
-        conditioning = _conditioning_summary(records)
+        train_stats = summarize_gains(train) if train else None
+        heldout_stats = summarize_gains(heldout) if heldout else None
+        gap = abs(train_stats['mean'] - heldout_stats['mean']) if train_stats and heldout_stats else None
+        conditioning = _conditioning_summary(records, helper_vectors[phrase])
         mean_gain = combined_stats['mean']
         conditioning_ok = (
             conditioning['median_relative_rms'] >= min_conditioning_relative_rms
-            and conditioning['mean_direction_consistency'] >= min_conditioning_direction_consistency
+            and conditioning['pairwise_direction_consistency'] >= min_conditioning_direction_consistency
         )
         target_not_harmful = (
             mean_gain >= min_mean_gain
@@ -220,13 +271,15 @@ def select_helpers(
         target_gate = (
             combined_stats['median'] >= min_median_gain
             and combined_stats['positive_fraction'] >= min_positive_fraction
+            and train_stats is not None
+            and heldout_stats is not None
             and heldout_stats['positive_fraction'] >= min_heldout_positive_fraction
             and combined_stats['p10'] >= min_p10_gain
             and gap <= max_train_heldout_gap
         )
         if selection_mode == 'conditioning_space':
             is_eligible = conditioning_ok and target_not_harmful
-            score = conditioning['median_relative_rms'] * max(conditioning['mean_direction_consistency'], 0.0) + mean_gain
+            score = conditioning['median_relative_rms'] * max(conditioning['pairwise_direction_consistency'], 0.0) + mean_gain
         else:
             is_eligible = target_gate
             score = combined_stats['median'] + combined_stats['p10'] + heldout_stats['mean'] - gap
@@ -234,8 +287,13 @@ def select_helpers(
             'train': train_stats,
             'heldout': heldout_stats,
             'combined': combined_stats,
+            'split_statistics_valid': not all_scope,
             'conditioning': conditioning,
             'train_heldout_gap': gap,
+            'pairwise_compatibility': {
+                key: value for key, value in compatibility.items()
+                if phrase in key
+            },
             'target_gate': target_gate,
             'conditioning_gate': conditioning_ok,
             'target_not_harmful': target_not_harmful,
@@ -245,11 +303,27 @@ def select_helpers(
         if is_eligible:
             eligible.append((phrase, score))
     eligible.sort(key=lambda pair: (-pair[1], pair[0]))
-    selected = eligible[:max_helpers]
+    selected = []
+    for phrase, score in eligible:
+        if len(selected) >= max_helpers:
+            break
+        if selected:
+            pair_values = [
+                compatibility.get(f'{other}||{phrase}', compatibility.get(f'{phrase}||{other}', 0.0))
+                for other in selected
+            ]
+            if min(pair_values) < min_pairwise_compatibility:
+                continue
+        selected.append((phrase, score))
     raw_weights = {phrase: max(score, 0.0) + sampling_floor for phrase, score in selected}
     total = sum(raw_weights.values())
     weights = {phrase: value / total for phrase, value in raw_weights.items()} if total else {}
-    return {'candidates': candidates, 'selected_helpers': [phrase for phrase, _ in selected], 'sampling_weights': weights}
+    return {
+        'candidates': candidates,
+        'compatibility_matrix': compatibility,
+        'selected_helpers': [phrase for phrase, _ in selected],
+        'sampling_weights': weights,
+    }
 
 
 def run_calibration(
@@ -367,7 +441,9 @@ def run_calibration(
                     'prediction_delta_rms': prediction_delta_rms,
                     'conditioning_relative_rms': conditioning_relative_rms,
                     'conditioning_direction_consistency': conditioning_direction_consistency,
+                    '_conditioning_vector': helper_conditioning.cpu() if helper_conditioning is not None else None,
                 })
+                records[phrase][-1].pop('_conditioning_vector', None)
                 print(
                     f'    helper {phrase!r} complete ({completed_predictions}/{total_predictions}), '
                     f'gain={gain:.9f}, prediction_delta_rms={prediction_delta_rms:.9e}',
@@ -386,19 +462,24 @@ def run_calibration(
             elapsed = time.perf_counter() - case_started_at
             print(f'    case complete in {elapsed:.1f}s', flush=True)
     print(f'  - Semantic scaffold calibration complete in {time.perf_counter() - started_at:.1f}s', flush=True)
-    selection = select_helpers(records, **selection_kwargs)
+    selection = select_helpers(
+        records,
+        helper_conditioning_vectors=conditioning_vectors,
+        **selection_kwargs,
+    )
     print('  - Semantic scaffold helper selection:', flush=True)
     for phrase, candidate in selection['candidates'].items():
         combined = candidate['combined']
         heldout = candidate['heldout']
         conditioning = candidate['conditioning']
+        heldout_fraction = None if heldout is None else heldout['positive_fraction']
         print(
             f'    {phrase!r}: eligible={candidate["eligible"]}, '
             f'median={combined["median"]:.9f}, positive_fraction={combined["positive_fraction"]:.3f}, '
-            f'heldout_positive_fraction={heldout["positive_fraction"]:.3f}, p10={combined["p10"]:.9f}, '
+            f'heldout_positive_fraction={heldout_fraction}, p10={combined["p10"]:.9f}, '
             f'conditioning_rms={conditioning["median_relative_rms"]:.9e}, '
-            f'conditioning_consistency={conditioning["mean_direction_consistency"]:.3f}, '
-            f'train_heldout_gap={candidate["train_heldout_gap"]:.9f}, score={candidate["score"]:.9f}',
+            f'conditioning_consistency={conditioning["pairwise_direction_consistency"]:.3f}, '
+            f'train_heldout_gap={candidate["train_heldout_gap"]}, score={candidate["score"]:.9f}',
             flush=True,
         )
     if selection['selected_helpers']:

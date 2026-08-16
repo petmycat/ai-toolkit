@@ -1013,6 +1013,7 @@ class SDTrainer(BaseSDTrainProcess):
                 'min_conditioning_direction_consistency': calibration.min_conditioning_direction_consistency,
                 'min_mean_gain': calibration.min_mean_gain,
                 'max_mean_gain_regression': calibration.max_mean_gain_regression,
+                'min_pairwise_compatibility': calibration.min_pairwise_compatibility,
             },
             output_dir=phase_root,
             identity=identity,
@@ -1028,17 +1029,27 @@ class SDTrainer(BaseSDTrainProcess):
         self._semantic_scaffold_helper_weights = dict(result.get('sampling_weights', {}))
         self._semantic_scaffold_probe_cases = cases
         self._semantic_scaffold_calibration_complete = True
-        self._trigger_binding_probe_sets = {
-            split: [
-                {
-                    **case.as_dict(),
-                    'dataset_relative_item_id': case.item_id,
-                    'probe_index': index,
-                }
-                for index, case in enumerate(case for case in cases if case.split == split)
-            ]
-            for split in ('train', 'heldout')
+        split_ids = {
+            'train': {str(value).replace('\\', '/') for value in manifest.train_item_ids},
+            'heldout': {str(value).replace('\\', '/') for value in manifest.heldout_item_ids},
         }
+        self._trigger_binding_probe_sets = {split: [] for split in ('train', 'heldout')}
+        for index, case in enumerate(cases):
+            effective_split = case.split
+            if effective_split == 'all':
+                effective_split = next(
+                    (split for split, ids in split_ids.items() if case.item_id in ids),
+                    None,
+                )
+            if effective_split not in self._trigger_binding_probe_sets:
+                continue
+            self._trigger_binding_probe_sets[effective_split].append({
+                **case.as_dict(),
+                'dataset_relative_item_id': case.item_id,
+                'probe_index': len(self._trigger_binding_probe_sets[effective_split]),
+            })
+        if any(not values for values in self._trigger_binding_probe_sets.values()):
+            raise RuntimeError('semantic scaffold calibration did not produce train and heldout validation probes')
         self._trigger_binding_probe_manifest_hash = result['probe_manifest_hash']
         self._semantic_scaffold_fixed_probe_evaluator = self._evaluate_semantic_scaffold_probe
 
