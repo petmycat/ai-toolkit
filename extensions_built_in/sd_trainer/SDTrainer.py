@@ -4465,11 +4465,13 @@ class SDTrainer(BaseSDTrainProcess):
             self.three_phase_trigger_training.run_root or self.save_root,
             f'phase_{self.runtime_phase}',
         )
+        final_step = max(int(self._phase_config().steps) - 1, 0)
+        is_final_save = int(self.step_num) >= final_step
         output_dir = os.path.join(
             phase_root,
-            artifact_config.final_dir if self.step_num >= self._phase_config().steps else artifact_config.checkpoint_dir,
+            artifact_config.final_dir if is_final_save else artifact_config.checkpoint_dir,
         )
-        if self.step_num < self._phase_config().steps:
+        if not is_final_save:
             output_dir = os.path.join(output_dir, str(self.step_num))
         os.makedirs(output_dir, exist_ok=True)
         te_artifact_module = getattr(self.text_activator, 'te_adapter_artifact_module', None)
