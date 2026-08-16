@@ -674,7 +674,10 @@ def normalized_response_metrics(
         raise ValueError('alpha, beta, and omega shapes must match')
     if not math.isfinite(epsilon) or epsilon <= 0:
         raise ValueError('epsilon must be finite and positive')
-    rho_tensor = _per_item_parameter(rho, alpha, 'rho').detach().float().reshape(alpha.shape)
+    rho_tensor = torch.broadcast_to(
+        _per_item_parameter(rho, alpha, 'rho').detach().float(),
+        alpha.shape,
+    )
     safe_rho = rho_tensor.abs().clamp_min(float(epsilon))
     rho_squared = safe_rho.square()
     return {
@@ -707,7 +710,10 @@ def response_norm_diagnostics(
     prediction_delta = (response - base).flatten(1).norm(dim=1)
     target_direction = (endpoint - base).flatten(1).norm(dim=1)
     target_error = (response - response_target).flatten(1).norm(dim=1)
-    rho_tensor = _per_item_parameter(rho, prediction_delta, 'rho').detach().float().reshape(prediction_delta.shape)
+    rho_tensor = torch.broadcast_to(
+        _per_item_parameter(rho, prediction_delta, 'rho').detach().float(),
+        prediction_delta.shape,
+    )
     requested_delta = rho_tensor.abs() * target_direction
     return {
         'prediction_delta_norm': prediction_delta,

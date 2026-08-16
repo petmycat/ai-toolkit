@@ -73,6 +73,19 @@ class TriggerBindingLossesV8Test(unittest.TestCase):
         )
         torch.testing.assert_close(clamped, torch.tensor([10.0, 10.0, 5.0]))
 
+    def test_scalar_rho_broadcasts_across_batch_metrics(self):
+        alpha = torch.tensor([0.05, 0.10])
+        beta = torch.tensor([0.0025, 0.01])
+        omega = torch.zeros(2)
+        normalized = normalized_response_metrics(alpha, beta, omega, 0.05)
+        torch.testing.assert_close(normalized['response_efficiency'], torch.tensor([1.0, 2.0]))
+        response = torch.tensor([[0.05, 0.0], [0.10, 0.0]])
+        base = torch.zeros_like(response)
+        target = torch.ones_like(response)
+        norms = response_norm_diagnostics(response, base, target, 0.05)
+        self.assertEqual(norms['prediction_delta_norm'].shape, (2,))
+        self.assertTrue(torch.isfinite(norms['prediction_delta_target_ratio']).all())
+
     def test_normalized_response_and_norm_metrics_match_exact_response(self):
         rho = 0.25
         base = torch.zeros(1, 2)
