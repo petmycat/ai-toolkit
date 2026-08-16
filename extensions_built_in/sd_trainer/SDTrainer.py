@@ -805,18 +805,22 @@ class SDTrainer(BaseSDTrainProcess):
         manifest = split_module.load_data_split_manifest(manifest_path)
         datasets = getattr(getattr(self, 'data_loader', None), 'dataset', None)
         dataset_list = getattr(datasets, 'datasets', None) or ([datasets] if datasets is not None else [])
-        items = []
+        items_by_id = {}
         for dataset in dataset_list:
             for file_item in getattr(dataset, 'file_list', []) or []:
                 item_id = getattr(file_item, 'dataset_relative_item_id', None)
-                if item_id is not None:
-                    items.append({
-                        'dataset_relative_item_id': item_id,
-                        'image_path': getattr(file_item, 'path', None),
-                        'caption': getattr(file_item, 'caption_template', None) or getattr(file_item, 'raw_caption', ''),
-                        'file_item': file_item,
-                    })
-        return manifest, items
+                if item_id is None:
+                    continue
+                normalized_id = str(item_id).replace('\\', '/')
+                if normalized_id in items_by_id:
+                    continue
+                items_by_id[normalized_id] = {
+                    'dataset_relative_item_id': normalized_id,
+                    'image_path': getattr(file_item, 'path', None),
+                    'caption': getattr(file_item, 'caption_template', None) or getattr(file_item, 'raw_caption', ''),
+                    'file_item': file_item,
+                }
+        return manifest, list(items_by_id.values())
 
     def _semantic_scaffold_prepare_case(self, case):
         item = self._semantic_scaffold_probe_case_by_id[case.probe_case_id]
