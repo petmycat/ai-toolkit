@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import math
 from typing import Dict, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
@@ -613,6 +614,107 @@ def per_item_response_mse(
         detach_target=detach_target,
     )
     return per_item_diffusion_mse(response_prediction, response_target)
+
+
+def response_loss_multiplier(
+    rho: TensorOrFloat,
+    reference: torch.Tensor,
+    *,
+    mode: str = 'none',
+    min_rho: float = 0.05,
+    max_multiplier: float = 20.0,
+) -> torch.Tensor:
+    if mode not in {'none', 'inverse_rho'}:
+        raise ValueError("response loss scaling mode must be 'none' or 'inverse_rho'")
+    if not math.isfinite(min_rho) or min_rho <= 0:
+        raise ValueError('response loss scaling min_rho must be finite and positive')
+    if not math.isfinite(max_multiplier) or max_multiplier <= 0:
+        raise ValueError('response loss scaling max_multiplier must be finite and positive')
+    rho_tensor = _per_item_parameter(rho, reference, 'rho').detach().float()
+    if not bool(torch.all(torch.isfinite(rho_tensor)).item()):
+        raise ValueError('rho must contain only finite values')
+    if mode == 'none':
+        return torch.ones_like(reference, dtype=torch.float32)
+    effective_rho = rho_tensor.abs().clamp_min(float(min_rho))
+    multiplier = effective_rho.reciprocal().clamp_max(float(max_multiplier))
+    return torch.broadcast_to(multiplier, reference.shape)
+
+
+def scale_response_loss(
+    response_loss: torch.Tensor,
+    rho: TensorOrFloat,
+    *,
+    mode: str = 'none',
+    min_rho: float = 0.05,
+    max_multiplier: float = 20.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    _validate_per_item(response_loss, 'response_loss')
+    multiplier = response_loss_multiplier(
+        rho,
+        response_loss,
+        mode=mode,
+        min_rho=min_rho,
+        max_multiplier=max_multiplier,
+    )
+    return response_loss * multiplier, multiplier
+
+
+def normalized_response_metrics(
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    omega: torch.Tensor,
+    rho: TensorOrFloat,
+    *,
+    epsilon: float = 1.0e-6,
+) -> Dict[str, torch.Tensor]:
+    _validate_per_item(alpha, 'alpha')
+    _validate_per_item(beta, 'beta')
+    _validate_per_item(omega, 'omega')
+    if alpha.shape != beta.shape or alpha.shape != omega.shape:
+        raise ValueError('alpha, beta, and omega shapes must match')
+    if not math.isfinite(epsilon) or epsilon <= 0:
+        raise ValueError('epsilon must be finite and positive')
+    rho_tensor = _per_item_parameter(rho, alpha, 'rho').detach().float().reshape(alpha.shape)
+    safe_rho = rho_tensor.abs().clamp_min(float(epsilon))
+    rho_squared = safe_rho.square()
+    return {
+        'response_efficiency': alpha / safe_rho,
+        'normalized_off_direction': omega / rho_squared,
+        'bypass_relative_response_ratio': (
+            beta - 2.0 * rho_tensor * alpha + rho_tensor.square()
+        ) / rho_squared,
+    }
+
+
+def response_norm_diagnostics(
+    response_prediction: torch.Tensor,
+    base_prediction: torch.Tensor,
+    target: torch.Tensor,
+    rho: TensorOrFloat,
+    *,
+    epsilon: float = 1.0e-6,
+) -> Dict[str, torch.Tensor]:
+    if response_prediction.shape != base_prediction.shape or response_prediction.shape != target.shape:
+        raise ValueError('response_prediction, base_prediction, and target shapes must match')
+    if response_prediction.ndim < 2:
+        raise ValueError('predictions must include batch and feature dimensions')
+    if not math.isfinite(epsilon) or epsilon <= 0:
+        raise ValueError('epsilon must be finite and positive')
+    response = response_prediction.float()
+    base = base_prediction.detach().float()
+    endpoint = target.detach().float()
+    response_target = condition_local_response_target(base, endpoint, rho)
+    prediction_delta = (response - base).flatten(1).norm(dim=1)
+    target_direction = (endpoint - base).flatten(1).norm(dim=1)
+    target_error = (response - response_target).flatten(1).norm(dim=1)
+    rho_tensor = _per_item_parameter(rho, prediction_delta, 'rho').detach().float().reshape(prediction_delta.shape)
+    requested_delta = rho_tensor.abs() * target_direction
+    return {
+        'prediction_delta_norm': prediction_delta,
+        'target_direction_norm': target_direction,
+        'target_error_norm': target_error,
+        'prediction_delta_target_ratio': prediction_delta / requested_delta.clamp_min(float(epsilon)),
+    }
 
 
 def _broadcast_reference_direction(

@@ -8,8 +8,12 @@ from toolkit.trigger_binding_losses import (
     clamped_response_floor,
     condition_local_response_target,
     huber_response_floor,
+    normalized_response_metrics,
     off_direction_penalty,
     per_item_response_mse,
+    response_loss_multiplier,
+    response_norm_diagnostics,
+    scale_response_loss,
     soft_response_floor,
     structured_natural_effect_consistency,
 )
@@ -38,6 +42,54 @@ class TriggerBindingLossesV8Test(unittest.TestCase):
         torch.testing.assert_close(result[1], torch.full((2, 2), 3.0))
         with self.assertRaisesRegex(ValueError, 'closed interval'):
             condition_local_response_target(base, target, 1.1)
+
+    def test_inverse_rho_scaling_preserves_optimum_and_restores_initial_gradient(self):
+        base = torch.zeros(1, 2)
+        target = torch.tensor([[2.0, -4.0]])
+        rho = 0.05
+        response = base.clone().requires_grad_()
+        raw = per_item_response_mse(response, base, target, rho)
+        scaled, multiplier = scale_response_loss(raw, rho, mode='inverse_rho')
+        scaled.mean().backward()
+        torch.testing.assert_close(multiplier, torch.tensor([20.0]))
+        torch.testing.assert_close(response.grad, 2.0 * (base - target) / response.numel())
+
+        optimum = condition_local_response_target(base, target, rho).requires_grad_()
+        optimum_raw = per_item_response_mse(optimum, base, target, rho)
+        optimum_scaled, _ = scale_response_loss(optimum_raw, rho, mode='inverse_rho')
+        torch.testing.assert_close(optimum_scaled, torch.zeros(1))
+
+    def test_response_loss_scaling_none_is_identity_and_inverse_rho_is_clamped(self):
+        loss = torch.tensor([2.0, 3.0])
+        unchanged, multiplier = scale_response_loss(loss, torch.tensor([0.05, 0.2]), mode='none')
+        torch.testing.assert_close(unchanged, loss)
+        torch.testing.assert_close(multiplier, torch.ones(2))
+        clamped = response_loss_multiplier(
+            torch.tensor([0.0, 0.01, 0.2]),
+            torch.ones(3),
+            mode='inverse_rho',
+            min_rho=0.05,
+            max_multiplier=10.0,
+        )
+        torch.testing.assert_close(clamped, torch.tensor([10.0, 10.0, 5.0]))
+
+    def test_normalized_response_and_norm_metrics_match_exact_response(self):
+        rho = 0.25
+        base = torch.zeros(1, 2)
+        target = torch.tensor([[4.0, 0.0]])
+        response = torch.tensor([[1.0, 0.0]])
+        diagnostics = causal_response_decomposition(response, base, target, epsilon=1.0e-8)
+        normalized = normalized_response_metrics(
+            diagnostics.alpha, diagnostics.beta, diagnostics.omega, rho, epsilon=1.0e-8
+        )
+        torch.testing.assert_close(normalized['response_efficiency'], torch.ones(1))
+        torch.testing.assert_close(normalized['normalized_off_direction'], torch.zeros(1))
+        torch.testing.assert_close(normalized['bypass_relative_response_ratio'], torch.zeros(1))
+        norms = response_norm_diagnostics(response, base, target, rho, epsilon=1.0e-8)
+        torch.testing.assert_close(norms['prediction_delta_norm'], torch.ones(1))
+        torch.testing.assert_close(norms['target_direction_norm'], torch.tensor([4.0]))
+        torch.testing.assert_close(norms['target_error_norm'], torch.zeros(1))
+        torch.testing.assert_close(norms['prediction_delta_target_ratio'], torch.ones(1))
 
     def test_condition_local_decomposition_matches_exact_epsilon_identity(self):
         base = torch.tensor([[1.0, -1.0, 2.0], [0.5, 2.0, -3.0]])

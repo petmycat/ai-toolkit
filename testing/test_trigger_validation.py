@@ -34,6 +34,7 @@ class _ValidationConfig:
     def __init__(self, **kwargs):
         self.enabled = kwargs.get('enabled', False)
         self.every = kwargs.get('every', 0)
+        self.steps = kwargs.get('steps', [])
         self.seed = kwargs.get('seed', 0)
         self.fixed_timesteps = kwargs.get('fixed_timesteps', [])
         self.fixed_sigmas = kwargs.get('fixed_sigmas', [])
@@ -165,6 +166,22 @@ class TriggerValidationTest(unittest.TestCase):
             self.assertEqual(len(lines), 2)
             self.assertEqual(json.loads(lines[0]), {'name': 'heldout', 'z': 1})
             self.assertEqual(json.loads(lines[1]), {'name': 'train-probe', 'z': 2})
+
+    def test_config_validation_accepts_steps_without_every(self):
+        with tempfile.TemporaryDirectory() as directory:
+            split_path = os.path.join(directory, 'split.json')
+            with open(split_path, 'w', encoding='utf-8') as handle:
+                handle.write('{}')
+            config = _ValidationConfig(
+                enabled=True,
+                every=0,
+                steps=[0, 10, 25, 50],
+                fixed_timesteps=[10],
+                data_split_manifest=split_path,
+                caption_sources=['json'],
+                negative_phrases=['painting'],
+            )
+            validate_trigger_validation_config(config)
 
     def test_config_validation_accepts_complete_configuration(self):
         with tempfile.TemporaryDirectory() as directory:

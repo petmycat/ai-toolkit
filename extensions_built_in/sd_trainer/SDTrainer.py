@@ -2168,6 +2168,105 @@ class SDTrainer(BaseSDTrainProcess):
             result[name] = float(value)
         return result
 
+    @staticmethod
+    def _v8_tensor_mean_norm(value):
+        tensors = value if isinstance(value, (list, tuple)) else [value]
+        finite = [tensor.detach().float().norm() for tensor in tensors if torch.is_tensor(tensor)]
+        if not finite:
+            return 0.0
+        return float(torch.stack(finite).mean().item())
+
+    @classmethod
+    def _v8_prompt_delta_norms(cls, active_embeds, bypass_embeds):
+        metrics = {}
+        active_text = getattr(active_embeds, 'text_embeds', None)
+        bypass_text = getattr(bypass_embeds, 'text_embeds', None)
+        if active_text is not None and bypass_text is not None:
+            active_values = active_text if isinstance(active_text, (list, tuple)) else [active_text]
+            bypass_values = bypass_text if isinstance(bypass_text, (list, tuple)) else [bypass_text]
+            deltas = [active - bypass for active, bypass in zip(active_values, bypass_values)]
+            metrics['conditioning_delta_norm'] = cls._v8_tensor_mean_norm(deltas)
+        if (
+            'text_taps' in active_embeds and 'text_taps' in bypass_embeds
+            and 'trigger_masks' in active_embeds
+        ):
+            active_taps, trigger_mask, _ = cls._prompt_tap_batch(active_embeds)
+            bypass_taps, _, _ = cls._prompt_tap_batch(bypass_embeds)
+            delta = (active_taps - bypass_taps).float()
+            mask = trigger_mask[:, None, :, None].to(delta.dtype)
+            denominator = mask.sum().clamp_min(1.0)
+            metrics['trigger_span_tap_delta_norm'] = float(
+                (delta * mask).square().sum().sqrt().div(denominator.sqrt()).detach().item()
+            )
+            metrics['final_tap_delta_norm'] = float(delta.square().sum().sqrt().detach().item())
+        return metrics
+
+    def _v8_gradient_diagnostics(self, loss, config):
+        diagnostics = config.get('diagnostics', {}) or {}
+        if not diagnostics.get('enabled', False):
+            return {}
+        configured_steps = {int(step) for step in diagnostics.get('gradient_steps', [])}
+        if configured_steps and self.step_num not in configured_steps:
+            return {}
+        named_parameters = [
+            (name, parameter)
+            for name, parameter in self.text_activator.named_parameters()
+            if parameter.requires_grad
+        ]
+        if not named_parameters:
+            return {}
+        gradients = torch.autograd.grad(
+            loss,
+            [parameter for _, parameter in named_parameters],
+            retain_graph=True,
+            allow_unused=True,
+        )
+        component_squares = {
+            'embedding': torch.zeros((), device=loss.device, dtype=torch.float32),
+            'module_lora': torch.zeros((), device=loss.device, dtype=torch.float32),
+            'tap_adapters': torch.zeros((), device=loss.device, dtype=torch.float32),
+        }
+        component_parameter_squares = {name: value.clone() for name, value in component_squares.items()}
+        representative_layers = {int(layer) for layer in diagnostics.get('representative_te_layers', [])}
+        layer_squares = {
+            layer: torch.zeros((), device=loss.device, dtype=torch.float32)
+            for layer in representative_layers
+        }
+        result = {}
+        for (name, parameter), gradient in zip(named_parameters, gradients):
+            if name.startswith('embedding.'):
+                component = 'embedding'
+            elif name.startswith('module_lora_adapters.') or name.startswith('te_adapter.'):
+                component = 'module_lora'
+            elif name.startswith('tap_adapters.'):
+                component = 'tap_adapters'
+            else:
+                continue
+            component_parameter_squares[component] += parameter.detach().float().square().sum()
+            if gradient is None:
+                continue
+            grad_square = gradient.detach().float().square().sum()
+            component_squares[component] += grad_square
+            if component == 'module_lora' and name.startswith('module_lora_adapters.layer_'):
+                layer_text = name.split('module_lora_adapters.layer_', 1)[1].split('__', 1)[0]
+                if layer_text.isdigit() and int(layer_text) in layer_squares:
+                    layer_squares[int(layer_text)] += grad_square
+        epsilon = float(diagnostics.get('relative_epsilon', 1.0e-12))
+        for component, squared_norm in component_squares.items():
+            grad_norm = squared_norm.sqrt()
+            parameter_norm = component_parameter_squares[component].sqrt()
+            prefix = f'{self.runtime_phase}/gradient/{component}'
+            result[f'{prefix}/norm'] = float(grad_norm.item())
+            result[f'{prefix}/parameter_norm'] = float(parameter_norm.item())
+            result[f'{prefix}/relative_norm'] = float(
+                grad_norm.div(parameter_norm.clamp_min(epsilon)).item()
+            )
+        for layer, squared_norm in sorted(layer_squares.items()):
+            result[f'{self.runtime_phase}/gradient/module_lora/layer_{layer}/norm'] = float(
+                squared_norm.sqrt().item()
+            )
+        return result
+
     def _calculate_conditional_response_v8_loss(
         self,
         noisy_latents,
@@ -2215,6 +2314,12 @@ class SDTrainer(BaseSDTrainProcess):
         source_objectives = {}
         source_local_alphas = {}
         metrics = {}
+        scaling_config = config.get('response_loss_scaling', {}) or {}
+        scaling_mode = str(scaling_config.get('mode', 'none'))
+        scaling_min_rho = float(scaling_config.get('min_rho', 0.05))
+        scaling_max_multiplier = float(scaling_config.get('max_multiplier', 20.0))
+        diagnostics_config = config.get('diagnostics', {}) or {}
+        return_diagnostic_taps = bool(diagnostics_config.get('conditioning_deltas', False))
         for source_name, templates in source_prompts.items():
             source_losses = []
             source_trigger_alphas = []
@@ -2229,7 +2334,11 @@ class SDTrainer(BaseSDTrainProcess):
                     prompts = [template.replace('[trigger]', replacement) for template in templates]
                 mode = 'full' if category_name == 'trigger' else 'activator_bypass'
                 with self._activator_mode(mode):
-                    embeds = self.sd.get_prompt_embeds(prompts, return_taps=False)
+                    embeds = self.sd.get_prompt_embeds(
+                        prompts,
+                        return_taps=return_diagnostic_taps and category_name == 'trigger',
+                    )
+                bypass_embeds = None
                 if self.runtime_phase == 'b':
                     with network_disabled(self.network):
                         with torch.no_grad():
@@ -2253,7 +2362,10 @@ class SDTrainer(BaseSDTrainProcess):
                 else:
                     with self._activator_mode('activator_bypass'):
                         with torch.no_grad():
-                            bypass_embeds = self.sd.get_prompt_embeds(prompts).detach()
+                            bypass_embeds = self.sd.get_prompt_embeds(
+                                prompts,
+                                return_taps=return_diagnostic_taps and category_name == 'trigger',
+                            ).detach()
                             base_pred = self.predict_noise(
                                 noisy_latents=noisy_latents,
                                 timesteps=timesteps,
@@ -2274,22 +2386,56 @@ class SDTrainer(BaseSDTrainProcess):
                 response_loss = loss_module.per_item_response_mse(
                     student_pred, base_pred, target, rhos[category_name]
                 )
+                scaled_response_loss, response_multiplier = loss_module.scale_response_loss(
+                    response_loss,
+                    rhos[category_name],
+                    mode=scaling_mode,
+                    min_rho=scaling_min_rho,
+                    max_multiplier=scaling_max_multiplier,
+                )
                 diagnostics = loss_module.causal_response_decomposition(
                     student_pred, base_pred, target
                 )
-                source_losses.append(response_loss)
+                normalized = loss_module.normalized_response_metrics(
+                    diagnostics.alpha,
+                    diagnostics.beta,
+                    diagnostics.omega,
+                    rhos[category_name],
+                )
+                norm_diagnostics = loss_module.response_norm_diagnostics(
+                    student_pred, base_pred, target, rhos[category_name]
+                )
+                source_losses.append(scaled_response_loss)
                 category_predictions[category_name].append(student_pred)
                 category_bases[category_name].append(base_pred)
                 category_targets[category_name].append(target)
                 prefix = f'{self.runtime_phase}/source/{source_name}/category/{category_name}'
                 metrics[f'{prefix}/rho'] = rhos[category_name]
                 metrics[f'{prefix}/response_loss'] = float(response_loss.detach().mean().item())
+                metrics[f'{prefix}/response_loss_unscaled'] = float(response_loss.detach().mean().item())
+                metrics[f'{prefix}/response_loss_scaled'] = float(scaled_response_loss.detach().mean().item())
+                metrics[f'{prefix}/response_loss_multiplier'] = float(response_multiplier.detach().mean().item())
+                metrics[f'{prefix}/response_loss_effective_rho'] = float(max(abs(rhos[category_name]), scaling_min_rho))
                 metrics[f'{prefix}/alpha_local'] = float(diagnostics.alpha.detach().mean().item())
                 metrics[f'{prefix}/beta'] = float(diagnostics.beta.detach().mean().item())
                 metrics[f'{prefix}/omega'] = float(diagnostics.omega.detach().mean().item())
+                metrics[f'{prefix}/response_efficiency_local'] = float(
+                    normalized['response_efficiency'].detach().mean().item()
+                )
+                metrics[f'{prefix}/normalized_off_direction'] = float(
+                    normalized['normalized_off_direction'].detach().mean().item()
+                )
+                metrics[f'{prefix}/bypass_relative_response_ratio'] = float(
+                    normalized['bypass_relative_response_ratio'].detach().mean().item()
+                )
+                for metric_name, value in norm_diagnostics.items():
+                    metrics[f'{prefix}/{metric_name}'] = float(value.detach().mean().item())
                 metrics[f'{prefix}/old_gain'] = float(diagnostics.old_gain.detach().mean().item())
                 metrics[f'{prefix}/reconstructed_gain'] = float(diagnostics.reconstructed_gain.detach().mean().item())
                 metrics[f'{prefix}/reconstruction_error'] = float(diagnostics.reconstruction_error.detach().abs().mean().item())
+                if bypass_embeds is not None and return_diagnostic_taps and category_name == 'trigger':
+                    for metric_name, value in self._v8_prompt_delta_norms(embeds, bypass_embeds).items():
+                        metrics[f'{prefix}/{metric_name}'] = value
                 if category_name == 'trigger':
                     source_trigger_alphas.append(diagnostics.alpha)
             source_objectives[source_name] = torch.stack(source_losses).mean(0)
@@ -2314,8 +2460,23 @@ class SDTrainer(BaseSDTrainProcess):
             )
             shared_alphas[category_name] = diagnostics.alpha
             off_direction.append(loss_module.off_direction_penalty(diagnostics.omega).mean())
+            shared_normalized = loss_module.normalized_response_metrics(
+                diagnostics.alpha,
+                diagnostics.beta,
+                diagnostics.omega,
+                rhos[category_name],
+            )
             metrics[f'{self.runtime_phase}/category/{category_name}/alpha_shared'] = float(
                 diagnostics.alpha.detach().mean().item()
+            )
+            metrics[f'{self.runtime_phase}/category/{category_name}/response_efficiency_shared'] = float(
+                shared_normalized['response_efficiency'].detach().mean().item()
+            )
+            metrics[f'{self.runtime_phase}/category/{category_name}/normalized_off_direction_shared'] = float(
+                shared_normalized['normalized_off_direction'].detach().mean().item()
+            )
+            metrics[f'{self.runtime_phase}/category/{category_name}/bypass_relative_response_ratio_shared'] = float(
+                shared_normalized['bypass_relative_response_ratio'].detach().mean().item()
             )
         if self.runtime_phase == 'b':
             hierarchy = loss_module.adjacent_response_hierarchy_loss(
@@ -2367,6 +2528,7 @@ class SDTrainer(BaseSDTrainProcess):
             + gamma_regularization_weight * gamma_regularization
         )
         metrics[f'{self.runtime_phase}/response_objective'] = float(aggregate.detach().mean().item())
+        metrics[f'{self.runtime_phase}/response_loss_scaling_inverse_rho'] = float(scaling_mode == 'inverse_rho')
         metrics[f'{self.runtime_phase}/hierarchy_loss'] = float(hierarchy_loss.detach().item())
         metrics[f'{self.runtime_phase}/off_direction_loss'] = float(torch.stack(off_direction).detach().mean().item())
         metrics[f'{self.runtime_phase}/alpha_floor_loss'] = float(alpha_floor_loss.detach().item())
@@ -2375,6 +2537,8 @@ class SDTrainer(BaseSDTrainProcess):
         metrics[f'{self.runtime_phase}/aggregate_loss'] = float(loss.detach().item())
         for name, weight in effective_weights.items():
             metrics[f'{self.runtime_phase}/source_weight/{name}'] = float(weight)
+        if diagnostics_config.get('enabled', False):
+            metrics.update(self._v8_gradient_diagnostics(loss, diagnostics_config))
         self._check_first_trigger_gradient(
             loss,
             category_predictions['trigger'][0],

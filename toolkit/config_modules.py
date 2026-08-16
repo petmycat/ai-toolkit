@@ -689,6 +689,7 @@ class TriggerValidationConfig:
     def __init__(self, **kwargs):
         self.enabled: bool = kwargs.get('enabled', False)
         self.every: int = int(kwargs.get('every', 0))
+        self.steps: List[int] = sorted({int(step) for step in kwargs.get('steps', [])})
         self.seed: int = int(kwargs.get('seed', 0))
         self.fixed_timesteps: List[int] = [int(value) for value in kwargs.get('fixed_timesteps', [])]
         self.fixed_sigmas: List[float] = [float(value) for value in kwargs.get('fixed_sigmas', [])]
