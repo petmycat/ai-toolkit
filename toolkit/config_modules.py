@@ -608,8 +608,10 @@ class TriggerBindingResumeConfig:
 
 class SemanticScaffoldCalibrationConfig:
     def __init__(self, **kwargs):
+        self.enabled = bool(kwargs.get('enabled', True))
         self.neutral_phrase = str(kwargs.get('neutral_phrase', ''))
         self.helper_candidates = [str(value) for value in kwargs.get('helper_candidates', [])]
+        self.manual_helpers = [str(value) for value in kwargs.get('manual_helpers', [])]
         self.far_phrases = [str(value) for value in kwargs.get('far_phrases', [])]
         self.probe_ids = [str(value) for value in kwargs.get('probe_ids', [])]
         self.probe_scope = str(kwargs.get('probe_scope', 'split'))
@@ -652,7 +654,7 @@ class SemanticScaffoldHelperBankConfig:
 
 class SemanticScaffoldHelperLossConfig:
     def __init__(self, **kwargs):
-        self.mode = str(kwargs.get('mode', 'prediction_effect_cosine'))
+        self.mode = str(kwargs.get('mode', 'conditioning_effect_cosine'))
         self.weight = float(kwargs.get('weight', 1.0))
         self.cosine_epsilon = float(kwargs.get('cosine_epsilon', 1.0e-8))
         self.minimum_teacher_effect_norm = float(kwargs.get('minimum_teacher_effect_norm', 1.0e-6))
@@ -1089,14 +1091,22 @@ def validate_three_phase_trigger_training_config(
                 raise ValueError('phase_a1 semantic scaffold objective must be enabled')
             if not isinstance(calibration.neutral_phrase, str):
                 raise ValueError('semantic scaffold calibration.neutral_phrase must be a string')
-            if not calibration.helper_candidates:
-                raise ValueError('semantic scaffold calibration.helper_candidates must not be empty')
+            if not calibration.helper_candidates and not calibration.manual_helpers:
+                raise ValueError('semantic scaffold calibration requires helper_candidates or manual_helpers')
             if len(set(calibration.helper_candidates)) != len(calibration.helper_candidates):
                 raise ValueError('semantic scaffold helper_candidates must be unique')
             if calibration.neutral_phrase in calibration.helper_candidates:
                 raise ValueError('semantic scaffold helper_candidates must not contain neutral_phrase')
-            if calibration.max_helpers <= 0 or calibration.max_helpers > len(calibration.helper_candidates):
-                raise ValueError('semantic scaffold calibration.max_helpers must be within helper candidates')
+            if calibration.max_helpers <= 0:
+                raise ValueError('semantic scaffold calibration.max_helpers must be positive')
+            if calibration.enabled and calibration.max_helpers > len(calibration.helper_candidates):
+                raise ValueError('semantic scaffold calibration.max_helpers must be within helper candidates when calibration is enabled')
+            if not calibration.enabled and not calibration.manual_helpers:
+                raise ValueError('semantic scaffold calibration.manual_helpers must not be empty when calibration is disabled')
+            if len(set(calibration.manual_helpers)) != len(calibration.manual_helpers):
+                raise ValueError('semantic scaffold calibration.manual_helpers must be unique')
+            if calibration.neutral_phrase in calibration.manual_helpers:
+                raise ValueError('semantic scaffold calibration.manual_helpers must not contain neutral_phrase')
             if calibration.probe_scope not in ('split', 'all'):
                 raise ValueError('semantic scaffold calibration.probe_scope must be split or all')
             if calibration.pilot_probe_limit < 0:
@@ -1115,9 +1125,9 @@ def validate_three_phase_trigger_training_config(
                 raise ValueError('semantic scaffold calibration.min_conditioning_direction_consistency must be in [-1, 1]')
             if not -1.0 <= calibration.min_pairwise_compatibility <= 1.0:
                 raise ValueError('semantic scaffold calibration.min_pairwise_compatibility must be in [-1, 1]')
-            if not calibration.noise_seeds:
+            if calibration.enabled and not calibration.noise_seeds:
                 raise ValueError('semantic scaffold calibration.noise_seeds must not be empty')
-            if bool(calibration.fixed_timesteps) == bool(calibration.fixed_sigmas):
+            if calibration.enabled and bool(calibration.fixed_timesteps) == bool(calibration.fixed_sigmas):
                 raise ValueError('semantic scaffold calibration requires exactly one of fixed_timesteps or fixed_sigmas')
             for value, name in (
                 (calibration.min_median_gain, 'min_median_gain'),
@@ -1147,8 +1157,10 @@ def validate_three_phase_trigger_training_config(
             if semantic.helper_bank.sampling_floor < 0 or not math.isfinite(semantic.helper_bank.sampling_floor):
                 raise ValueError('semantic scaffold helper_bank.sampling_floor must be finite and non-negative')
             helper_loss = semantic.helper_loss
-            if helper_loss.mode != 'prediction_effect_cosine':
-                raise ValueError('semantic scaffold helper_loss.mode must be prediction_effect_cosine')
+            if helper_loss.mode not in ('prediction_effect_cosine', 'conditioning_effect_cosine'):
+                raise ValueError(
+                    'semantic scaffold helper_loss.mode must be prediction_effect_cosine or conditioning_effect_cosine'
+                )
             if helper_loss.weight < 0 or helper_loss.cosine_epsilon <= 0:
                 raise ValueError('semantic scaffold helper_loss weight and epsilon are invalid')
             if helper_loss.minimum_teacher_effect_norm < 0 or helper_loss.minimum_private_effect_norm < 0:

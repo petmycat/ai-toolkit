@@ -57,6 +57,7 @@ from toolkit.semantic_scaffold_calibration import (
     build_fixed_probe_cases,
     run_calibration,
 )
+from toolkit.trigger_binding_artifacts import fingerprint
 from toolkit.trigger_selective_training import (
     TSTMetricsWriter,
     apply_differential_guidance_target,
@@ -974,6 +975,59 @@ class SDTrainer(BaseSDTrainProcess):
         config = self._semantic_scaffold_config()
         manifest, items = self._semantic_scaffold_items()
         calibration = config.calibration
+        if not calibration.enabled:
+            helpers = list(calibration.manual_helpers)
+            self._semantic_scaffold_manifest = {
+                'schema': 'ai-toolkit.semantic-scaffold-manual-helper-bank',
+                'schema_version': 1,
+                'identity': {'objective_mode': 'semantic_scaffold_control_channel', 'phase': 'a1', 'split_hash': manifest.split_hash},
+                'calibration': {'enabled': False, 'manual_helpers': helpers},
+                'selected_helpers': helpers,
+                'sampling_weights': {helper: 1.0 / len(helpers) for helper in helpers},
+            }
+            self._semantic_scaffold_helper_weights = dict(self._semantic_scaffold_manifest['sampling_weights'])
+            validation_config = self._v8_validation_config()
+            probe_cases = build_fixed_probe_cases(
+                items,
+                {'train_item_ids': manifest.train_item_ids, 'heldout_item_ids': manifest.heldout_item_ids},
+                noise_seeds=[int(getattr(validation_config, 'seed', 42))],
+                fixed_timesteps=list(getattr(validation_config, 'fixed_timesteps', ())),
+                fixed_sigmas=list(getattr(validation_config, 'fixed_sigmas', ())),
+                limit=calibration.probe_limit,
+                probe_scope=calibration.probe_scope,
+            )
+            self._semantic_scaffold_probe_cases = probe_cases
+            self._semantic_scaffold_probe_case_by_id = {
+                case.probe_case_id: next(
+                    item for item in items
+                    if str(item['dataset_relative_item_id']).replace('\\', '/') == case.item_id
+                )
+                for case in probe_cases
+            }
+            split_ids = {
+                'train': {str(value).replace('\\', '/') for value in manifest.train_item_ids},
+                'heldout': {str(value).replace('\\', '/') for value in manifest.heldout_item_ids},
+            }
+            self._trigger_binding_probe_sets = {split: [] for split in ('train', 'heldout')}
+            for case in probe_cases:
+                effective_split = case.split
+                if effective_split == 'all':
+                    effective_split = next((split for split, ids in split_ids.items() if case.item_id in ids), None)
+                if effective_split in self._trigger_binding_probe_sets:
+                    self._trigger_binding_probe_sets[effective_split].append({
+                        **case.as_dict(),
+                        'dataset_relative_item_id': case.item_id,
+                        'probe_index': len(self._trigger_binding_probe_sets[effective_split]),
+                    })
+            if any(not values for values in self._trigger_binding_probe_sets.values()):
+                raise RuntimeError('manual semantic scaffold helper bank requires train and heldout validation probes')
+            self._trigger_binding_probe_manifest_hash = fingerprint([case.as_dict() for case in probe_cases])
+            self._semantic_scaffold_fixed_probe_evaluator = self._evaluate_semantic_scaffold_probe
+            print(
+                f'  - Semantic scaffold calibration disabled; using manual helpers {helpers}',
+                flush=True,
+            )
+            return
         probe_scope = calibration.probe_scope
         probe_limit = calibration.probe_limit
         noise_seeds = calibration.noise_seeds
@@ -2319,7 +2373,7 @@ class SDTrainer(BaseSDTrainProcess):
             return
         if (
             self.runtime_phase in {'a1', 'a2'}
-            and not self.semantic_scaffold_enabled
+            and not getattr(self, 'semantic_scaffold_enabled', False)
             and getattr(self, '_trigger_binding_metrics_pending_step', None) != self.step_num
         ):
             return
@@ -2526,9 +2580,9 @@ class SDTrainer(BaseSDTrainProcess):
                 embeds = embeds.detach()
             return prediction, embeds
 
-        neutral_prediction, _ = predict(neutral_prompts, 'stock_literal', detach=True)
-        helper_prediction, _ = predict(helper_prompts, 'stock_literal', detach=True)
-        bypass_prediction, _ = predict(prompts, 'activator_bypass', detach=True)
+        neutral_prediction, neutral_embeds = predict(neutral_prompts, 'stock_literal', detach=True)
+        helper_prediction, helper_embeds = predict(helper_prompts, 'stock_literal', detach=True)
+        bypass_prediction, bypass_embeds = predict(prompts, 'activator_bypass', detach=True)
         semantic_prediction, semantic_embeds = predict(prompts, 'semantic_only', details=True)
         full_prediction, full_embeds = predict(prompts, 'full', details=True)
 
@@ -2556,6 +2610,17 @@ class SDTrainer(BaseSDTrainProcess):
             minimum_private_norm=config.helper_loss.minimum_private_effect_norm,
         )
         helper_loss = config.helper_loss.weight * helper_result.loss
+        if config.helper_loss.mode == 'conditioning_effect_cosine':
+            semantic_conditioning = semantic_embeds.text_embeds[0] - bypass_embeds.text_embeds[0]
+            helper_conditioning = helper_embeds.text_embeds[0] - neutral_embeds.text_embeds[0]
+            conditioning_result = loss_module.effect_direction_cosine(
+                semantic_conditioning,
+                helper_conditioning,
+                epsilon=config.helper_loss.cosine_epsilon,
+                minimum_teacher_norm=config.helper_loss.minimum_teacher_effect_norm,
+                minimum_private_norm=config.helper_loss.minimum_private_effect_norm,
+            )
+            helper_loss = config.helper_loss.weight * conditioning_result.loss
         beta = loss_module.normalized_disturbance_beta(full_prediction, bypass_prediction, target)
         disturbance_loss = config.disturbance_cap.weight * loss_module.disturbance_cap_penalty(
             beta, config.disturbance_cap.max_beta
@@ -2596,7 +2661,44 @@ class SDTrainer(BaseSDTrainProcess):
             self._semantic_scaffold_state = state_module.SemanticScaffoldState(
                 tuple(config.semantic_channel.tap_layers)
             )
-        gate = self._semantic_scaffold_state.curriculum
+        state = self._semantic_scaffold_state
+        gain_value = float(gain.detach().mean().item())
+        decay = config.helper_decay.gain_ema_decay
+        state.gain_ema = gain_value if state.gain_ema is None else decay * state.gain_ema + (1.0 - decay) * gain_value
+        helper_gain_value = float(loss_module.normalized_gain_vs_neutral(
+            loss_module.per_item_diffusion_mse(helper_prediction, target), neutral_mse
+        ).detach().mean().item())
+        previous_helper_gain = state.helper_gain_ema.get(helper_phrase)
+        state.helper_gain_ema[helper_phrase] = (
+            helper_gain_value if previous_helper_gain is None
+            else decay * previous_helper_gain + (1.0 - decay) * helper_gain_value
+        )
+        state.helper_latch.advance(
+            state.gain_ema - state.helper_gain_ema[helper_phrase],
+            margin=config.helper_decay.off_margin,
+            patience=config.helper_decay.off_patience,
+            step=int(self.step_num),
+        )
+        for batch_details in semantic_embeds.activator_details:
+            for layer_index, layer_id in enumerate(config.semantic_channel.tap_layers):
+                state.update_ema(
+                    str(layer_id),
+                    batch_details['pre_taps'][layer_index].detach().float().mean(dim=0),
+                    decay=config.semantic_channel.prototype_ema_decay,
+                    kind='semantic',
+                )
+        for batch_details in full_embeds.activator_details:
+            for layer_index, layer_id in enumerate(config.semantic_channel.tap_layers):
+                residual = batch_details['tap_residuals'][layer_index]
+                if state.curriculum.unlock_step is not None:
+                    state.update_ema(
+                        str(layer_id),
+                        residual.detach().float().mean(dim=0),
+                        decay=config.tap_specialization.prototype_ema_decay,
+                        kind='tap',
+                    )
+        state.last_update_step = int(self.step_num)
+        gate = state.curriculum
         gate.observe_gate(
             step=int(self.step_num),
             progress=progress,
@@ -2614,6 +2716,16 @@ class SDTrainer(BaseSDTrainProcess):
             ramp_steps=config.tap_specialization.lr_ramp_steps,
         )
         self._sync_semantic_scaffold_tap_runtime()
+        if gate.unlock_step is not None and int(self.step_num) > gate.unlock_step + 1 and self._semantic_scaffold_tap_lr_ramp > 0.0:
+            tap_up_delta = 0.0
+            for name, parameter in self.text_activator.named_parameters():
+                if 'tap_adapters' not in name or not name.endswith('up.weight'):
+                    continue
+                initial = self._trigger_binding_initial_parameters.get(name)
+                if initial is not None:
+                    tap_up_delta += float((parameter.detach().float().cpu() - initial).norm().item())
+            if tap_up_delta <= 0.0:
+                raise RuntimeError('semantic scaffold tap adapters unlocked but tap up projections remain unchanged; optimizer group is not updating taps')
         self._semantic_scaffold_gradient_diagnostics = {
             name: {
                 'requires_grad': bool(parameter.requires_grad),
@@ -3534,11 +3646,20 @@ class SDTrainer(BaseSDTrainProcess):
         unlocked = self._semantic_scaffold_state.curriculum.unlock_step is not None
         self.text_activator.set_component_mode('tap_adapters', active=unlocked, trainable=unlocked)
         ramp = float(self._semantic_scaffold_tap_lr_ramp)
-        for group in getattr(self, 'params', []) or []:
+        optimizer_groups = getattr(getattr(self, 'optimizer', None), 'param_groups', None)
+        groups_to_update = optimizer_groups if optimizer_groups is not None else getattr(self, 'params', [])
+        tap_parameter_ids = {id(parameter) for parameter in self.text_activator.tap_adapters.parameters()}
+        configured_lr = float(self._phase_config().learning_rates.get('tap_adapters', 0.0))
+        for group in groups_to_update or []:
             if not isinstance(group, dict):
                 continue
-            if group.get('name') == 'text_activator.tap_adapters':
-                base_lr = float(group.get('_semantic_scaffold_base_lr', group.get('lr', 0.0)))
+            group_parameter_ids = {id(parameter) for parameter in group.get('params', [])}
+            is_tap_group = (
+                group.get('name') == 'text_activator.tap_adapters'
+                or bool(tap_parameter_ids.intersection(group_parameter_ids))
+            )
+            if is_tap_group:
+                base_lr = float(group.get('_semantic_scaffold_base_lr', configured_lr))
                 group['_semantic_scaffold_base_lr'] = base_lr
                 group['lr'] = base_lr * ramp
 
