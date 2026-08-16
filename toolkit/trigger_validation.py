@@ -82,8 +82,14 @@ def validate_trigger_validation_config(
         raise ValueError('three_phase_trigger_training.validation.enabled must be boolean')
     if not config.enabled:
         return
-    if config.every <= 0:
-        raise ValueError('three_phase_trigger_training.validation.every must be positive')
+    if config.every <= 0 and not config.steps:
+        if config.every == 0:
+            raise ValueError('three_phase_trigger_training.validation.every must be positive')
+        raise ValueError('three_phase_trigger_training.validation.every or steps must be configured')
+    if any(step < 0 for step in config.steps):
+        raise ValueError('validation.steps must be non-negative')
+    if len(set(config.steps)) != len(config.steps):
+        raise ValueError('validation.steps must be unique')
     if config.seed < 0:
         raise ValueError('three_phase_trigger_training.validation.seed must be non-negative')
     if bool(config.fixed_timesteps) == bool(config.fixed_sigmas):
