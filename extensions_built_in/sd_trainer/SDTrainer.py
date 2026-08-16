@@ -2317,7 +2317,11 @@ class SDTrainer(BaseSDTrainProcess):
             return
         if self._trigger_binding_last_metrics_written_step == self.step_num:
             return
-        if self.runtime_phase in {'a1', 'a2'} and getattr(self, '_trigger_binding_metrics_pending_step', None) != self.step_num:
+        if (
+            self.runtime_phase in {'a1', 'a2'}
+            and not self.semantic_scaffold_enabled
+            and getattr(self, '_trigger_binding_metrics_pending_step', None) != self.step_num
+        ):
             return
         artifact_config = getattr(
             self.three_phase_trigger_training.artifacts,
@@ -2626,6 +2630,8 @@ class SDTrainer(BaseSDTrainProcess):
             'full': full_prediction,
             'target': target,
         }
+        self._trigger_binding_metrics_pending_loss = total.detach()
+        self._trigger_binding_metrics_pending_step = self.step_num
         return total
 
     def _calculate_trigger_binding_loss(
