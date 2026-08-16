@@ -612,6 +612,14 @@ class SemanticScaffoldCalibrationConfig:
         self.helper_candidates = [str(value) for value in kwargs.get('helper_candidates', [])]
         self.far_phrases = [str(value) for value in kwargs.get('far_phrases', [])]
         self.probe_ids = [str(value) for value in kwargs.get('probe_ids', [])]
+        self.probe_scope = str(kwargs.get('probe_scope', 'split'))
+        self.selection_mode = str(kwargs.get('selection_mode', 'target_compatibility'))
+        self.min_conditioning_relative_rms = float(kwargs.get('min_conditioning_relative_rms', 0.0))
+        self.min_conditioning_direction_consistency = float(
+            kwargs.get('min_conditioning_direction_consistency', -1.0)
+        )
+        self.min_mean_gain = float(kwargs.get('min_mean_gain', -1.0e9))
+        self.max_mean_gain_regression = float(kwargs.get('max_mean_gain_regression', 1.0e9))
         self.probe_limit = int(kwargs.get('probe_limit', 0))
         self.noise_seeds = [int(value) for value in kwargs.get('noise_seeds', [])]
         self.fixed_timesteps = [int(value) for value in kwargs.get('fixed_timesteps', [])]
@@ -1083,8 +1091,18 @@ def validate_three_phase_trigger_training_config(
                 raise ValueError('semantic scaffold helper_candidates must not contain neutral_phrase')
             if calibration.max_helpers <= 0 or calibration.max_helpers > len(calibration.helper_candidates):
                 raise ValueError('semantic scaffold calibration.max_helpers must be within helper candidates')
+            if calibration.probe_scope not in ('split', 'all'):
+                raise ValueError('semantic scaffold calibration.probe_scope must be split or all')
+            if calibration.selection_mode not in ('target_compatibility', 'conditioning_space'):
+                raise ValueError(
+                    'semantic scaffold calibration.selection_mode must be target_compatibility or conditioning_space'
+                )
             if calibration.probe_limit < 0:
                 raise ValueError('semantic scaffold calibration.probe_limit must be non-negative')
+            if calibration.min_conditioning_relative_rms < 0 or not math.isfinite(calibration.min_conditioning_relative_rms):
+                raise ValueError('semantic scaffold calibration.min_conditioning_relative_rms must be finite and non-negative')
+            if not -1.0 <= calibration.min_conditioning_direction_consistency <= 1.0:
+                raise ValueError('semantic scaffold calibration.min_conditioning_direction_consistency must be in [-1, 1]')
             if not calibration.noise_seeds:
                 raise ValueError('semantic scaffold calibration.noise_seeds must not be empty')
             if bool(calibration.fixed_timesteps) == bool(calibration.fixed_sigmas):
@@ -1095,6 +1113,8 @@ def validate_three_phase_trigger_training_config(
                 (calibration.min_heldout_positive_fraction, 'min_heldout_positive_fraction'),
                 (calibration.min_p10_gain, 'min_p10_gain'),
                 (calibration.max_train_heldout_gap, 'max_train_heldout_gap'),
+                (calibration.min_mean_gain, 'min_mean_gain'),
+                (calibration.max_mean_gain_regression, 'max_mean_gain_regression'),
             ):
                 if not math.isfinite(value):
                     raise ValueError(f'semantic scaffold calibration.{name} must be finite')

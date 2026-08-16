@@ -72,10 +72,13 @@ def build_fixed_probe_cases(
     fixed_timesteps: Sequence[int] = (),
     fixed_sigmas: Sequence[float] = (),
     limit: int = 0,
+    probe_scope: str = 'split',
     target_mode: str = 'flow',
 ) -> List[FixedDiffusionProbeCase]:
     if bool(fixed_timesteps) == bool(fixed_sigmas):
         raise ValueError('probe cases require exactly one of fixed_timesteps or fixed_sigmas')
+    if probe_scope not in ('split', 'all'):
+        raise ValueError('probe_scope must be split or all')
     if not noise_seeds or any(seed < 0 for seed in noise_seeds):
         raise ValueError('probe cases require non-negative noise seeds')
     by_id = {}
@@ -85,10 +88,14 @@ def build_fixed_probe_cases(
             raise ValueError(f'duplicate calibration probe item: {item_id}')
         by_id[item_id] = dict(item)
     cases = []
-    for split, ids in (
-        ('train', split_manifest.get('train_item_ids', ())),
-        ('heldout', split_manifest.get('heldout_item_ids', ())),
-    ):
+    if probe_scope == 'all':
+        split_groups = [('all', list(by_id))]
+    else:
+        split_groups = [
+            ('train', split_manifest.get('train_item_ids', ())),
+            ('heldout', split_manifest.get('heldout_item_ids', ())),
+        ]
+    for split, ids in split_groups:
         selected_ids = [normalize_dataset_relative_item_id(value) for value in ids if normalize_dataset_relative_item_id(value) in by_id]
         if limit > 0:
             selected_ids = selected_ids[:limit]
@@ -159,6 +166,19 @@ def summarize_gains(values: Sequence[float]) -> Dict[str, float]:
     }
 
 
+def _conditioning_summary(records: Sequence[Mapping[str, Any]]) -> Dict[str, float]:
+    rms_values = [float(record['conditioning_relative_rms']) for record in records if 'conditioning_relative_rms' in record]
+    consistency_values = [float(record['conditioning_direction_consistency']) for record in records if 'conditioning_direction_consistency' in record]
+    if not rms_values or not consistency_values:
+        return {'count': 0, 'mean_relative_rms': 0.0, 'median_relative_rms': 0.0, 'mean_direction_consistency': -1.0}
+    return {
+        'count': len(rms_values),
+        'mean_relative_rms': statistics.fmean(rms_values),
+        'median_relative_rms': statistics.median(rms_values),
+        'mean_direction_consistency': statistics.fmean(consistency_values),
+    }
+
+
 def select_helpers(
     helper_records: Mapping[str, Sequence[Mapping[str, Any]]],
     *,
@@ -169,31 +189,56 @@ def select_helpers(
     max_train_heldout_gap: float,
     max_helpers: int,
     sampling_floor: float,
+    selection_mode: str = 'target_compatibility',
+    min_conditioning_relative_rms: float = 0.0,
+    min_conditioning_direction_consistency: float = -1.0,
+    min_mean_gain: float = -1.0e9,
+    max_mean_gain_regression: float = 1.0e9,
 ) -> Dict[str, Any]:
     candidates = {}
     eligible = []
     for phrase, records in helper_records.items():
-        train = [float(record['gain']) for record in records if record['split'] == 'train']
-        heldout = [float(record['gain']) for record in records if record['split'] == 'heldout']
+        train = [float(record['gain']) for record in records if record['split'] in ('train', 'all')]
+        heldout = [float(record['gain']) for record in records if record['split'] in ('heldout', 'all')]
         if not train or not heldout:
-            raise ValueError(f'helper {phrase!r} requires train and heldout observations')
+            raise ValueError(f'helper {phrase!r} requires calibration observations')
         train_stats = summarize_gains(train)
         heldout_stats = summarize_gains(heldout)
-        combined_stats = summarize_gains(train + heldout)
+        combined_values = train if all(record['split'] == 'all' for record in records) else train + heldout
+        combined_stats = summarize_gains(combined_values)
         gap = abs(train_stats['mean'] - heldout_stats['mean'])
-        is_eligible = (
+        conditioning = _conditioning_summary(records)
+        mean_gain = combined_stats['mean']
+        conditioning_ok = (
+            conditioning['median_relative_rms'] >= min_conditioning_relative_rms
+            and conditioning['mean_direction_consistency'] >= min_conditioning_direction_consistency
+        )
+        target_not_harmful = (
+            mean_gain >= min_mean_gain
+            and mean_gain >= -max_mean_gain_regression
+        )
+        target_gate = (
             combined_stats['median'] >= min_median_gain
             and combined_stats['positive_fraction'] >= min_positive_fraction
             and heldout_stats['positive_fraction'] >= min_heldout_positive_fraction
             and combined_stats['p10'] >= min_p10_gain
             and gap <= max_train_heldout_gap
         )
-        score = combined_stats['median'] + combined_stats['p10'] + heldout_stats['mean'] - gap
+        if selection_mode == 'conditioning_space':
+            is_eligible = conditioning_ok and target_not_harmful
+            score = conditioning['median_relative_rms'] * max(conditioning['mean_direction_consistency'], 0.0) + mean_gain
+        else:
+            is_eligible = target_gate
+            score = combined_stats['median'] + combined_stats['p10'] + heldout_stats['mean'] - gap
         candidates[phrase] = {
             'train': train_stats,
             'heldout': heldout_stats,
             'combined': combined_stats,
+            'conditioning': conditioning,
             'train_heldout_gap': gap,
+            'target_gate': target_gate,
+            'conditioning_gate': conditioning_ok,
+            'target_not_harmful': target_not_harmful,
             'eligible': is_eligible,
             'score': score,
         }
@@ -230,6 +275,7 @@ def run_calibration(
     os.makedirs(output_dir, exist_ok=True)
     _atomic_write_json(os.path.join(output_dir, probe_manifest_filename), probe_payload)
     records: Dict[str, List[Dict[str, Any]]] = {phrase: [] for phrase in helper_phrases}
+    conditioning_vectors: Dict[str, List[torch.Tensor]] = {phrase: [] for phrase in helper_phrases}
     total_predictions = len(cases) * (1 + len(helper_phrases))
     completed_predictions = 0
     started_at = time.perf_counter()
@@ -253,13 +299,43 @@ def run_calibration(
                 )
                 for phrase in helper_phrases:
                     print(f'      helper {phrase!r}: {template.replace(placeholder, phrase)[:160]!r}', flush=True)
-            neutral_prediction = predict_phrase(neutral_phrase, prepared).detach()
+            neutral_result = predict_phrase(neutral_phrase, prepared)
+            neutral_prediction = neutral_result[0] if isinstance(neutral_result, tuple) else neutral_result
+            neutral_conditioning = neutral_result[1] if isinstance(neutral_result, tuple) and len(neutral_result) > 1 else None
+            neutral_prediction = neutral_prediction.detach()
+            if neutral_conditioning is not None:
+                if not isinstance(neutral_conditioning, torch.Tensor):
+                    raise ValueError('neutral conditioning effect must be a tensor')
+                neutral_conditioning = neutral_conditioning.detach().float().reshape(-1)
             completed_predictions += 1
             print(f'    neutral complete ({completed_predictions}/{total_predictions})', flush=True)
             for phrase in helper_phrases:
-                prediction = predict_phrase(phrase, prepared).detach()
+                helper_result = predict_phrase(phrase, prepared)
+                if isinstance(helper_result, tuple):
+                    prediction, helper_conditioning = helper_result
+                else:
+                    prediction, helper_conditioning = helper_result, None
+                prediction = prediction.detach()
                 completed_predictions += 1
                 gain = helper_gain(prediction, neutral_prediction, prepared['target'])
+                conditioning_relative_rms = 0.0
+                conditioning_direction_consistency = 0.0
+                if helper_conditioning is not None:
+                    if not isinstance(helper_conditioning, torch.Tensor):
+                        raise ValueError('helper conditioning effect must be a tensor')
+                    helper_conditioning = helper_conditioning.detach().float().reshape(-1)
+                    if neutral_conditioning is not None:
+                        helper_conditioning = helper_conditioning - neutral_conditioning
+                    conditioning_vectors[phrase].append(helper_conditioning)
+                    conditioning_relative_rms = float(helper_conditioning.square().mean().sqrt().cpu().item())
+                    if helper_conditioning.numel() and conditioning_vectors[phrase][:-1]:
+                        prior = torch.stack(conditioning_vectors[phrase][:-1])
+                        prototype = prior.mean(dim=0)
+                        conditioning_direction_consistency = float(
+                            torch.nn.functional.cosine_similarity(
+                                helper_conditioning.unsqueeze(0), prototype.unsqueeze(0), dim=1
+                            ).item()
+                        )
                 prediction_delta_rms = float(
                     (prediction.float() - neutral_prediction.float()).square().mean().sqrt().detach().cpu().item()
                 )
@@ -268,6 +344,8 @@ def run_calibration(
                     'split': case.split,
                     'gain': gain,
                     'prediction_delta_rms': prediction_delta_rms,
+                    'conditioning_relative_rms': conditioning_relative_rms,
+                    'conditioning_direction_consistency': conditioning_direction_consistency,
                 })
                 print(
                     f'    helper {phrase!r} complete ({completed_predictions}/{total_predictions}), '
@@ -278,6 +356,22 @@ def run_calibration(
             print(f'    case complete in {elapsed:.1f}s', flush=True)
     print(f'  - Semantic scaffold calibration complete in {time.perf_counter() - started_at:.1f}s', flush=True)
     selection = select_helpers(records, **selection_kwargs)
+    print('  - Semantic scaffold helper selection:', flush=True)
+    for phrase, candidate in selection['candidates'].items():
+        combined = candidate['combined']
+        heldout = candidate['heldout']
+        conditioning = candidate['conditioning']
+        print(
+            f'    {phrase!r}: eligible={candidate["eligible"]}, '
+            f'median={combined["median"]:.9f}, positive_fraction={combined["positive_fraction"]:.3f}, '
+            f'heldout_positive_fraction={heldout["positive_fraction"]:.3f}, p10={combined["p10"]:.9f}, '
+            f'conditioning_rms={conditioning["median_relative_rms"]:.9e}, '
+            f'conditioning_consistency={conditioning["mean_direction_consistency"]:.3f}, '
+            f'train_heldout_gap={candidate["train_heldout_gap"]:.9f}, score={candidate["score"]:.9f}',
+            flush=True,
+        )
+    if selection['selected_helpers']:
+        print(f'    selected={selection["selected_helpers"]}', flush=True)
     manifest = {
         'schema': CALIBRATION_SCHEMA,
         'schema_version': CALIBRATION_SCHEMA_VERSION,

@@ -931,7 +931,7 @@ class SDTrainer(BaseSDTrainProcess):
             )
         prompt = template.replace(placeholder, phrase)
         embeds = self._trigger_binding_prompt_encoder([prompt], runtime_mode='stock_literal')
-        return self.predict_noise(
+        prediction = self.predict_noise(
             noisy_latents=prepared['noisy_latents'],
             timesteps=prepared['timesteps'],
             conditional_embeds=embeds.to(self.device_torch, dtype=prepared['noisy_latents'].dtype),
@@ -939,6 +939,12 @@ class SDTrainer(BaseSDTrainProcess):
             batch=self._semantic_scaffold_probe_batch(prepared),
             is_primary_pred=False,
         )
+        token_embeds = embeds.text_embeds[0].float()
+        conditioning = torch.cat([
+            token_embeds.mean(dim=0),
+            token_embeds.square().mean(dim=0).sqrt(),
+        ]).reshape(-1)
+        return prediction, conditioning
 
     def _semantic_scaffold_probe_batch(self, prepared):
         return type('SemanticScaffoldProbeBatch', (), {
@@ -960,6 +966,7 @@ class SDTrainer(BaseSDTrainProcess):
             fixed_timesteps=calibration.fixed_timesteps,
             fixed_sigmas=calibration.fixed_sigmas,
             limit=calibration.probe_limit,
+            probe_scope=calibration.probe_scope,
         )
         items_by_id = {
             str(item['dataset_relative_item_id']).replace('\\', '/'): item
@@ -985,6 +992,11 @@ class SDTrainer(BaseSDTrainProcess):
                 'max_train_heldout_gap': calibration.max_train_heldout_gap,
                 'max_helpers': calibration.max_helpers,
                 'sampling_floor': config.helper_bank.sampling_floor,
+                'selection_mode': calibration.selection_mode,
+                'min_conditioning_relative_rms': calibration.min_conditioning_relative_rms,
+                'min_conditioning_direction_consistency': calibration.min_conditioning_direction_consistency,
+                'min_mean_gain': calibration.min_mean_gain,
+                'max_mean_gain_regression': calibration.max_mean_gain_regression,
             },
             output_dir=phase_root,
             identity=identity,
