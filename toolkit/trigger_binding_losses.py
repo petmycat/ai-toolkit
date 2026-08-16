@@ -78,7 +78,8 @@ def normalized_activator_gain(
         raise ValueError('activator_loss and bypass_loss shapes must match')
     if epsilon <= 0:
         raise ValueError('epsilon must be positive')
-    return 1.0 - activator_loss / (bypass_loss.detach() + epsilon)
+    reference = bypass_loss.detach()
+    return (reference - activator_loss) / (reference.abs() + epsilon)
 
 
 def interpolate_schedule(

@@ -7,6 +7,7 @@ import torch
 from toolkit.semantic_scaffold_calibration import (
     SemanticScaffoldCalibrationError,
     build_fixed_probe_cases,
+    helper_gain,
     run_calibration,
     select_helpers,
 )
@@ -32,6 +33,11 @@ class SemanticScaffoldCalibrationTest(unittest.TestCase):
         self.assertEqual([case.as_dict() for case in first], [case.as_dict() for case in second])
         self.assertEqual(len(first), 2)
         self.assertNotEqual(first[0].probe_case_id, first[1].probe_case_id)
+
+    def test_equal_helper_and_neutral_predictions_have_zero_gain(self):
+        prediction = torch.tensor([1.0, 2.0])
+        target = torch.zeros_like(prediction)
+        self.assertEqual(helper_gain(prediction, prediction, target), 0.0)
 
     def test_helper_selection_requires_both_splits_and_applies_thresholds(self):
         records = {

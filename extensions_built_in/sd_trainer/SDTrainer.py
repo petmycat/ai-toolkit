@@ -2473,7 +2473,11 @@ class SDTrainer(BaseSDTrainProcess):
         self._trigger_binding_last_metrics = metrics
         self.additional_logs['runtime_phase'] = self.runtime_phase
         for key, value in metrics.items():
-            self.additional_logs[f'phase/{self.runtime_phase}/{key}'] = float(value)
+            log_key = f'phase/{self.runtime_phase}/{key}'
+            if isinstance(value, (int, float)):
+                self.additional_logs[log_key] = float(value)
+            else:
+                self.additional_logs[log_key] = value
         self._semantic_scaffold_last_embeddings = (semantic_embeds, full_embeds)
         if self._semantic_scaffold_state is None:
             state_module = importlib.import_module('toolkit.semantic_scaffold_state')

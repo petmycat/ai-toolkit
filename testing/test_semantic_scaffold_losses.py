@@ -17,7 +17,9 @@ from toolkit.trigger_binding_losses import (
 class SemanticScaffoldLossTest(unittest.TestCase):
     def test_gain_and_soft_floor(self):
         gain = normalized_gain_vs_neutral(torch.tensor([1.0, 0.5]), torch.tensor([2.0, 1.0]))
-        torch.testing.assert_close(gain, torch.tensor([0.5, 0.5]))
+        torch.testing.assert_close(gain, torch.tensor([0.5, 0.5]), atol=1.0e-6, rtol=1.0e-6)
+        equal_gain = normalized_gain_vs_neutral(torch.tensor([2.0]), torch.tensor([2.0]))
+        torch.testing.assert_close(equal_gain, torch.zeros_like(equal_gain))
         self.assertGreater(float(soft_gain_floor(gain, 0.75, 0.1).mean()), 0.0)
 
     def test_effect_cosine_detaches_teacher_and_masks_invalid(self):

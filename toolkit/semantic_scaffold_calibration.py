@@ -135,7 +135,7 @@ def helper_gain(prediction: torch.Tensor, neutral_prediction: torch.Tensor, targ
         raise ValueError('calibration predictions and target must have matching shapes')
     helper_loss = torch.mean((prediction.float() - target.float()).square())
     neutral_loss = torch.mean((neutral_prediction.float() - target.float()).square())
-    value = 1.0 - helper_loss / (neutral_loss + epsilon)
+    value = (neutral_loss - helper_loss) / (neutral_loss.abs() + epsilon)
     result = float(value.detach().cpu().item())
     if not math.isfinite(result):
         raise ValueError('calibration gain must be finite')
@@ -249,12 +249,20 @@ def run_calibration(
                 prediction = predict_phrase(phrase, prepared).detach()
                 completed_predictions += 1
                 gain = helper_gain(prediction, neutral_prediction, prepared['target'])
+                prediction_delta_rms = float(
+                    (prediction.float() - neutral_prediction.float()).square().mean().sqrt().detach().cpu().item()
+                )
                 records[phrase].append({
                     'probe_case_id': case.probe_case_id,
                     'split': case.split,
                     'gain': gain,
+                    'prediction_delta_rms': prediction_delta_rms,
                 })
-                print(f'    helper {phrase!r} complete ({completed_predictions}/{total_predictions}), gain={gain:.6f}', flush=True)
+                print(
+                    f'    helper {phrase!r} complete ({completed_predictions}/{total_predictions}), '
+                    f'gain={gain:.9f}, prediction_delta_rms={prediction_delta_rms:.9e}',
+                    flush=True,
+                )
             elapsed = time.perf_counter() - case_started_at
             print(f'    case complete in {elapsed:.1f}s', flush=True)
     print(f'  - Semantic scaffold calibration complete in {time.perf_counter() - started_at:.1f}s', flush=True)
