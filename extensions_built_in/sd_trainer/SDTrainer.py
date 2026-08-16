@@ -4546,7 +4546,7 @@ class SDTrainer(BaseSDTrainProcess):
             f'phase_{self.runtime_phase}',
         )
         final_step = max(int(self._phase_config().steps) - 1, 0)
-        is_final_save = int(self.step_num) >= final_step
+        is_final_save = int(self.step_num) >= final_step or int(self.step_num) >= int(self._phase_config().steps)
         output_dir = os.path.join(
             phase_root,
             artifact_config.final_dir if is_final_save else artifact_config.checkpoint_dir,

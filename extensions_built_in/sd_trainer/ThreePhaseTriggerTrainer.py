@@ -522,6 +522,11 @@ class ThreePhaseTriggerTrainer(BaseExtensionProcess):
             required_outputs.append(os.path.join(phase_root, phase_artifacts.metrics_file))
             missing_outputs = [path for path in required_outputs if not os.path.isfile(path)]
             if missing_outputs:
+                print(
+                    f'Phase {phase_name} completed but required artifacts are missing: '
+                    + '; '.join(missing_outputs),
+                    flush=True,
+                )
                 status = 'failed'
                 result = subprocess.CompletedProcess(result.args, 1)
         self.write_completion_contract(phase_name, status, result.returncode)
