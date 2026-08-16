@@ -247,6 +247,12 @@ class ThreePhaseTriggerTrainer(BaseExtensionProcess):
         child['train']['steps'] = phase.steps
         child['train']['optimizer'] = phase.optimizer
         child['train']['optimizer_params'] = copy.deepcopy(phase.optimizer_params)
+        if (
+            self.three_phase_config.objective_mode == 'semantic_scaffold_control_channel'
+            and phase_name == 'a1'
+            and not any(bool(phase.train.get(key, False)) for key in ('diffusion_lora', 'train_unet', 'unet'))
+        ):
+            child['network'] = None
         child['save'] = copy.deepcopy(child.get('save', {}))
         if phase.save_steps:
             child['save']['save_steps'] = list(phase.save_steps)
