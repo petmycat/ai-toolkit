@@ -378,14 +378,18 @@ class ThreePhaseTriggerTrainer(BaseExtensionProcess):
         if self.three_phase_config.objective_mode != 'semantic_scaffold_control_channel' or phase_name != 'a1':
             return {}
         phase_root = self._phase_root(phase_name)
-        return {
+        records = {
             'manifest': os.path.join(phase_root, 'semantic_scaffold_manifest.json'),
             'probe_manifest': os.path.join(phase_root, 'semantic_scaffold_probe_manifest.json'),
             'state_json': os.path.join(phase_root, 'semantic_scaffold_state.json'),
             'state_safetensors': os.path.join(phase_root, 'semantic_scaffold_state.safetensors'),
-            'validation_train': os.path.join(phase_root, 'semantic_train_validation.jsonl'),
-            'validation_heldout': os.path.join(phase_root, 'semantic_heldout_validation.jsonl'),
         }
+        if self.three_phase_config.validation.enabled:
+            records.update({
+                'validation_train': os.path.join(phase_root, 'semantic_train_validation.jsonl'),
+                'validation_heldout': os.path.join(phase_root, 'semantic_heldout_validation.jsonl'),
+            })
+        return records
 
     def completion_contract(self, phase_name: str, status: str, return_code: Optional[int] = None) -> Dict:
         phase = self.three_phase_config.get_phase(phase_name)
@@ -578,7 +582,9 @@ class ThreePhaseTriggerTrainer(BaseExtensionProcess):
                 return False
         semantic_records = contract.get('semantic_scaffold', {})
         if self.three_phase_config.objective_mode == 'semantic_scaffold_control_channel' and phase_name == 'a1':
-            required_semantic = ('manifest', 'probe_manifest', 'state_json', 'state_safetensors', 'validation_train', 'validation_heldout')
+            required_semantic = ['manifest', 'probe_manifest', 'state_json', 'state_safetensors']
+            if self.three_phase_config.validation.enabled:
+                required_semantic.extend(['validation_train', 'validation_heldout'])
             if any(not semantic_records.get(name) or not os.path.isfile(semantic_records[name]) for name in required_semantic):
                 return False
         if self.three_phase_config.schema_version == 8:

@@ -242,6 +242,17 @@ def run_calibration(
             required = {'target'}
             if not required.issubset(prepared):
                 raise ValueError('prepared calibration case must contain target')
+            template = prepared.get('prompt_template')
+            placeholder = prepared.get('placeholder')
+            if template is not None and placeholder is not None:
+                if placeholder not in template:
+                    raise ValueError(f'calibration prompt lacks placeholder {placeholder!r}: {str(template)[:200]!r}')
+                print(
+                    f'    prompt variants: neutral={template.replace(placeholder, neutral_phrase)[:160]!r}',
+                    flush=True,
+                )
+                for phrase in helper_phrases:
+                    print(f'      helper {phrase!r}: {template.replace(placeholder, phrase)[:160]!r}', flush=True)
             neutral_prediction = predict_phrase(neutral_phrase, prepared).detach()
             completed_predictions += 1
             print(f'    neutral complete ({completed_predictions}/{total_predictions})', flush=True)

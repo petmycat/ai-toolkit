@@ -815,10 +815,23 @@ class SDTrainer(BaseSDTrainProcess):
                 normalized_id = str(item_id).replace('\\', '/')
                 if normalized_id in items_by_id:
                     continue
+                source_templates = getattr(file_item, 'caption_source_templates', {}) or {}
+                source_captions = getattr(file_item, 'caption_sources_raw', {}) or {}
+                caption = next(
+                    (str(value) for value in source_templates.values() if self.three_phase_trigger_training.placeholder in str(value)),
+                    None,
+                )
+                if caption is None:
+                    caption = next(
+                        (str(value) for value in source_captions.values() if self.three_phase_trigger_training.placeholder in str(value)),
+                        None,
+                    )
+                if caption is None:
+                    caption = getattr(file_item, 'caption_template', None) or getattr(file_item, 'raw_caption', '')
                 items_by_id[normalized_id] = {
                     'dataset_relative_item_id': normalized_id,
                     'image_path': getattr(file_item, 'path', None),
-                    'caption': getattr(file_item, 'caption_template', None) or getattr(file_item, 'raw_caption', ''),
+                    'caption': caption,
                     'file_item': file_item,
                 }
         known_ids = set(items_by_id)
@@ -901,7 +914,13 @@ class SDTrainer(BaseSDTrainProcess):
         }
 
     def _semantic_scaffold_predict_phrase(self, phrase, prepared):
-        prompt = prepared['prompt_template'].replace(prepared['placeholder'], phrase)
+        template = prepared['prompt_template']
+        placeholder = prepared['placeholder']
+        if placeholder not in template:
+            raise RuntimeError(
+                f'semantic scaffold calibration prompt lacks placeholder {placeholder!r}: {template[:200]!r}'
+            )
+        prompt = template.replace(placeholder, phrase)
         embeds = self._trigger_binding_prompt_encoder([prompt], runtime_mode='stock_literal')
         return self.predict_noise(
             noisy_latents=prepared['noisy_latents'],

@@ -176,6 +176,8 @@ class SemanticScaffoldState:
         for group in ('semantic_prototypes', 'tap_prototypes'):
             for key, value in payload[group].items():
                 tensors[f'{group}.{key}'] = value
+        if not tensors:
+            tensors['__empty_state__'] = torch.empty(0, dtype=torch.float32)
         save_file(tensors, tensor_path, metadata={'semantic_scaffold_state': '1'})
         import json
         with open(json_path, 'w', encoding='utf-8') as handle:

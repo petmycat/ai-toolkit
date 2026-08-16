@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 
@@ -43,6 +44,17 @@ class SemanticScaffoldStateTest(unittest.TestCase):
         ), 'unlocked')
         self.assertEqual(curriculum.advance_ramp(step=31, ramp_steps=10), 0.5)
         self.assertEqual(curriculum.advance_ramp(step=36, ramp_steps=10), 1.0)
+
+    def test_empty_state_round_trip(self):
+        state = SemanticScaffoldState((0, 3))
+        with tempfile.TemporaryDirectory() as directory:
+            json_path = os.path.join(directory, 'state.json')
+            tensor_path = os.path.join(directory, 'state.safetensors')
+            state.save(json_path, tensor_path)
+            loaded = SemanticScaffoldState.load(json_path, tensor_path)
+        self.assertEqual(loaded.tap_layers, (0, 3))
+        self.assertEqual(loaded.semantic_prototypes, {})
+        self.assertEqual(loaded.tap_prototypes, {})
 
     def test_state_round_trip(self):
         state = SemanticScaffoldState((0, 3))
