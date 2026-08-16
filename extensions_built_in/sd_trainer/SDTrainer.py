@@ -959,14 +959,30 @@ class SDTrainer(BaseSDTrainProcess):
         config = self._semantic_scaffold_config()
         manifest, items = self._semantic_scaffold_items()
         calibration = config.calibration
+        probe_scope = calibration.probe_scope
+        probe_limit = calibration.probe_limit
+        noise_seeds = calibration.noise_seeds
+        fixed_timesteps = calibration.fixed_timesteps
+        fixed_sigmas = calibration.fixed_sigmas
+        if calibration.pilot_only:
+            probe_limit = calibration.pilot_probe_limit
+            noise_seeds = calibration.pilot_noise_seeds or noise_seeds[:1]
+            fixed_timesteps = calibration.pilot_fixed_timesteps or fixed_timesteps[:1]
+            fixed_sigmas = calibration.pilot_fixed_sigmas or fixed_sigmas[:1]
+        print(
+            f'  - Semantic scaffold calibration mode={"pilot" if calibration.pilot_only else "full"}, '
+            f'scope={probe_scope}, probe_limit={probe_limit}, seeds={len(noise_seeds)}, '
+            f'schedules={len(fixed_timesteps or fixed_sigmas)}',
+            flush=True,
+        )
         cases = build_fixed_probe_cases(
             items,
             {'train_item_ids': manifest.train_item_ids, 'heldout_item_ids': manifest.heldout_item_ids},
-            noise_seeds=calibration.noise_seeds,
-            fixed_timesteps=calibration.fixed_timesteps,
-            fixed_sigmas=calibration.fixed_sigmas,
-            limit=calibration.probe_limit,
-            probe_scope=calibration.probe_scope,
+            noise_seeds=noise_seeds,
+            fixed_timesteps=fixed_timesteps,
+            fixed_sigmas=fixed_sigmas,
+            limit=probe_limit,
+            probe_scope=probe_scope,
         )
         items_by_id = {
             str(item['dataset_relative_item_id']).replace('\\', '/'): item
@@ -1002,6 +1018,11 @@ class SDTrainer(BaseSDTrainProcess):
             identity=identity,
             manifest_filename=calibration.manifest_filename,
             probe_manifest_filename=calibration.probe_manifest_filename,
+        )
+        print(
+            f'  - Calibration evidence accepted; entering full phase A1 training with helpers '
+            f'{result.get("selected_helpers", [])}',
+            flush=True,
         )
         self._semantic_scaffold_manifest = result
         self._semantic_scaffold_helper_weights = dict(result.get('sampling_weights', {}))

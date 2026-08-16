@@ -264,6 +264,7 @@ def run_calibration(
     identity: Mapping[str, Any],
     manifest_filename: str = 'semantic_scaffold_manifest.json',
     probe_manifest_filename: str = 'semantic_scaffold_probe_manifest.json',
+    progress_filename: str = 'semantic_scaffold_calibration_progress.json',
 ) -> Dict[str, Any]:
     probe_payload = {
         'schema': PROBE_SCHEMA,
@@ -277,14 +278,33 @@ def run_calibration(
     records: Dict[str, List[Dict[str, Any]]] = {phrase: [] for phrase in helper_phrases}
     conditioning_vectors: Dict[str, List[torch.Tensor]] = {phrase: [] for phrase in helper_phrases}
     total_predictions = len(cases) * (1 + len(helper_phrases))
+    progress_path = os.path.join(output_dir, progress_filename)
+
+    def write_progress(status: str, **extra: Any) -> None:
+        payload = {
+            'schema': 'ai-toolkit.semantic-scaffold-calibration-progress',
+            'schema_version': 1,
+            'status': status,
+            'case_count': len(cases),
+            'helper_count': len(helper_phrases),
+            'total_predictions': total_predictions,
+            'completed_predictions': completed_predictions,
+            'elapsed_seconds': time.perf_counter() - started_at,
+            'records_completed': {phrase: len(values) for phrase, values in records.items()},
+            **extra,
+        }
+        _atomic_write_json(progress_path, payload)
+
     completed_predictions = 0
     started_at = time.perf_counter()
+    write_progress('started')
     print(f'  - Semantic scaffold calibration: {len(cases)} cases, {len(helper_phrases)} helpers, {total_predictions} predictions', flush=True)
     with torch.inference_mode(), isolated_rng(0):
         for case_index, case in enumerate(cases, start=1):
             case_started_at = time.perf_counter()
             print(f'  - Calibration case {case_index}/{len(cases)} [{case.split}] {case.item_id}', flush=True)
             prepared = dict(prepare_case(case))
+            write_progress('case_prepared', case_index=case_index, probe_case_id=case.probe_case_id)
             required = {'target'}
             if not required.issubset(prepared):
                 raise ValueError('prepared calibration case must contain target')
@@ -309,6 +329,7 @@ def run_calibration(
                 neutral_conditioning = neutral_conditioning.detach().float().reshape(-1)
             completed_predictions += 1
             print(f'    neutral complete ({completed_predictions}/{total_predictions})', flush=True)
+            write_progress('neutral_complete', case_index=case_index, probe_case_id=case.probe_case_id)
             for phrase in helper_phrases:
                 helper_result = predict_phrase(phrase, prepared)
                 if isinstance(helper_result, tuple):
@@ -352,6 +373,16 @@ def run_calibration(
                     f'gain={gain:.9f}, prediction_delta_rms={prediction_delta_rms:.9e}',
                     flush=True,
                 )
+                write_progress(
+                    'prediction_complete',
+                    case_index=case_index,
+                    probe_case_id=case.probe_case_id,
+                    helper=phrase,
+                    gain=gain,
+                    prediction_delta_rms=prediction_delta_rms,
+                    conditioning_relative_rms=conditioning_relative_rms,
+                    conditioning_direction_consistency=conditioning_direction_consistency,
+                )
             elapsed = time.perf_counter() - case_started_at
             print(f'    case complete in {elapsed:.1f}s', flush=True)
     print(f'  - Semantic scaffold calibration complete in {time.perf_counter() - started_at:.1f}s', flush=True)
@@ -386,6 +417,12 @@ def run_calibration(
         manifest['failure_reason'] = 'semantic_scaffold_calibration_failed'
     manifest['manifest_hash'] = fingerprint(manifest)
     _atomic_write_json(os.path.join(output_dir, manifest_filename), manifest)
+    write_progress(
+        'complete' if manifest['selected_helpers'] else 'failed',
+        selected_helpers=manifest['selected_helpers'],
+        candidates=manifest['candidates'],
+        failure_reason=manifest['failure_reason'],
+    )
     if not manifest['selected_helpers']:
         raise SemanticScaffoldCalibrationError('semantic_scaffold_calibration_failed')
     return manifest

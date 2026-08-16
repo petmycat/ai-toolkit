@@ -613,6 +613,11 @@ class SemanticScaffoldCalibrationConfig:
         self.far_phrases = [str(value) for value in kwargs.get('far_phrases', [])]
         self.probe_ids = [str(value) for value in kwargs.get('probe_ids', [])]
         self.probe_scope = str(kwargs.get('probe_scope', 'split'))
+        self.pilot_only = bool(kwargs.get('pilot_only', False))
+        self.pilot_probe_limit = int(kwargs.get('pilot_probe_limit', 2))
+        self.pilot_noise_seeds = [int(value) for value in kwargs.get('pilot_noise_seeds', [])]
+        self.pilot_fixed_timesteps = [int(value) for value in kwargs.get('pilot_fixed_timesteps', [])]
+        self.pilot_fixed_sigmas = [float(value) for value in kwargs.get('pilot_fixed_sigmas', [])]
         self.selection_mode = str(kwargs.get('selection_mode', 'target_compatibility'))
         self.min_conditioning_relative_rms = float(kwargs.get('min_conditioning_relative_rms', 0.0))
         self.min_conditioning_direction_consistency = float(
@@ -1093,6 +1098,10 @@ def validate_three_phase_trigger_training_config(
                 raise ValueError('semantic scaffold calibration.max_helpers must be within helper candidates')
             if calibration.probe_scope not in ('split', 'all'):
                 raise ValueError('semantic scaffold calibration.probe_scope must be split or all')
+            if calibration.pilot_probe_limit < 0:
+                raise ValueError('semantic scaffold calibration.pilot_probe_limit must be non-negative')
+            if calibration.pilot_only and not calibration.pilot_probe_limit:
+                raise ValueError('semantic scaffold calibration pilot_probe_limit must be positive in pilot_only mode')
             if calibration.selection_mode not in ('target_compatibility', 'conditioning_space'):
                 raise ValueError(
                     'semantic scaffold calibration.selection_mode must be target_compatibility or conditioning_space'
