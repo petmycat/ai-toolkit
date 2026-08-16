@@ -6,7 +6,7 @@ import random
 import json
 from collections import OrderedDict
 from types import MethodType
-from typing import Union, Literal, List, Optional
+from typing import Union, Literal, List, Optional, Mapping
 
 import numpy as np
 from diffusers import T2IAdapter, AutoencoderTiny, ControlNetModel
@@ -53,6 +53,7 @@ from toolkit.trigger_validation import (
     semantic_prediction_metrics,
 )
 from toolkit.semantic_scaffold_calibration import (
+    FixedDiffusionProbeCase,
     build_fixed_probe_cases,
     run_calibration,
 )
@@ -882,6 +883,20 @@ class SDTrainer(BaseSDTrainProcess):
         return manifest, list(items_by_id.values())
 
     def _semantic_scaffold_prepare_case(self, case):
+        if isinstance(case, Mapping):
+            case = FixedDiffusionProbeCase(
+                probe_case_id=str(case['probe_case_id']),
+                split=str(case['split']),
+                item_id=str(case['item_id']),
+                caption_hash=str(case['caption_hash']),
+                image_hash=str(case['image_hash']),
+                noise_seed=int(case['noise_seed']),
+                timestep=None if case.get('timestep') is None else int(case['timestep']),
+                sigma=None if case.get('sigma') is None else float(case['sigma']),
+                target_mode=str(case['target_mode']),
+                transform=dict(case.get('transform', {})),
+                latent_hash=case.get('latent_hash'),
+            )
         item = self._semantic_scaffold_probe_case_by_id[case.probe_case_id]
         file_item = item.get('file_item')
         latent = None
@@ -1054,7 +1069,21 @@ class SDTrainer(BaseSDTrainProcess):
         self._semantic_scaffold_fixed_probe_evaluator = self._evaluate_semantic_scaffold_probe
 
     def _evaluate_semantic_scaffold_probe(self, item, split, step):
-        case = self._semantic_scaffold_probe_case_by_id[item.get('probe_case_id')]
+        case = item
+        if isinstance(item, Mapping):
+            case = FixedDiffusionProbeCase(
+                probe_case_id=str(item['probe_case_id']),
+                split=str(item['split']),
+                item_id=str(item['item_id']),
+                caption_hash=str(item['caption_hash']),
+                image_hash=str(item['image_hash']),
+                noise_seed=int(item['noise_seed']),
+                timestep=None if item.get('timestep') is None else int(item['timestep']),
+                sigma=None if item.get('sigma') is None else float(item['sigma']),
+                target_mode=str(item['target_mode']),
+                transform=dict(item.get('transform', {})),
+                latent_hash=item.get('latent_hash'),
+            )
         prepared = self._semantic_scaffold_prepare_case(case)
         template = prepared['prompt_template']
         placeholder = prepared['placeholder']
@@ -2446,7 +2475,14 @@ class SDTrainer(BaseSDTrainProcess):
         neutral_phrase = config.calibration.neutral_phrase
         helper_phrase = config.calibration.helper_candidates[0]
         if self._semantic_scaffold_helper_weights:
-            helper_phrase = max(self._semantic_scaffold_helper_weights, key=self._semantic_scaffold_helper_weights.get)
+            helper_names = list(self._semantic_scaffold_helper_weights)
+            helper_weights = torch.tensor(
+                [float(self._semantic_scaffold_helper_weights[name]) for name in helper_names],
+                device=self.device_torch,
+                dtype=torch.float32,
+            )
+            helper_index = int(torch.multinomial(helper_weights, 1).item())
+            helper_phrase = helper_names[helper_index]
         neutral_prompts = [prompt.replace(placeholder, neutral_phrase) for prompt in prompts]
         helper_prompts = [prompt.replace(placeholder, helper_phrase) for prompt in prompts]
         target = shared_loss_target(self, noise, batch, timesteps).detach()
