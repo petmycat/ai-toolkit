@@ -3,6 +3,7 @@ import importlib
 import inspect
 import os
 import random
+import json
 from collections import OrderedDict
 from types import MethodType
 from typing import Union, Literal, List, Optional
@@ -820,6 +821,42 @@ class SDTrainer(BaseSDTrainProcess):
                     'caption': getattr(file_item, 'caption_template', None) or getattr(file_item, 'raw_caption', ''),
                     'file_item': file_item,
                 }
+        known_ids = set(items_by_id)
+        dataset_roots = [
+            getattr(dataset, 'dataset_path', None)
+            for dataset in dataset_list
+            if getattr(dataset, 'dataset_path', None) and os.path.isdir(getattr(dataset, 'dataset_path', None))
+        ]
+        if dataset_roots:
+            root = dataset_roots[0]
+            all_ids = tuple(manifest.train_item_ids) + tuple(manifest.heldout_item_ids)
+            for item_id in all_ids:
+                normalized_id = str(item_id).replace('\\', '/')
+                if normalized_id in known_ids:
+                    continue
+                image_path = os.path.join(root, normalized_id.replace('/', os.sep))
+                if not os.path.isfile(image_path):
+                    continue
+                caption = ''
+                stem = os.path.splitext(image_path)[0]
+                for extension in ('.json', '.txt'):
+                    caption_path = stem + extension
+                    if not os.path.isfile(caption_path):
+                        continue
+                    try:
+                        with open(caption_path, 'r', encoding='utf-8') as handle:
+                            loaded = json.load(handle) if extension == '.json' else handle.read()
+                        caption = loaded if isinstance(loaded, str) else str(loaded.get('text', loaded.get('caption', '')))
+                    except (OSError, ValueError, TypeError):
+                        caption = ''
+                    break
+                items_by_id[normalized_id] = {
+                    'dataset_relative_item_id': normalized_id,
+                    'image_path': image_path,
+                    'caption': caption,
+                    'file_item': None,
+                }
+                known_ids.add(normalized_id)
         return manifest, list(items_by_id.values())
 
     def _semantic_scaffold_prepare_case(self, case):
@@ -831,7 +868,15 @@ class SDTrainer(BaseSDTrainProcess):
         if latent is None:
             tensor = getattr(file_item, 'tensor', None) if file_item is not None else None
             if tensor is None:
-                raise RuntimeError(f'fixed probe has no latent or image tensor: {case.item_id}')
+                image_path = item.get('image_path')
+                if not image_path or not os.path.isfile(image_path):
+                    raise RuntimeError(f'fixed probe has no latent or image tensor: {case.item_id}')
+                with Image.open(image_path) as image:
+                    image = image.convert('RGB')
+                    width = max(16, (image.width // 16) * 16)
+                    height = max(16, (image.height // 16) * 16)
+                    image = image.resize((width, height), Image.Resampling.BICUBIC)
+                    tensor = transforms.ToTensor()(image) * 2.0 - 1.0
             with torch.no_grad():
                 latent = self.sd.encode_images([tensor], device=self.device_torch, dtype=get_torch_dtype(self.train_config.dtype))[0]
         latent = latent.to(self.device_torch, dtype=get_torch_dtype(self.train_config.dtype))
