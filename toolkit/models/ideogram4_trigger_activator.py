@@ -653,8 +653,15 @@ class TextActivator(nn.Module):
             return self.module_lora_adapters
         return self.te_adapter
 
-    def parameter_groups(self, learning_rates: Optional[Mapping[str, float]] = None) -> List[Dict[str, Any]]:
+    def parameter_groups(
+        self,
+        learning_rates: Optional[Mapping[str, float]] = None,
+        *,
+        include_frozen: bool = False,
+        lr_multipliers: Optional[Mapping[str, float]] = None,
+    ) -> List[Dict[str, Any]]:
         learning_rates = learning_rates or {}
+        lr_multipliers = lr_multipliers or {}
         groups: List[Dict[str, Any]] = []
         component_modules = {
             "embedding": [self.embedding],
@@ -665,19 +672,19 @@ class TextActivator(nn.Module):
         for name in self.COMPONENTS:
             params: List[nn.Parameter] = []
             for module in component_modules[name]:
-                params.extend(parameter for parameter in module.parameters() if parameter.requires_grad)
+                params.extend(parameter for parameter in module.parameters() if include_frozen or parameter.requires_grad)
             if name in self.component_gammas:
                 params.extend(
-                    parameter for parameter in self.component_gammas[name].parameters() if parameter.requires_grad
+                    parameter for parameter in self.component_gammas[name].parameters() if include_frozen or parameter.requires_grad
                 )
             if name == "embedding":
-                params.extend(parameter for parameter in gamma_parameters if parameter.requires_grad)
+                params.extend(parameter for parameter in gamma_parameters if include_frozen or parameter.requires_grad)
             seen: set[int] = set()
             params = [parameter for parameter in params if not (id(parameter) in seen or seen.add(id(parameter)))]
             if params:
                 group: Dict[str, Any] = {"params": params, "name": f"text_activator.{name}"}
                 if name in learning_rates:
-                    group["lr"] = float(learning_rates[name])
+                    group["lr"] = float(learning_rates[name]) * float(lr_multipliers.get(name, 1.0))
                 groups.append(group)
         return groups
 

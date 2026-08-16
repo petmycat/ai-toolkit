@@ -10,6 +10,7 @@ import torch
 SUPPORTED_ACTIVATOR_MODES = frozenset(
     {
         "full",
+        "semantic_only",
         "embedding_only",
         "tap_only",
         "internal_only",
@@ -137,6 +138,7 @@ class ActivatorRuntimeState:
 
 _MODE_STATES = {
     "full": ActivatorRuntimeState("full", True, True, True, False, False),
+    "semantic_only": ActivatorRuntimeState("semantic_only", True, True, False, False, False),
     "embedding_only": ActivatorRuntimeState("embedding_only", True, False, False, False, False),
     "tap_only": ActivatorRuntimeState("tap_only", False, False, True, False, False),
     "internal_only": ActivatorRuntimeState("internal_only", False, True, False, False, False),

@@ -27,6 +27,10 @@ from toolkit.trigger_validation import (
     make_torch_generator,
     validate_trigger_data_split_config,
     validate_trigger_validation_config,
+    should_run_validation,
+    assert_probe_split_disjoint,
+    build_fixed_probe_sets,
+    write_fixed_probe_results,
 )
 
 
@@ -65,6 +69,57 @@ class _DataSplitConfig:
 
 
 class TriggerValidationTest(unittest.TestCase):
+    def test_exact_steps_override_interval_schedule(self):
+        config = _ValidationConfig(enabled=True, every=100, steps=[0, 10, 25])
+        self.assertTrue(should_run_validation(0, config))
+        self.assertTrue(should_run_validation(10, config))
+        self.assertFalse(should_run_validation(100, config))
+
+    def test_interval_schedule_is_used_without_exact_steps(self):
+        config = _ValidationConfig(enabled=True, every=25, steps=[])
+        self.assertTrue(should_run_validation(50, config))
+        self.assertFalse(should_run_validation(51, config))
+
+    def test_probe_split_leakage_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, 'probe leakage'):
+            assert_probe_split_disjoint(['a.png', 'nested/b.png'], ['nested\\b.png'])
+
+    def test_fixed_probe_sets_are_deterministic_and_disjoint(self):
+        items = [
+            {'dataset_relative_item_id': 'a.png'},
+            {'dataset_relative_item_id': 'b.png'},
+            {'dataset_relative_item_id': 'c.png'},
+            {'dataset_relative_item_id': 'd.png'},
+        ]
+        manifest = {'train_item_ids': ['a.png', 'b.png'], 'heldout_item_ids': ['c.png', 'd.png']}
+        first = build_fixed_probe_sets(items, manifest, seed=42)
+        second = build_fixed_probe_sets(items, manifest, seed=42)
+        self.assertEqual(first, second)
+        self.assertTrue(set(item['dataset_relative_item_id'] for item in first['train']).isdisjoint(
+            item['dataset_relative_item_id'] for item in first['heldout']
+        ))
+
+    def test_fixed_probe_results_write_split_and_aggregate_jsonl(self):
+        config = _ValidationConfig()
+        with tempfile.TemporaryDirectory() as output_dir:
+            probe_sets = {
+                'train': [{'dataset_relative_item_id': 'a.png', 'probe_index': 0}],
+                'heldout': [{'dataset_relative_item_id': 'b.png', 'probe_index': 0}],
+            }
+            write_fixed_probe_results(
+                output_dir,
+                config,
+                step=10,
+                probe_sets=probe_sets,
+                evaluate=lambda item, split, step: {'gain': 0.5 if split == 'train' else 0.25},
+            )
+            for filename in (
+                config.train_probe_output_filename,
+                config.heldout_output_filename,
+                config.aggregate_output_filename,
+            ):
+                self.assertTrue(os.path.isfile(os.path.join(output_dir, filename)))
+
     def test_rng_isolation_restores_all_global_states(self):
         random.seed(101)
         np.random.seed(202)

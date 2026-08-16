@@ -1,14 +1,28 @@
+import math
 import os
 import time
 from typing import List, Optional, Literal, Tuple, Union, TYPE_CHECKING, Dict
 import random
 
 import torch
-import torchaudio
 
-from toolkit.audio.album_artwork import add_album_artwork
-from toolkit.prompt_utils import PromptEmbeds
-from torchao.quantization.quant_primitives import _DTYPE_TO_BIT_WIDTH
+try:
+    import torchaudio
+except (ImportError, OSError):
+    torchaudio = None
+
+try:
+    from toolkit.audio.album_artwork import add_album_artwork
+except (ImportError, OSError):
+    add_album_artwork = None
+try:
+    from toolkit.prompt_utils import PromptEmbeds
+except (ImportError, OSError):
+    PromptEmbeds = None
+try:
+    from torchao.quantization.quant_primitives import _DTYPE_TO_BIT_WIDTH
+except (ImportError, OSError):
+    _DTYPE_TO_BIT_WIDTH = {}
 
 ImgExt = Literal['jpg', 'png', 'webp']
 
@@ -592,6 +606,125 @@ class TriggerBindingResumeConfig:
         self.checkpoint: Optional[str] = kwargs.get('checkpoint', None)
 
 
+class SemanticScaffoldCalibrationConfig:
+    def __init__(self, **kwargs):
+        self.neutral_phrase = str(kwargs.get('neutral_phrase', ''))
+        self.helper_candidates = [str(value) for value in kwargs.get('helper_candidates', [])]
+        self.far_phrases = [str(value) for value in kwargs.get('far_phrases', [])]
+        self.probe_ids = [str(value) for value in kwargs.get('probe_ids', [])]
+        self.probe_limit = int(kwargs.get('probe_limit', 0))
+        self.noise_seeds = [int(value) for value in kwargs.get('noise_seeds', [])]
+        self.fixed_timesteps = [int(value) for value in kwargs.get('fixed_timesteps', [])]
+        self.fixed_sigmas = [float(value) for value in kwargs.get('fixed_sigmas', [])]
+        self.max_helpers = int(kwargs.get('max_helpers', 1))
+        self.manifest_filename = str(kwargs.get('manifest_filename', 'semantic_scaffold_manifest.json'))
+        self.probe_manifest_filename = str(
+            kwargs.get('probe_manifest_filename', 'semantic_scaffold_probe_manifest.json')
+        )
+        self.min_median_gain = float(kwargs.get('min_median_gain', 0.0))
+        self.min_positive_fraction = float(kwargs.get('min_positive_fraction', 0.0))
+        self.min_heldout_positive_fraction = float(kwargs.get('min_heldout_positive_fraction', 0.0))
+        self.min_p10_gain = float(kwargs.get('min_p10_gain', -1.0))
+        self.max_train_heldout_gap = float(kwargs.get('max_train_heldout_gap', 1.0))
+
+
+class SemanticScaffoldHelperBankConfig:
+    def __init__(self, **kwargs):
+        self.selection_mode = str(kwargs.get('selection_mode', 'calibrated'))
+        self.sampling_mode = str(kwargs.get('sampling_mode', 'usefulness_weighted'))
+        self.sampling_floor = float(kwargs.get('sampling_floor', 0.05))
+        self.teacher_mode = str(kwargs.get('teacher_mode', 'sampled_helper'))
+
+
+class SemanticScaffoldHelperLossConfig:
+    def __init__(self, **kwargs):
+        self.mode = str(kwargs.get('mode', 'prediction_effect_cosine'))
+        self.weight = float(kwargs.get('weight', 1.0))
+        self.cosine_epsilon = float(kwargs.get('cosine_epsilon', 1.0e-8))
+        self.minimum_teacher_effect_norm = float(kwargs.get('minimum_teacher_effect_norm', 1.0e-6))
+        self.minimum_private_effect_norm = float(kwargs.get('minimum_private_effect_norm', 1.0e-6))
+
+
+class SemanticScaffoldHelperDecayConfig:
+    def __init__(self, **kwargs):
+        self.gain_ema_decay = float(kwargs.get('gain_ema_decay', 0.95))
+        self.progress_start = float(kwargs.get('progress_start', 1.0))
+        self.progress_end = float(kwargs.get('progress_end', 0.0))
+        self.smoothstep = bool(kwargs.get('smoothstep', True))
+        self.off_margin = float(kwargs.get('off_margin', 0.0))
+        self.off_patience = int(kwargs.get('off_patience', 3))
+        self.permanent_latch = bool(kwargs.get('permanent_latch', True))
+
+
+class SemanticScaffoldTargetUsefulnessConfig:
+    def __init__(self, **kwargs):
+        self.mode = str(kwargs.get('mode', 'normalized_gain_vs_neutral'))
+        self.min_gain = float(kwargs.get('min_gain', 0.0))
+        self.soft_hinge_temperature = float(kwargs.get('soft_hinge_temperature', 0.05))
+        self.weight = float(kwargs.get('weight', 1.0))
+        self.direct_mse_weight = float(kwargs.get('direct_mse_weight', 0.0))
+
+
+class SemanticScaffoldChannelConfig:
+    def __init__(self, **kwargs):
+        self.tap_layers = [int(value) for value in kwargs.get(
+            'tap_layers', [0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 35]
+        )]
+        self.prototype_ema_decay = float(kwargs.get('prototype_ema_decay', 0.95))
+        self.warmup_steps = int(kwargs.get('warmup_steps', 0))
+        self.consistency_weight = float(kwargs.get('consistency_weight', 1.0))
+        self.relative_rms_low = float(kwargs.get('relative_rms_low', 0.25))
+        self.relative_rms_high = float(kwargs.get('relative_rms_high', 4.0))
+        self.band_weight = float(kwargs.get('band_weight', 0.0))
+
+
+class SemanticScaffoldDisturbanceCapConfig:
+    def __init__(self, **kwargs):
+        self.max_beta = float(kwargs.get('max_beta', 1.0))
+        self.weight = float(kwargs.get('weight', 0.0))
+        self.epsilon = float(kwargs.get('epsilon', 1.0e-6))
+
+
+class SemanticScaffoldTapSpecializationConfig:
+    def __init__(self, **kwargs):
+        self.initially_disabled = bool(kwargs.get('initially_disabled', True))
+        self.unlock_min_step = int(kwargs.get('unlock_min_step', 25))
+        self.unlock_min_progress = float(kwargs.get('unlock_min_progress', 0.0))
+        self.unlock_min_semantic_cosine = float(kwargs.get('unlock_min_semantic_cosine', 0.0))
+        self.unlock_min_relative_rms = float(kwargs.get('unlock_min_relative_rms', 0.0))
+        self.max_wait_step = int(kwargs.get('max_wait_step', 100))
+        self.gate_patience = int(kwargs.get('gate_patience', 3))
+        self.lr_ramp_steps = int(kwargs.get('lr_ramp_steps', 25))
+        self.prototype_ema_decay = float(kwargs.get('prototype_ema_decay', 0.95))
+        self.consistency_weight = float(kwargs.get('consistency_weight', 1.0))
+        self.magnitude_band_weight = float(kwargs.get('magnitude_band_weight', 0.0))
+
+
+class SemanticScaffoldDiagnosticsConfig:
+    def __init__(self, **kwargs):
+        self.post_backward_steps = [int(value) for value in kwargs.get('post_backward_steps', [])]
+        self.representative_te_layers = [int(value) for value in kwargs.get('representative_te_layers', [])]
+        self.per_layer = bool(kwargs.get('per_layer', True))
+        self.per_tap = bool(kwargs.get('per_tap', True))
+        self.per_helper = bool(kwargs.get('per_helper', True))
+        self.predictions = bool(kwargs.get('predictions', True))
+
+
+class SemanticScaffoldConfig:
+    def __init__(self, **kwargs):
+        self.enabled = bool(kwargs.get('enabled', True))
+        self.calibration = SemanticScaffoldCalibrationConfig(**kwargs.get('calibration', {}))
+        self.helper_bank = SemanticScaffoldHelperBankConfig(**kwargs.get('helper_bank', {}))
+        self.helper_loss = SemanticScaffoldHelperLossConfig(**kwargs.get('helper_loss', {}))
+        self.helper_decay = SemanticScaffoldHelperDecayConfig(**kwargs.get('helper_decay', {}))
+        self.target_usefulness = SemanticScaffoldTargetUsefulnessConfig(**kwargs.get('target_usefulness', {}))
+        self.semantic_channel = SemanticScaffoldChannelConfig(**kwargs.get('semantic_channel', {}))
+        self.disturbance_cap = SemanticScaffoldDisturbanceCapConfig(**kwargs.get('disturbance_cap', {}))
+        self.tap_specialization = SemanticScaffoldTapSpecializationConfig(**kwargs.get('tap_specialization', {}))
+        self.diagnostics = SemanticScaffoldDiagnosticsConfig(**kwargs.get('diagnostics', {}))
+        self.validation = dict(kwargs.get('validation', {}))
+
+
 class TriggerBindingPhaseConfig:
     def __init__(self, phase_name: str, **kwargs):
         self.phase_name = phase_name
@@ -605,6 +738,9 @@ class TriggerBindingPhaseConfig:
         self.train: Dict[str, bool] = kwargs.get('train', {})
         self.caption_sources: Dict = kwargs.get('caption_sources', {})
         self.losses: Dict = kwargs.get('losses', {})
+        self.semantic_scaffold = SemanticScaffoldConfig(
+            **kwargs.get('losses', {}).get('semantic_scaffold_control_channel', {})
+        )
         self.save_steps: List[int] = [int(step) for step in kwargs.get('save_steps', [])]
         self.resume = TriggerBindingResumeConfig(**kwargs.get('resume', {}))
         self.text_activator_source = TriggerBindingPhaseSourceConfig(
@@ -689,7 +825,9 @@ class TriggerValidationConfig:
     def __init__(self, **kwargs):
         self.enabled: bool = kwargs.get('enabled', False)
         self.every: int = int(kwargs.get('every', 0))
-        self.steps: List[int] = sorted({int(step) for step in kwargs.get('steps', [])})
+        raw_steps = [int(step) for step in kwargs.get('steps', [])]
+        self.steps: List[int] = list(raw_steps)
+        self._raw_steps: Tuple[int, ...] = tuple(raw_steps)
         self.seed: int = int(kwargs.get('seed', 0))
         self.fixed_timesteps: List[int] = [int(value) for value in kwargs.get('fixed_timesteps', [])]
         self.fixed_sigmas: List[float] = [float(value) for value in kwargs.get('fixed_sigmas', [])]
@@ -791,9 +929,11 @@ def validate_three_phase_trigger_training_config(
         raise ValueError('three_phase_trigger_training.schema_version must be 7 or 8')
     is_v8 = config.schema_version == 8
     if is_v8:
-        if config.objective_mode != 'conditional_response_v8':
+        allowed_objectives = {'conditional_response_v8', 'semantic_scaffold_control_channel'}
+        if config.objective_mode not in allowed_objectives:
             raise ValueError(
-                'three_phase_trigger_training.objective_mode must be conditional_response_v8 for schema_version=8'
+                'three_phase_trigger_training.objective_mode must be conditional_response_v8 '
+                'or semantic_scaffold_control_channel for schema_version=8'
             )
         if config.execution.start_phase not in config.PHASE_NAMES:
             raise ValueError('three_phase_trigger_training.execution.start_phase must be a1, b or a2')
@@ -908,6 +1048,10 @@ def validate_three_phase_trigger_training_config(
     )
 
     phases = {name: config.get_phase(name) for name in config.PHASE_NAMES}
+    if len(set(config.validation.steps)) != len(config.validation.steps):
+        raise ValueError('three_phase_trigger_training.validation.steps must be unique')
+    config.validation.steps = sorted(config.validation.steps)
+
     if is_v8:
         a1_sources = phases['a1'].caption_sources or {}
         if a1_sources.get('enabled', False):
@@ -920,6 +1064,90 @@ def validate_three_phase_trigger_training_config(
                     'three_phase_trigger_training.phase_a1.caption_sources must contain only '
                     'the structured/json source; natural captions are introduced in phase_a2'
                 )
+        if config.objective_mode == 'semantic_scaffold_control_channel':
+            if config.execution.start_phase != 'a1' or config.execution.stop_after_phase != 'a1':
+                raise ValueError(
+                    'semantic_scaffold_control_channel only supports execution a1 -> a1'
+                )
+            semantic = phases['a1'].semantic_scaffold
+            calibration = semantic.calibration
+            if not semantic.enabled:
+                raise ValueError('phase_a1 semantic scaffold objective must be enabled')
+            if not isinstance(calibration.neutral_phrase, str):
+                raise ValueError('semantic scaffold calibration.neutral_phrase must be a string')
+            if not calibration.helper_candidates:
+                raise ValueError('semantic scaffold calibration.helper_candidates must not be empty')
+            if len(set(calibration.helper_candidates)) != len(calibration.helper_candidates):
+                raise ValueError('semantic scaffold helper_candidates must be unique')
+            if calibration.neutral_phrase in calibration.helper_candidates:
+                raise ValueError('semantic scaffold helper_candidates must not contain neutral_phrase')
+            if calibration.max_helpers <= 0 or calibration.max_helpers > len(calibration.helper_candidates):
+                raise ValueError('semantic scaffold calibration.max_helpers must be within helper candidates')
+            if calibration.probe_limit < 0:
+                raise ValueError('semantic scaffold calibration.probe_limit must be non-negative')
+            if not calibration.noise_seeds:
+                raise ValueError('semantic scaffold calibration.noise_seeds must not be empty')
+            if bool(calibration.fixed_timesteps) == bool(calibration.fixed_sigmas):
+                raise ValueError('semantic scaffold calibration requires exactly one of fixed_timesteps or fixed_sigmas')
+            for value, name in (
+                (calibration.min_median_gain, 'min_median_gain'),
+                (calibration.min_positive_fraction, 'min_positive_fraction'),
+                (calibration.min_heldout_positive_fraction, 'min_heldout_positive_fraction'),
+                (calibration.min_p10_gain, 'min_p10_gain'),
+                (calibration.max_train_heldout_gap, 'max_train_heldout_gap'),
+            ):
+                if not math.isfinite(value):
+                    raise ValueError(f'semantic scaffold calibration.{name} must be finite')
+            for value, name in (
+                (calibration.min_positive_fraction, 'min_positive_fraction'),
+                (calibration.min_heldout_positive_fraction, 'min_heldout_positive_fraction'),
+            ):
+                if not 0.0 <= value <= 1.0:
+                    raise ValueError(f'semantic scaffold calibration.{name} must be in [0, 1]')
+            if calibration.max_train_heldout_gap < 0:
+                raise ValueError('semantic scaffold calibration.max_train_heldout_gap must be non-negative')
+            if semantic.helper_bank.selection_mode != 'calibrated':
+                raise ValueError('semantic scaffold helper_bank.selection_mode must be calibrated')
+            if semantic.helper_bank.sampling_mode != 'usefulness_weighted':
+                raise ValueError('semantic scaffold helper_bank.sampling_mode must be usefulness_weighted')
+            if semantic.helper_bank.teacher_mode != 'sampled_helper':
+                raise ValueError('semantic scaffold helper_bank.teacher_mode must be sampled_helper')
+            if semantic.helper_bank.sampling_floor < 0 or not math.isfinite(semantic.helper_bank.sampling_floor):
+                raise ValueError('semantic scaffold helper_bank.sampling_floor must be finite and non-negative')
+            helper_loss = semantic.helper_loss
+            if helper_loss.mode != 'prediction_effect_cosine':
+                raise ValueError('semantic scaffold helper_loss.mode must be prediction_effect_cosine')
+            if helper_loss.weight < 0 or helper_loss.cosine_epsilon <= 0:
+                raise ValueError('semantic scaffold helper_loss weight and epsilon are invalid')
+            if helper_loss.minimum_teacher_effect_norm < 0 or helper_loss.minimum_private_effect_norm < 0:
+                raise ValueError('semantic scaffold helper effect norm thresholds must be non-negative')
+            if len(semantic.semantic_channel.tap_layers) != 13 or semantic.semantic_channel.tap_layers != [0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 35]:
+                raise ValueError('semantic scaffold semantic_channel.tap_layers must exactly match Ideogram4 taps')
+            for value, name in (
+                (semantic.semantic_channel.prototype_ema_decay, 'prototype_ema_decay'),
+                (semantic.tap_specialization.prototype_ema_decay, 'tap_specialization.prototype_ema_decay'),
+            ):
+                if not 0.0 <= value < 1.0:
+                    raise ValueError(f'semantic scaffold {name} must be in [0, 1)')
+            if semantic.semantic_channel.warmup_steps < 0:
+                raise ValueError('semantic scaffold semantic_channel.warmup_steps must be non-negative')
+            tap = semantic.tap_specialization
+            if tap.unlock_min_step < 0 or tap.max_wait_step < tap.unlock_min_step:
+                raise ValueError('semantic scaffold tap unlock min/max steps are invalid')
+            if tap.gate_patience <= 0 or tap.lr_ramp_steps < 0:
+                raise ValueError('semantic scaffold tap gate patience/ramp steps are invalid')
+            if tap.initially_disabled is not True:
+                raise ValueError('semantic scaffold tap_specialization.initially_disabled must be true for A1')
+            target = semantic.target_usefulness
+            if target.mode != 'normalized_gain_vs_neutral' or target.weight < 0 or target.direct_mse_weight < 0:
+                raise ValueError('semantic scaffold target_usefulness configuration is invalid')
+            if target.soft_hinge_temperature <= 0:
+                raise ValueError('semantic scaffold target_usefulness.soft_hinge_temperature must be positive')
+            disturbance = semantic.disturbance_cap
+            if disturbance.max_beta < 0 or disturbance.weight < 0 or disturbance.epsilon <= 0:
+                raise ValueError('semantic scaffold disturbance_cap configuration is invalid')
+            if phases['a1'].losses.get('conditional_response_v8'):
+                raise ValueError('semantic scaffold A1 must not configure conditional_response_v8 loss')
         a1_response = phases['a1'].losses.get('conditional_response_v8', {})
         configured_a1_categories = set(
             a1_response.get('responses', a1_response.get('categories', {}))
@@ -2051,6 +2279,8 @@ class GenerateImageConfig:
                 raise ValueError(f"Unsupported video format {self.output_ext}")
         elif self.output_ext in ['wav', 'mp3', 'flac', 'ogg']:
             # save audio file
+            if torchaudio is None:
+                raise RuntimeError('torchaudio is required to save audio outputs')
             audio_path = self.get_image_path(count, max_count)
             torchaudio.save(
                 audio_path, 

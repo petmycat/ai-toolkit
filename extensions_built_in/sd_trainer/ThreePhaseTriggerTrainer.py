@@ -368,15 +368,37 @@ class ThreePhaseTriggerTrainer(BaseExtensionProcess):
         self._write_yaml_atomic(snapshot_path, self.build_child_job_config(phase_name))
         return snapshot_path
 
+    def _semantic_scaffold_contract_records(self, phase_name: str) -> Dict[str, Optional[str]]:
+        if self.three_phase_config.objective_mode != 'semantic_scaffold_control_channel' or phase_name != 'a1':
+            return {}
+        phase_root = self._phase_root(phase_name)
+        return {
+            'manifest': os.path.join(phase_root, 'semantic_scaffold_manifest.json'),
+            'probe_manifest': os.path.join(phase_root, 'semantic_scaffold_probe_manifest.json'),
+            'state_json': os.path.join(phase_root, 'semantic_scaffold_state.json'),
+            'state_safetensors': os.path.join(phase_root, 'semantic_scaffold_state.safetensors'),
+            'validation_train': os.path.join(phase_root, 'semantic_train_validation.jsonl'),
+            'validation_heldout': os.path.join(phase_root, 'semantic_heldout_validation.jsonl'),
+        }
+
     def completion_contract(self, phase_name: str, status: str, return_code: Optional[int] = None) -> Dict:
         phase = self.three_phase_config.get_phase(phase_name)
         phase_artifacts = self._phase_artifacts(phase_name)
         phase_root = self._phase_root(phase_name)
         split_manifest = getattr(self, 'data_split_manifest', None)
+        semantic_records = self._semantic_scaffold_contract_records(phase_name)
+        if status == 'completed' and semantic_records:
+            missing_semantic = [path for path in semantic_records.values() if not os.path.isfile(path)]
+            if missing_semantic:
+                raise FileNotFoundError(
+                    'semantic scaffold completion requires calibration/state/validation artifacts: '
+                    + '; '.join(missing_semantic)
+                )
         return {
             'schema_version': 2 if self.three_phase_config.schema_version == 8 else 1,
             'training_schema_version': self.three_phase_config.schema_version,
             'objective_mode': self.three_phase_config.objective_mode,
+            'semantic_scaffold': semantic_records,
             'architecture_mode': self.three_phase_config.text_activator.architecture_mode,
             'split_manifest_path': self.three_phase_config.data_split.manifest_path,
             'split_manifest_hash': getattr(split_manifest, 'split_hash', None),
@@ -393,6 +415,7 @@ class ThreePhaseTriggerTrainer(BaseExtensionProcess):
             'phase_root': phase_root,
             'steps': phase.steps,
             'inputs': self._source_records(phase_name),
+            'semantic_scaffold': self._semantic_scaffold_contract_records(phase_name),
             'artifacts': {
                 'metrics_file': os.path.join(phase_root, phase_artifacts.metrics_file),
                 'console_log': os.path.join(phase_root, phase_artifacts.console_log),
@@ -546,6 +569,11 @@ class ThreePhaseTriggerTrainer(BaseExtensionProcess):
             if not os.path.isfile(source_path):
                 return False
             if expected_hash is not None and self._sha256_file(source_path) != expected_hash:
+                return False
+        semantic_records = contract.get('semantic_scaffold', {})
+        if self.three_phase_config.objective_mode == 'semantic_scaffold_control_channel' and phase_name == 'a1':
+            required_semantic = ('manifest', 'probe_manifest', 'state_json', 'state_safetensors', 'validation_train', 'validation_heldout')
+            if any(not semantic_records.get(name) or not os.path.isfile(semantic_records[name]) for name in required_semantic):
                 return False
         if self.three_phase_config.schema_version == 8:
             artifacts = contract.get('artifacts', {})

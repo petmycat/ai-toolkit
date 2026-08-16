@@ -21,7 +21,7 @@ def _load_runtime_methods():
         'three_phase_enabled', '_load_trigger_binding_modules', '_call_supported', '_first_callable',
         '_phase_config', '_activator_component_flags', '_configure_phase_trainability',
         'hook_add_extra_train_params', '_activator_mode', '_write_trigger_binding_metrics',
-        '_phase_caption_source_weights', '_prompt_tap_batch', '_check_first_trigger_gradient',
+        '_phase_caption_source_weights', '_prompt_tap_batch', '_check_first_trigger_gradient', '_v8_masked_delta_metrics', '_v8_prompt_delta_norms',
         '_calculate_trigger_binding_loss', '_install_trigger_binding_prompt_encoder', 'encode_static_prompt',
     }
     selected = [node for node in class_node.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names]
@@ -314,6 +314,7 @@ class ThreePhaseRuntimeTest(unittest.TestCase):
             trainer.three_phase_trigger_training.artifacts = SimpleNamespace(
                 phase_a1=SimpleNamespace(metrics_file='metrics.jsonl'),
             )
+            trainer._trigger_binding_metrics_pending_step = 7
             trainer._write_trigger_binding_metrics(torch.tensor(0.5))
             trainer._write_trigger_binding_metrics(torch.tensor(0.75))
             metrics_path = Path(temp_dir) / 'phase_a1' / 'metrics.jsonl'

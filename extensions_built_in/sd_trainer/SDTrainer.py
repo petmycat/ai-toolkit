@@ -45,6 +45,16 @@ from toolkit.unloader import unload_text_encoder
 from PIL import Image
 from torchvision.transforms import functional as TF
 from toolkit.basic import flush
+from toolkit.trigger_validation import (
+    build_fixed_probe_sets,
+    should_run_validation,
+    write_fixed_probe_results,
+    semantic_prediction_metrics,
+)
+from toolkit.semantic_scaffold_calibration import (
+    build_fixed_probe_cases,
+    run_calibration,
+)
 from toolkit.trigger_selective_training import (
     TSTMetricsWriter,
     apply_differential_guidance_target,
@@ -122,7 +132,17 @@ class SDTrainer(BaseSDTrainProcess):
         self._trigger_binding_last_metrics_written_step = None
         self._trigger_gradient_reachability_checked = False
         self._trigger_optimizer_isolation_checked = False
-        self._trigger_gradient_reachability_checked = False
+        self._trigger_binding_probe_sets = None
+        self._trigger_binding_probe_manifest_hash = None
+        self._trigger_binding_validation_steps = set()
+        self._semantic_scaffold_state = None
+        self._semantic_scaffold_tap_lr_ramp = 0.0
+        self._semantic_scaffold_gradient_diagnostics = {}
+        self._semantic_scaffold_manifest = None
+        self._semantic_scaffold_probe_cases = []
+        self._semantic_scaffold_probe_case_by_id = {}
+        self._semantic_scaffold_helper_weights = {}
+        self._semantic_scaffold_calibration_complete = False
 
         self.dfe: Optional[DiffusionFeatureExtractor] = None
         self.unconditional_embeds = None
@@ -239,10 +259,19 @@ class SDTrainer(BaseSDTrainProcess):
     def _configure_phase_trainability(self):
         flags = self._activator_component_flags()
         phase_is_b = self.runtime_phase == 'b'
+        semantic = bool(getattr(self, 'semantic_scaffold_enabled', False))
+        semantic_state = getattr(self, '_semantic_scaffold_state', None)
+        tap_unlocked = bool(
+            semantic_state is not None
+            and semantic_state.curriculum.unlock_step is not None
+        )
         for component, trainable in flags.items():
             setter = getattr(self.text_activator, 'set_component_mode', None)
             if callable(setter):
-                setter(component, active=True, trainable=trainable and not phase_is_b)
+                effective_trainable = trainable and not phase_is_b
+                if semantic and component == 'tap_adapters':
+                    effective_trainable = effective_trainable and tap_unlocked
+                setter(component, active=True, trainable=effective_trainable)
             else:
                 module = getattr(self.text_activator, component, None)
                 if module is not None:
@@ -260,6 +289,8 @@ class SDTrainer(BaseSDTrainProcess):
         for name, parameter in self.text_activator.named_parameters():
             if name.startswith('gamma.') or name.startswith('component_gammas.'):
                 parameter.requires_grad_(gamma_trainable)
+        if semantic and not tap_unlocked:
+            self.text_activator.set_component_mode('tap_adapters', active=False, trainable=False)
         if self.network is not None:
             network_trainable = bool(self._phase_config().train.get('diffusion_lora', phase_is_b))
             self.network.requires_grad_(network_trainable)
@@ -479,7 +510,7 @@ class SDTrainer(BaseSDTrainProcess):
             placeholder = self.three_phase_trigger_training.placeholder
             literal = self.three_phase_trigger_training.literal
             placeholder_presence = [placeholder in text for text in prompts]
-            if runtime_mode == 'activator_bypass' and not any(placeholder_presence):
+            if runtime_mode in {'activator_bypass', 'stock_literal'} and not any(placeholder_presence):
                 return original(prompt, runtime_mode=runtime_mode, **kwargs)
             if not any(placeholder_presence) and all(literal in text for text in prompts):
                 # The standard ai-toolkit caption path has already replaced the
@@ -510,6 +541,7 @@ class SDTrainer(BaseSDTrainProcess):
                 'extensions_built_in.diffusion_models.ideogram4.src.pipeline'
             )
             return_taps = bool(kwargs.pop('return_taps', False))
+            return_activator_details = bool(kwargs.pop('return_activator_details', False))
             features_result = pipeline.get_qwen3_vl_features(
                 sd_model.text_encoder,
                 batch.input_ids,
@@ -521,8 +553,9 @@ class SDTrainer(BaseSDTrainProcess):
                 runtime_mode=runtime_mode or 'full',
                 runtime_metadata=(batch.runtime_metadata() if hasattr(batch, 'runtime_metadata') else None),
                 return_taps=return_taps,
+                return_activator_details=return_activator_details,
             )
-            if return_taps:
+            if return_activator_details or return_taps:
                 features, taps = features_result
             else:
                 features = features_result
@@ -534,12 +567,27 @@ class SDTrainer(BaseSDTrainProcess):
                     for index in range(batch.trigger_mask.shape[0])
                 ],
             }
-            if return_taps:
+            if return_taps and not return_activator_details:
                 embeds_kwargs['text_taps'] = [
                     torch.stack([
                         tap[index, :int(batch.attention_mask[index].sum().item())]
                         for tap in taps
                     ], dim=0)
+                    for index in range(features.shape[0])
+                ]
+            if return_activator_details:
+                embeds_kwargs['activator_details'] = [
+                    {
+                        key: (
+                            torch.stack([
+                                value[index, :int(batch.attention_mask[index].sum().item())]
+                                for value in taps[key]
+                            ], dim=0)
+                            if key in {'pre_taps', 'post_taps', 'tap_residuals'}
+                            else value
+                        )
+                        for key, value in taps.items()
+                    }
                     for index in range(features.shape[0])
                 ]
             embeds = AdvancedPromptEmbeds(**embeds_kwargs)
@@ -574,7 +622,20 @@ class SDTrainer(BaseSDTrainProcess):
                 filtered.append(group)
         if not phase_is_b:
             learning_rates = self._phase_config().learning_rates
-            groups = self.text_activator.parameter_groups(learning_rates)
+            semantic = bool(getattr(self, 'semantic_scaffold_enabled', False))
+            tap_multiplier = getattr(self, '_semantic_scaffold_tap_lr_ramp', 0.0) if semantic else 1.0
+            parameter_groups = self.text_activator.parameter_groups
+            if semantic:
+                try:
+                    groups = parameter_groups(
+                        learning_rates,
+                        include_frozen=True,
+                        lr_multipliers={'tap_adapters': tap_multiplier},
+                    )
+                except TypeError:
+                    groups = parameter_groups(learning_rates)
+            else:
+                groups = parameter_groups(learning_rates)
             present = {id(parameter) for group in filtered for parameter in (group.get('params', []) if isinstance(group, dict) else [group])}
             for group in groups:
                 group['params'] = [parameter for parameter in group['params'] if id(parameter) not in present]
@@ -735,8 +796,232 @@ class SDTrainer(BaseSDTrainProcess):
             self.taesd.eval()
             self.taesd.requires_grad_(False)
 
+    def _semantic_scaffold_items(self):
+        split_config = getattr(self.three_phase_trigger_training, 'data_split', None)
+        manifest_path = getattr(split_config, 'manifest_path', None)
+        if not manifest_path:
+            raise RuntimeError('semantic scaffold requires data_split.manifest_path')
+        split_module = importlib.import_module('toolkit.trigger_data_split')
+        manifest = split_module.load_data_split_manifest(manifest_path)
+        datasets = getattr(getattr(self, 'data_loader', None), 'dataset', None)
+        dataset_list = getattr(datasets, 'datasets', None) or ([datasets] if datasets is not None else [])
+        items = []
+        for dataset in dataset_list:
+            for file_item in getattr(dataset, 'file_list', []) or []:
+                item_id = getattr(file_item, 'dataset_relative_item_id', None)
+                if item_id is not None:
+                    items.append({
+                        'dataset_relative_item_id': item_id,
+                        'image_path': getattr(file_item, 'path', None),
+                        'caption': getattr(file_item, 'caption_template', None) or getattr(file_item, 'raw_caption', ''),
+                        'file_item': file_item,
+                    })
+        return manifest, items
+
+    def _semantic_scaffold_prepare_case(self, case):
+        item = self._semantic_scaffold_probe_case_by_id[case.probe_case_id]
+        file_item = item.get('file_item')
+        latent = None
+        if file_item is not None and hasattr(file_item, 'get_latent'):
+            latent = file_item.get_latent()
+        if latent is None:
+            tensor = getattr(file_item, 'tensor', None) if file_item is not None else None
+            if tensor is None:
+                raise RuntimeError(f'fixed probe has no latent or image tensor: {case.item_id}')
+            with torch.no_grad():
+                latent = self.sd.encode_images([tensor], device=self.device_torch, dtype=get_torch_dtype(self.train_config.dtype))[0]
+        latent = latent.to(self.device_torch, dtype=get_torch_dtype(self.train_config.dtype))
+        if latent.ndim == 3:
+            latent = latent.unsqueeze(0)
+        generator = torch.Generator(device=latent.device)
+        generator.manual_seed(int(case.noise_seed))
+        noise = torch.randn(latent.shape, generator=generator, device=latent.device, dtype=latent.dtype)
+        schedule = float(case.timestep) / 1000.0 if case.timestep is not None else float(case.sigma)
+        schedule = max(0.0, min(1.0, schedule))
+        shape = (1,) + (1,) * (latent.ndim - 1)
+        noisy = latent * (1.0 - schedule) + noise * schedule
+        target = noise - latent
+        return {
+            'latent': latent,
+            'noise': noise,
+            'noisy_latents': noisy,
+            'timesteps': torch.tensor([float(case.timestep if case.timestep is not None else schedule * 1000.0)], device=latent.device, dtype=latent.dtype),
+            'target': target,
+            'prompt_template': str(item.get('caption', '')),
+            'placeholder': self.three_phase_trigger_training.placeholder,
+        }
+
+    def _semantic_scaffold_predict_phrase(self, phrase, prepared):
+        prompt = prepared['prompt_template'].replace(prepared['placeholder'], phrase)
+        embeds = self._trigger_binding_prompt_encoder([prompt], runtime_mode='stock_literal')
+        return self.predict_noise(
+            noisy_latents=prepared['noisy_latents'],
+            timesteps=prepared['timesteps'],
+            conditional_embeds=embeds.to(self.device_torch, dtype=prepared['noisy_latents'].dtype),
+            unconditional_embeds=None,
+            batch=self._semantic_scaffold_probe_batch(prepared),
+            is_primary_pred=False,
+        )
+
+    def _semantic_scaffold_probe_batch(self, prepared):
+        return type('SemanticScaffoldProbeBatch', (), {
+            'latents': prepared['latent'],
+            'file_items': [],
+            'audio_pred_slot': None,
+        })()
+
+    def _run_semantic_scaffold_calibration(self):
+        if not self.semantic_scaffold_enabled or self._semantic_scaffold_calibration_complete:
+            return
+        config = self._semantic_scaffold_config()
+        manifest, items = self._semantic_scaffold_items()
+        calibration = config.calibration
+        cases = build_fixed_probe_cases(
+            items,
+            {'train_item_ids': manifest.train_item_ids, 'heldout_item_ids': manifest.heldout_item_ids},
+            noise_seeds=calibration.noise_seeds,
+            fixed_timesteps=calibration.fixed_timesteps,
+            fixed_sigmas=calibration.fixed_sigmas,
+            limit=calibration.probe_limit,
+        )
+        items_by_id = {
+            str(item['dataset_relative_item_id']).replace('\\', '/'): item
+            for item in items
+        }
+        self._semantic_scaffold_probe_case_by_id = {
+            case.probe_case_id: items_by_id[case.item_id]
+            for case in cases
+        }
+        phase_root = os.path.join(self.three_phase_trigger_training.run_root or self.save_root, f'phase_{self.runtime_phase}')
+        identity = {'split_hash': manifest.split_hash, 'objective_mode': 'semantic_scaffold_control_channel', 'phase': 'a1'}
+        result = run_calibration(
+            cases,
+            calibration.helper_candidates,
+            neutral_phrase=calibration.neutral_phrase,
+            prepare_case=self._semantic_scaffold_prepare_case,
+            predict_phrase=self._semantic_scaffold_predict_phrase,
+            selection_kwargs={
+                'min_median_gain': calibration.min_median_gain,
+                'min_positive_fraction': calibration.min_positive_fraction,
+                'min_heldout_positive_fraction': calibration.min_heldout_positive_fraction,
+                'min_p10_gain': calibration.min_p10_gain,
+                'max_train_heldout_gap': calibration.max_train_heldout_gap,
+                'max_helpers': calibration.max_helpers,
+                'sampling_floor': config.helper_bank.sampling_floor,
+            },
+            output_dir=phase_root,
+            identity=identity,
+            manifest_filename=calibration.manifest_filename,
+            probe_manifest_filename=calibration.probe_manifest_filename,
+        )
+        self._semantic_scaffold_manifest = result
+        self._semantic_scaffold_helper_weights = dict(result.get('sampling_weights', {}))
+        self._semantic_scaffold_probe_cases = cases
+        self._semantic_scaffold_calibration_complete = True
+        self._trigger_binding_probe_sets = {
+            split: [
+                {
+                    **case.as_dict(),
+                    'dataset_relative_item_id': case.item_id,
+                    'probe_index': index,
+                }
+                for index, case in enumerate(case for case in cases if case.split == split)
+            ]
+            for split in ('train', 'heldout')
+        }
+        self._trigger_binding_probe_manifest_hash = result['probe_manifest_hash']
+        self._semantic_scaffold_fixed_probe_evaluator = self._evaluate_semantic_scaffold_probe
+
+    def _evaluate_semantic_scaffold_probe(self, item, split, step):
+        case = self._semantic_scaffold_probe_case_by_id[item.get('probe_case_id')]
+        prepared = self._semantic_scaffold_prepare_case(case)
+        template = prepared['prompt_template']
+        placeholder = prepared['placeholder']
+        neutral = self._semantic_scaffold_config().calibration.neutral_phrase
+        helper = next(iter(self._semantic_scaffold_helper_weights), self._semantic_scaffold_config().calibration.helper_candidates[0])
+        def prompt_for(value):
+            return [template.replace(placeholder, value)]
+        def prediction(prompts, mode):
+            if mode == 'stock_literal':
+                embeds = self._trigger_binding_prompt_encoder(prompts, runtime_mode=mode)
+            else:
+                with self._activator_mode(mode):
+                    embeds = self.sd.get_prompt_embeds(prompts)
+            return self.predict_noise(
+                noisy_latents=prepared['noisy_latents'], timesteps=prepared['timesteps'],
+                conditional_embeds=embeds.to(self.device_torch, dtype=prepared['noisy_latents'].dtype),
+                unconditional_embeds=None,
+                batch=self._semantic_scaffold_probe_batch(prepared),
+                is_primary_pred=False,
+            )
+        with torch.no_grad():
+            neutral_prediction = prediction(prompt_for(neutral), 'stock_literal')
+            helper_prediction = prediction(prompt_for(helper), 'stock_literal')
+            bypass_prediction = prediction([template], 'activator_bypass')
+            semantic_prediction = prediction([template], 'semantic_only')
+            full_prediction = prediction([template], 'full')
+        metrics = semantic_prediction_metrics(
+            neutral_prediction=neutral_prediction, helper_prediction=helper_prediction,
+            bypass_prediction=bypass_prediction, semantic_prediction=semantic_prediction,
+            full_prediction=full_prediction, target=prepared['target'],
+        )
+        return {'schema': 'ai-toolkit.semantic-scaffold-validation', 'schema_version': 1, 'probe_case_id': case.probe_case_id, **metrics, 'fixed_timestep': case.timestep, 'fixed_sigma': case.sigma}
+
+    def _prepare_v8_fixed_probe_sets(self):
+        if self.semantic_scaffold_enabled:
+            self._run_semantic_scaffold_calibration()
+            return
+        config = self._v8_validation_config()
+        split_config = getattr(self.three_phase_trigger_training, 'data_split', None)
+        manifest_path = getattr(config, 'data_split_manifest', None) or getattr(split_config, 'manifest_path', None)
+        if config is None or not getattr(config, 'enabled', False) or not manifest_path:
+            return
+        split_module = importlib.import_module('toolkit.trigger_data_split')
+        manifest = split_module.load_data_split_manifest(manifest_path)
+        items = []
+        datasets = getattr(getattr(self, 'data_loader', None), 'dataset', None)
+        dataset_list = getattr(datasets, 'datasets', None) or ([datasets] if datasets is not None else [])
+        for dataset in dataset_list:
+            for file_item in getattr(dataset, 'file_list', []) or []:
+                item_id = getattr(file_item, 'dataset_relative_item_id', None)
+                if item_id is None:
+                    continue
+                items.append({
+                    'dataset_relative_item_id': item_id,
+                    'image_path': getattr(file_item, 'path', None),
+                    'caption': getattr(file_item, 'caption_template', None) or getattr(file_item, 'raw_caption', ''),
+                })
+        known_ids = {item['dataset_relative_item_id'] for item in items}
+        dataset_root = next((getattr(dataset, 'dataset_path', None) for dataset in dataset_list if getattr(dataset, 'dataset_path', None)), None)
+        for item_id in tuple(manifest.train_item_ids) + tuple(manifest.heldout_item_ids):
+            if item_id in known_ids or dataset_root is None:
+                continue
+            image_path = os.path.join(dataset_root, item_id.replace('/', os.sep))
+            caption = ''
+            for extension in ('.json', '.txt'):
+                caption_path = os.path.splitext(image_path)[0] + extension
+                if not os.path.isfile(caption_path):
+                    continue
+                with open(caption_path, 'r', encoding='utf-8') as handle:
+                    loaded = handle.read() if extension == '.txt' else __import__('json').load(handle)
+                caption = loaded if isinstance(loaded, str) else str(loaded.get('text', loaded.get('caption', '')))
+                break
+            items.append({'dataset_relative_item_id': item_id, 'image_path': image_path, 'caption': caption})
+        self._trigger_binding_probe_sets = build_fixed_probe_sets(
+            items,
+            {
+                'train_item_ids': manifest.train_item_ids,
+                'heldout_item_ids': manifest.heldout_item_ids,
+            },
+            seed=int(getattr(config, 'seed', 0)),
+        )
+        self._trigger_binding_probe_manifest_hash = manifest.split_hash
+
     def hook_before_train_loop(self):
         super().hook_before_train_loop()
+        self._prepare_v8_fixed_probe_sets()
+        if self.semantic_scaffold_enabled:
+            self._maybe_run_v8_fixed_validation()
         if self.three_phase_enabled:
             probe_config = self.three_phase_trigger_training.reachability_probe
             if probe_config.get('enabled', True):
@@ -1842,6 +2127,18 @@ class SDTrainer(BaseSDTrainProcess):
             and getattr(self.three_phase_trigger_training, 'objective_mode', None) == 'conditional_response_v8'
         )
 
+    @property
+    def semantic_scaffold_enabled(self):
+        return bool(
+            self.three_phase_enabled
+            and self.runtime_phase == 'a1'
+            and getattr(self.three_phase_trigger_training, 'schema_version', 7) == 8
+            and getattr(self.three_phase_trigger_training, 'objective_mode', None) == 'semantic_scaffold_control_channel'
+        )
+
+    def _semantic_scaffold_config(self):
+        return self._phase_config().semantic_scaffold
+
     def _conditional_response_config(self):
         losses = getattr(self.three_phase_trigger_training.phase_runtime, 'losses', {}) or {}
         return losses.get('conditional_response_v8', losses.get('conditional_response', {}))
@@ -1869,6 +2166,8 @@ class SDTrainer(BaseSDTrainProcess):
         if self.runtime_phase == 'b' and not self.conditional_response_v8_enabled:
             return
         if self._trigger_binding_last_metrics_written_step == self.step_num:
+            return
+        if self.runtime_phase in {'a1', 'a2'} and getattr(self, '_trigger_binding_metrics_pending_step', None) != self.step_num:
             return
         artifact_config = getattr(
             self.three_phase_trigger_training.artifacts,
@@ -2006,6 +2305,167 @@ class SDTrainer(BaseSDTrainProcess):
             raise_on_error=True,
         )
         self._trigger_gradient_reachability_checked = True
+
+    def _calculate_semantic_scaffold_a1_loss(
+        self,
+        noisy_latents,
+        noise,
+        timesteps,
+        batch,
+        pred_kwargs,
+        dtype,
+    ):
+        config = self._semantic_scaffold_config()
+        loss_module = self._load_trigger_binding_modules()['losses']
+        prompts = [
+            getattr(item, 'caption_template', None) or item.raw_caption
+            for item in batch.file_items
+        ]
+        placeholder = self.three_phase_trigger_training.placeholder
+        neutral_phrase = config.calibration.neutral_phrase
+        helper_phrase = config.calibration.helper_candidates[0]
+        if self._semantic_scaffold_helper_weights:
+            helper_phrase = max(self._semantic_scaffold_helper_weights, key=self._semantic_scaffold_helper_weights.get)
+        neutral_prompts = [prompt.replace(placeholder, neutral_phrase) for prompt in prompts]
+        helper_prompts = [prompt.replace(placeholder, helper_phrase) for prompt in prompts]
+        target = shared_loss_target(self, noise, batch, timesteps).detach()
+
+        def predict(prompt_batch, mode, *, details=False, detach=False):
+            if mode == 'stock_literal':
+                embeds = self._trigger_binding_prompt_encoder(
+                    prompt_batch,
+                    runtime_mode='stock_literal',
+                )
+                prediction = self.predict_noise(
+                    noisy_latents=noisy_latents,
+                    timesteps=timesteps,
+                    conditional_embeds=embeds.to(self.device_torch, dtype=dtype),
+                    unconditional_embeds=None,
+                    batch=batch,
+                    is_primary_pred=False,
+                    **pred_kwargs,
+                )
+                return prediction.detach(), embeds.detach()
+            with self._activator_mode(mode):
+                embeds = self.sd.get_prompt_embeds(
+                    prompt_batch,
+                    return_activator_details=details,
+                )
+                prediction = self.predict_noise(
+                    noisy_latents=noisy_latents,
+                    timesteps=timesteps,
+                    conditional_embeds=embeds.to(self.device_torch, dtype=dtype),
+                    unconditional_embeds=None,
+                    batch=batch,
+                    is_primary_pred=mode in {'semantic_only', 'full'},
+                    **pred_kwargs,
+                )
+            if detach:
+                prediction = prediction.detach()
+                embeds = embeds.detach()
+            return prediction, embeds
+
+        neutral_prediction, _ = predict(neutral_prompts, 'stock_literal', detach=True)
+        helper_prediction, _ = predict(helper_prompts, 'stock_literal', detach=True)
+        bypass_prediction, _ = predict(prompts, 'activator_bypass', detach=True)
+        semantic_prediction, semantic_embeds = predict(prompts, 'semantic_only', details=True)
+        full_prediction, full_embeds = predict(prompts, 'full', details=True)
+
+        neutral_mse = loss_module.per_item_diffusion_mse(neutral_prediction, target)
+        semantic_mse = loss_module.per_item_diffusion_mse(semantic_prediction, target)
+        full_mse = loss_module.per_item_diffusion_mse(full_prediction, target)
+        gain = loss_module.normalized_gain_vs_neutral(full_mse, neutral_mse)
+        target_cfg = config.target_usefulness
+        target_floor = loss_module.soft_gain_floor(
+            gain,
+            target_cfg.min_gain,
+            target_cfg.soft_hinge_temperature,
+        )
+        target_loss = target_cfg.weight * target_floor
+        if target_cfg.direct_mse_weight:
+            target_loss = target_loss + target_cfg.direct_mse_weight * full_mse
+
+        helper_effect = helper_prediction - neutral_prediction
+        semantic_effect = semantic_prediction - bypass_prediction
+        helper_result = loss_module.effect_direction_cosine(
+            semantic_effect,
+            helper_effect,
+            epsilon=config.helper_loss.cosine_epsilon,
+            minimum_teacher_norm=config.helper_loss.minimum_teacher_effect_norm,
+            minimum_private_norm=config.helper_loss.minimum_private_effect_norm,
+        )
+        helper_loss = config.helper_loss.weight * helper_result.loss
+        beta = loss_module.normalized_disturbance_beta(full_prediction, bypass_prediction, target)
+        disturbance_loss = config.disturbance_cap.weight * loss_module.disturbance_cap_penalty(
+            beta, config.disturbance_cap.max_beta
+        )
+        progress = min(1.0, max(0.0, float(self.step_num) / max(config.semantic_channel.warmup_steps, 1)))
+        semantic_consistency = loss_module.effect_direction_cosine(
+            full_prediction - bypass_prediction,
+            semantic_prediction.detach() - bypass_prediction,
+            epsilon=config.helper_loss.cosine_epsilon,
+            minimum_teacher_norm=config.helper_loss.minimum_teacher_effect_norm,
+            minimum_private_norm=config.helper_loss.minimum_private_effect_norm,
+        )
+        consistency_weight = config.semantic_channel.consistency_weight * progress
+        total = target_loss.mean() + helper_loss + disturbance_loss.mean() + consistency_weight * semantic_consistency.loss
+        metrics = {
+            'a1/semantic_scaffold/target_gain': float(gain.detach().mean().item()),
+            'a1/semantic_scaffold/target_loss': float(target_loss.detach().mean().item()),
+            'a1/semantic_scaffold/helper_effect_cosine': float(helper_result.cosine_per_item.detach().mean().item()),
+            'a1/semantic_scaffold/helper_effect_loss': float(helper_loss.detach().item()),
+            'a1/semantic_scaffold/disturbance_beta': float(beta.detach().mean().item()),
+            'a1/semantic_scaffold/disturbance_loss': float(disturbance_loss.detach().mean().item()),
+            'a1/semantic_scaffold/semantic_consistency': float(semantic_consistency.loss.detach().item()),
+            'a1/semantic_scaffold/progress': progress,
+            'a1/semantic_scaffold/tap_gate_stage': self._semantic_scaffold_state.curriculum.stage if self._semantic_scaffold_state is not None else 'a1.0',
+            'a1/semantic_scaffold/tap_lr_ramp': self._semantic_scaffold_tap_lr_ramp,
+        }
+        self._trigger_binding_last_metrics = metrics
+        self.additional_logs['runtime_phase'] = self.runtime_phase
+        for key, value in metrics.items():
+            self.additional_logs[f'phase/{self.runtime_phase}/{key}'] = float(value)
+        self._semantic_scaffold_last_embeddings = (semantic_embeds, full_embeds)
+        if self._semantic_scaffold_state is None:
+            state_module = importlib.import_module('toolkit.semantic_scaffold_state')
+            self._semantic_scaffold_state = state_module.SemanticScaffoldState(
+                tuple(config.semantic_channel.tap_layers)
+            )
+        gate = self._semantic_scaffold_state.curriculum
+        gate.observe_gate(
+            step=int(self.step_num),
+            progress=progress,
+            semantic_cosine=float(semantic_consistency.cosine_per_item.detach().mean().item()),
+            relative_rms=float(torch.linalg.vector_norm(semantic_effect.detach()).item()),
+            min_step=config.tap_specialization.unlock_min_step,
+            min_progress=config.tap_specialization.unlock_min_progress,
+            min_semantic_cosine=config.tap_specialization.unlock_min_semantic_cosine,
+            min_relative_rms=config.tap_specialization.unlock_min_relative_rms,
+            patience=config.tap_specialization.gate_patience,
+            max_wait_step=config.tap_specialization.max_wait_step,
+        )
+        self._semantic_scaffold_tap_lr_ramp = gate.advance_ramp(
+            step=int(self.step_num),
+            ramp_steps=config.tap_specialization.lr_ramp_steps,
+        )
+        self._sync_semantic_scaffold_tap_runtime()
+        self._semantic_scaffold_gradient_diagnostics = {
+            name: {
+                'requires_grad': bool(parameter.requires_grad),
+                'gradient_norm': None if parameter.grad is None else float(parameter.grad.detach().float().norm().item()),
+            }
+            for name, parameter in self.text_activator.named_parameters()
+            if name.startswith('embedding') or 'module_lora' in name or 'tap_adapters' in name
+        }
+        self._semantic_scaffold_last_predictions = {
+            'neutral': neutral_prediction,
+            'helper': helper_prediction,
+            'bypass': bypass_prediction,
+            'semantic': semantic_prediction,
+            'full': full_prediction,
+            'target': target,
+        }
+        return total
 
     def _calculate_trigger_binding_loss(
         self,
@@ -2176,29 +2636,89 @@ class SDTrainer(BaseSDTrainProcess):
             return 0.0
         return float(torch.stack(finite).mean().item())
 
+    @staticmethod
+    def _v8_masked_delta_metrics(delta, mask=None, prefix=''):
+        delta = delta.float()
+        metrics = {
+            f'{prefix}delta_rms': float(delta.square().mean().sqrt().detach().item()),
+            f'{prefix}delta_max_abs': float(delta.abs().max().detach().item()),
+        }
+        if mask is None:
+            return metrics
+        mask = mask.to(device=delta.device, dtype=torch.bool)
+        while mask.ndim < delta.ndim:
+            mask = mask.unsqueeze(-1)
+        mask = torch.broadcast_to(mask, delta.shape)
+        selected = delta.masked_select(mask)
+        inverse = ~mask
+        non_selected = delta.masked_select(inverse)
+        metrics[f'{prefix}rms'] = float(
+            selected.square().mean().sqrt().detach().item() if selected.numel() else 0.0
+        )
+        metrics[f'{prefix}max_abs'] = float(selected.abs().max().detach().item() if selected.numel() else 0.0)
+        metrics[f'{prefix}non_trigger_rms'] = float(
+            non_selected.square().mean().sqrt().detach().item() if non_selected.numel() else 0.0
+        )
+        metrics[f'{prefix}non_trigger_max_abs'] = float(
+            non_selected.abs().max().detach().item() if non_selected.numel() else 0.0
+        )
+        return metrics
+
     @classmethod
     def _v8_prompt_delta_norms(cls, active_embeds, bypass_embeds):
         metrics = {}
         active_text = getattr(active_embeds, 'text_embeds', None)
         bypass_text = getattr(bypass_embeds, 'text_embeds', None)
+        trigger_masks = getattr(active_embeds, 'trigger_masks', None)
         if active_text is not None and bypass_text is not None:
             active_values = active_text if isinstance(active_text, (list, tuple)) else [active_text]
             bypass_values = bypass_text if isinstance(bypass_text, (list, tuple)) else [bypass_text]
             deltas = [active - bypass for active, bypass in zip(active_values, bypass_values)]
             metrics['conditioning_delta_norm'] = cls._v8_tensor_mean_norm(deltas)
+            all_rms = []
+            trigger_rms = []
+            suffix_rms = []
+            max_abs = []
+            for index, delta in enumerate(deltas):
+                token_mask = None
+                if trigger_masks is not None and index < len(trigger_masks):
+                    token_mask = trigger_masks[index]
+                stats = cls._v8_masked_delta_metrics(delta, token_mask, 'conditioning_')
+                all_rms.append(stats['conditioning_delta_rms'])
+                max_abs.append(stats['conditioning_delta_max_abs'])
+                if token_mask is not None:
+                    trigger_rms.append(stats['conditioning_rms'])
+                    suffix_rms.append(stats['conditioning_non_trigger_rms'])
+            metrics['conditioning_delta_rms'] = sum(all_rms) / max(len(all_rms), 1)
+            metrics['conditioning_delta_max_abs'] = max(max_abs, default=0.0)
+            metrics['conditioning_trigger_span_rms'] = sum(trigger_rms) / max(len(trigger_rms), 1)
+            metrics['conditioning_non_trigger_rms'] = sum(suffix_rms) / max(len(suffix_rms), 1)
         if (
             'text_taps' in active_embeds and 'text_taps' in bypass_embeds
             and 'trigger_masks' in active_embeds
         ):
-            active_taps, trigger_mask, _ = cls._prompt_tap_batch(active_embeds)
+            active_taps, trigger_mask, valid_mask = cls._prompt_tap_batch(active_embeds)
             bypass_taps, _, _ = cls._prompt_tap_batch(bypass_embeds)
             delta = (active_taps - bypass_taps).float()
-            mask = trigger_mask[:, None, :, None].to(delta.dtype)
-            denominator = mask.sum().clamp_min(1.0)
+            trigger = trigger_mask[:, None, :].expand(-1, delta.shape[1], -1)
+            valid = valid_mask[:, None, :].expand(-1, delta.shape[1], -1)
+            trigger_valid = trigger & valid
+            non_trigger_valid = (~trigger) & valid
             metrics['trigger_span_tap_delta_norm'] = float(
-                (delta * mask).square().sum().sqrt().div(denominator.sqrt()).detach().item()
+                delta.masked_select(trigger_valid.unsqueeze(-1)).square().mean().sqrt().detach().item()
+                if trigger_valid.any() else 0.0
             )
-            metrics['final_tap_delta_norm'] = float(delta.square().sum().sqrt().detach().item())
+            metrics['final_tap_delta_norm'] = float(delta.square().mean().sqrt().detach().item())
+            metrics['tap_delta_rms'] = metrics['final_tap_delta_norm']
+            metrics['tap_trigger_span_rms'] = float(
+                delta.masked_select(trigger_valid.unsqueeze(-1)).square().mean().sqrt().detach().item()
+                if trigger_valid.any() else 0.0
+            )
+            metrics['tap_non_trigger_rms'] = float(
+                delta.masked_select(non_trigger_valid.unsqueeze(-1)).square().mean().sqrt().detach().item()
+                if non_trigger_valid.any() else 0.0
+            )
+            metrics['tap_delta_max_abs'] = float(delta.abs().max().detach().item())
         return metrics
 
     def _v8_gradient_diagnostics(self, loss, config):
@@ -2548,7 +3068,8 @@ class SDTrainer(BaseSDTrainProcess):
         self.additional_logs['runtime_phase'] = self.runtime_phase
         for key, value in metrics.items():
             self.additional_logs[f'phase/{self.runtime_phase}/{key}'] = float(value)
-        self._write_trigger_binding_metrics(loss)
+        self._trigger_binding_metrics_pending_loss = loss.detach()
+        self._trigger_binding_metrics_pending_step = self.step_num
         return loss
 
     def _encode_tst_prompt_variants(self, batch, trigger_prompts, decoy_prompts, dtype):
@@ -2839,6 +3360,66 @@ class SDTrainer(BaseSDTrainProcess):
                 ],
             })
         return loss
+
+    def _sync_semantic_scaffold_tap_runtime(self):
+        if not self.semantic_scaffold_enabled or self._semantic_scaffold_state is None:
+            return
+        unlocked = self._semantic_scaffold_state.curriculum.unlock_step is not None
+        self.text_activator.set_component_mode('tap_adapters', active=unlocked, trainable=unlocked)
+        ramp = float(self._semantic_scaffold_tap_lr_ramp)
+        for group in getattr(self, 'params', []) or []:
+            if not isinstance(group, dict):
+                continue
+            if group.get('name') == 'text_activator.tap_adapters':
+                base_lr = float(group.get('_semantic_scaffold_base_lr', group.get('lr', 0.0)))
+                group['_semantic_scaffold_base_lr'] = base_lr
+                group['lr'] = base_lr * ramp
+
+    def _v8_validation_config(self):
+        if not self.three_phase_enabled:
+            return None
+        return getattr(self.three_phase_trigger_training, 'validation', None)
+
+    def _maybe_run_v8_fixed_validation(self):
+        config = self._v8_validation_config()
+        if config is None or not getattr(config, 'enabled', False):
+            return
+        completed_updates = int(self.step_num)
+        if not should_run_validation(completed_updates, config):
+            return
+        if completed_updates in self._trigger_binding_validation_steps:
+            return
+        if not self.accelerator.is_main_process or not self._trigger_binding_probe_sets:
+            return
+        output_root = os.path.join(
+            self.three_phase_trigger_training.run_root or self.save_root,
+            f'phase_{self.runtime_phase}',
+        )
+        def evaluate(item, split, step):
+            if self.semantic_scaffold_enabled:
+                if not hasattr(self, '_semantic_scaffold_fixed_probe_evaluator'):
+                    raise RuntimeError('semantic scaffold validation requires a fixed prediction evaluator')
+                return self._semantic_scaffold_fixed_probe_evaluator(item, split, step)
+            prompt = item.get('caption', '')
+            if self.trigger_word:
+                prompt = self.sd.inject_trigger_into_prompt(prompt, trigger=self.trigger_word, add_if_not_present=False)
+            with torch.no_grad():
+                with self._activator_mode('full'):
+                    active = self.sd.get_prompt_embeds([prompt])
+                with self._activator_mode('activator_bypass'):
+                    bypass = self.sd.get_prompt_embeds([prompt]).detach()
+            active_norm = float(torch.stack([value.float().norm() for value in active if torch.is_tensor(value)]).mean().item()) if isinstance(active, (list, tuple)) else float(active.float().norm().item())
+            bypass_norm = float(torch.stack([value.float().norm() for value in bypass if torch.is_tensor(value)]).mean().item()) if isinstance(bypass, (list, tuple)) else float(bypass.float().norm().item())
+            return {
+                'active_conditioning_norm': active_norm,
+                'bypass_conditioning_norm': bypass_norm,
+                'conditioning_delta_norm': abs(active_norm - bypass_norm),
+                'fixed_timesteps': list(getattr(config, 'fixed_timesteps', [])),
+                'negative_phrases': list(getattr(config, 'negative_phrases', [])),
+                'probe_available': True,
+            }
+        write_fixed_probe_results(output_root, config, step=completed_updates, probe_sets=self._trigger_binding_probe_sets, evaluate=evaluate)
+        self._trigger_binding_validation_steps.add(completed_updates)
 
     def train_single_accumulation(self, batch: DataLoaderBatchDTO):
         with torch.no_grad():
@@ -3613,7 +4194,17 @@ class SDTrainer(BaseSDTrainProcess):
                     )
                 else:
                     tst_loss = None
-                    if self.conditional_response_v8_enabled:
+                    if self.semantic_scaffold_enabled:
+                        with self.timer('semantic_scaffold_control_channel_predict_and_loss'):
+                            tst_loss = self._calculate_semantic_scaffold_a1_loss(
+                                noisy_latents=noisy_latents.to(self.device_torch, dtype=dtype),
+                                noise=noise.to(self.device_torch, dtype=dtype).detach(),
+                                timesteps=timesteps,
+                                batch=batch,
+                                pred_kwargs=pred_kwargs,
+                                dtype=dtype,
+                            )
+                    elif self.conditional_response_v8_enabled:
                         with self.timer('conditional_response_v8_predict_and_loss'):
                             tst_loss = self._calculate_conditional_response_v8_loss(
                                 noisy_latents=noisy_latents.to(self.device_torch, dtype=dtype),
@@ -3745,6 +4336,16 @@ class SDTrainer(BaseSDTrainProcess):
     def post_save_hook(self, save_path):
         if not self.three_phase_enabled or self.text_activator is None:
             return
+        if self.semantic_scaffold_enabled and self._semantic_scaffold_state is not None:
+            state_root = os.path.join(
+                self.three_phase_trigger_training.run_root or self.save_root,
+                f'phase_{self.runtime_phase}',
+            )
+            os.makedirs(state_root, exist_ok=True)
+            self._semantic_scaffold_state.save(
+                os.path.join(state_root, 'semantic_scaffold_state.json'),
+                os.path.join(state_root, 'semantic_scaffold_state.safetensors'),
+            )
         modules = self._load_trigger_binding_modules()
         proof = {}
         for name, parameter in self.text_activator.named_parameters():
@@ -3864,17 +4465,24 @@ class SDTrainer(BaseSDTrainProcess):
                     self.accelerator.clip_grad_norm_(self.params, self.train_config.max_grad_norm)
             # only step if we are not accumulating
             with self.timer('optimizer_step'):
+                if getattr(self, '_trigger_binding_metrics_pending_step', None) == self.step_num:
+                    self._write_trigger_binding_metrics(
+                        getattr(self, '_trigger_binding_metrics_pending_loss', None)
+                    )
+                    self._trigger_binding_metrics_pending_step = None
                 self.optimizer.step()
-
                 self.optimizer.zero_grad(set_to_none=True)
                 if self.adapter and isinstance(self.adapter, CustomAdapter):
                     self.adapter.post_weight_update()
-            if self.ema is not None:
-                with self.timer('ema_update'):
-                    self.ema.update()
+        if self.ema is not None:
+            with self.timer('ema_update'):
+                self.ema.update()
         else:
             # gradient accumulation. Just a place for breakpoint
             pass
+
+        if not self.is_grad_accumulation_step:
+            self._maybe_run_v8_fixed_validation()
 
         # TODO Should we only step scheduler on grad step? If so, need to recalculate last step
         with self.timer('scheduler_step'):

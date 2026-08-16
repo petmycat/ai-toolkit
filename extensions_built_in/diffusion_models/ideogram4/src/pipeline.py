@@ -247,6 +247,7 @@ def get_qwen3_vl_features(
     runtime_mode: Optional[str] = None,
     runtime_metadata: Optional[Any] = None,
     return_taps: bool = False,
+    return_activator_details: bool = False,
 ):
     """Run Qwen3-VL and optionally apply trigger-selective text activation.
 
@@ -321,6 +322,9 @@ def get_qwen3_vl_features(
 
         tap_set = set(QWEN3_VL_ACTIVATION_LAYERS)
         captured: dict[int, torch.Tensor] = {}
+        pre_taps: dict[int, torch.Tensor] = {}
+        post_taps: dict[int, torch.Tensor] = {}
+        tap_residuals: dict[int, torch.Tensor] = {}
         hidden_states = inputs_embeds
         use_gradient_checkpointing = bool(
             torch.is_grad_enabled()
@@ -394,7 +398,8 @@ def get_qwen3_vl_features(
                     **activator_kwargs,
                 )
             if layer_idx in tap_set:
-                tap = hidden_states
+                pre_tap = hidden_states
+                tap = pre_tap
                 if text_activator is not None and _runtime_component_enabled(
                     runtime_mode, "tap"
                 ):
@@ -414,6 +419,9 @@ def get_qwen3_vl_features(
                         **activator_kwargs,
                     )
                 captured[layer_idx] = tap
+                pre_taps[layer_idx] = pre_tap
+                post_taps[layer_idx] = tap
+                tap_residuals[layer_idx] = tap - pre_tap
 
     selected = [captured[i] for i in QWEN3_VL_ACTIVATION_LAYERS]
     batch_size, seq_len = token_ids.shape
@@ -423,6 +431,15 @@ def get_qwen3_vl_features(
 
     text_mask = attention_mask.to(stacked.dtype).unsqueeze(-1)
     stacked = stacked * text_mask
+    if return_activator_details:
+        return stacked, {
+            'layer_ids': tuple(QWEN3_VL_ACTIVATION_LAYERS),
+            'pre_taps': [pre_taps[index] for index in QWEN3_VL_ACTIVATION_LAYERS],
+            'post_taps': [post_taps[index] for index in QWEN3_VL_ACTIVATION_LAYERS],
+            'tap_residuals': [tap_residuals[index] for index in QWEN3_VL_ACTIVATION_LAYERS],
+            'trigger_mask': trigger_mask,
+            'valid_mask': attention_mask.bool(),
+        }
     if return_taps:
         return stacked, selected
     return stacked

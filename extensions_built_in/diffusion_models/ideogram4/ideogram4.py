@@ -621,6 +621,7 @@ class Ideogram4Model(BaseModel):
         text_activator=None,
         runtime_mode: Optional[str] = None,
         return_taps: bool = False,
+        return_activator_details: bool = False,
         **kwargs,
     ) -> AdvancedPromptEmbeds:
         if isinstance(prompt, str):
@@ -698,8 +699,16 @@ class Ideogram4Model(BaseModel):
                 runtime_mode=mode,
                 runtime_metadata=trigger_runtime_metadata,
                 return_taps=return_taps,
+                return_activator_details=return_activator_details,
             )
-            if return_taps:
+            if return_activator_details:
+                features, details = result
+                details = dict(details)
+                details['pre_taps'] = torch.stack([tap[0] for tap in details['pre_taps']], dim=0)
+                details['post_taps'] = torch.stack([tap[0] for tap in details['post_taps']], dim=0)
+                details['tap_residuals'] = torch.stack([tap[0] for tap in details['tap_residuals']], dim=0)
+                taps_list.append(details)
+            elif return_taps:
                 features, taps = result
                 taps_list.append(torch.stack([tap[0] for tap in taps], dim=0))
             else:
@@ -715,6 +724,12 @@ class Ideogram4Model(BaseModel):
             embeds_kwargs["trigger_masks"] = trigger_masks
         if return_taps:
             embeds_kwargs["text_taps"] = taps_list
+            tap_layers = torch.tensor(
+                QWEN3_VL_ACTIVATION_LAYERS, dtype=torch.long, device=device
+            )
+            embeds_kwargs["tap_layers"] = [tap_layers for _ in prompt]
+        if return_activator_details:
+            embeds_kwargs["activator_details"] = taps_list
             tap_layers = torch.tensor(
                 QWEN3_VL_ACTIVATION_LAYERS, dtype=torch.long, device=device
             )

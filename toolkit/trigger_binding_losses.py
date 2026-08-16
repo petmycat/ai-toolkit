@@ -395,6 +395,135 @@ def aggregate_paired_source_losses(
     return aggregate, weighted, weights
 
 
+@dataclass(frozen=True)
+class SemanticHelperEffectResult:
+    loss: torch.Tensor
+    cosine_per_item: torch.Tensor
+    valid_per_item: torch.Tensor
+    valid_fraction: torch.Tensor
+
+
+@dataclass(frozen=True)
+class SemanticScaffoldTargetResult:
+    per_item: torch.Tensor
+    gain_per_item: torch.Tensor
+    floor_per_item: torch.Tensor
+    beta_per_item: torch.Tensor
+
+
+def per_item_target_mse(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    return per_item_diffusion_mse(prediction, target)
+
+
+def normalized_gain_vs_neutral(
+    active_loss: torch.Tensor,
+    neutral_loss: torch.Tensor,
+    epsilon: float = 1.0e-6,
+) -> torch.Tensor:
+    return normalized_activator_gain(active_loss, neutral_loss, epsilon)
+
+
+def soft_gain_floor(
+    batch_gain: torch.Tensor,
+    minimum_gain: TensorOrFloat,
+    temperature: float,
+) -> torch.Tensor:
+    if temperature <= 0 or not math.isfinite(float(temperature)):
+        raise ValueError('temperature must be finite and positive')
+    _validate_per_item(batch_gain, 'batch_gain')
+    return float(temperature) * F.softplus(
+        (_scalar_like(minimum_gain, batch_gain) - batch_gain) / float(temperature)
+    )
+
+
+def effect_direction_cosine(
+    private_effect: torch.Tensor,
+    helper_effect: torch.Tensor,
+    *,
+    epsilon: float = 1.0e-8,
+    minimum_teacher_norm: float = 1.0e-6,
+    minimum_private_norm: float = 1.0e-6,
+) -> SemanticHelperEffectResult:
+    if private_effect.shape != helper_effect.shape or private_effect.ndim < 2:
+        raise ValueError('private_effect and helper_effect must have matching batched shapes')
+    if epsilon <= 0 or minimum_teacher_norm < 0 or minimum_private_norm < 0:
+        raise ValueError('effect cosine thresholds must be valid positive values')
+    private = private_effect.float().flatten(1)
+    helper = helper_effect.detach().float().flatten(1)
+    private_norm = torch.linalg.vector_norm(private, dim=1)
+    helper_norm = torch.linalg.vector_norm(helper, dim=1)
+    valid = (private_norm >= minimum_private_norm) & (helper_norm >= minimum_teacher_norm)
+    cosine = F.cosine_similarity(private, helper, dim=1, eps=epsilon)
+    valid_float = valid.to(cosine.dtype)
+    valid_count = valid_float.sum().clamp_min(1.0)
+    loss = ((1.0 - cosine) * valid_float).sum() / valid_count
+    return SemanticHelperEffectResult(loss, cosine, valid, valid_float.mean())
+
+
+def relative_residual_rms(
+    delta: torch.Tensor,
+    reference: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+    epsilon: float = 1.0e-8,
+) -> torch.Tensor:
+    if delta.shape != reference.shape:
+        raise ValueError('delta and reference shapes must match')
+    if epsilon <= 0:
+        raise ValueError('epsilon must be positive')
+    delta_f = delta.float()
+    reference_f = reference.detach().float()
+    if mask is not None:
+        selected = mask.to(device=delta.device, dtype=torch.bool)
+        while selected.ndim < delta_f.ndim:
+            selected = selected.unsqueeze(-1)
+        delta_f = delta_f.masked_select(selected)
+        reference_f = reference_f.masked_select(selected)
+    return torch.sqrt(delta_f.square().mean() + epsilon) / torch.sqrt(reference_f.square().mean() + epsilon)
+
+
+def broad_band_penalty(
+    value: torch.Tensor,
+    low: float,
+    high: float,
+) -> torch.Tensor:
+    if low < 0 or high < low:
+        raise ValueError('broad-band bounds must satisfy 0 <= low <= high')
+    return torch.relu(_scalar_like(low, value) - value).square() + torch.relu(value - float(high)).square()
+
+
+def normalized_disturbance_beta(
+    active_prediction: torch.Tensor,
+    bypass_prediction: torch.Tensor,
+    target: torch.Tensor,
+    epsilon: float = 1.0e-6,
+) -> torch.Tensor:
+    if active_prediction.shape != bypass_prediction.shape or active_prediction.shape != target.shape:
+        raise ValueError('disturbance predictions and target must have matching shapes')
+    active_delta = (active_prediction.float() - bypass_prediction.detach().float()).flatten(1)
+    target_delta = (target.detach().float() - bypass_prediction.detach().float()).flatten(1)
+    return active_delta.square().mean(1) / (target_delta.square().mean(1) + float(epsilon))
+
+
+def disturbance_cap_penalty(beta: torch.Tensor, max_beta: float) -> torch.Tensor:
+    if max_beta < 0:
+        raise ValueError('max_beta must be non-negative')
+    return torch.relu(beta - float(max_beta)).square()
+
+
+def smooth_progress_weight(
+    progress: TensorOrFloat,
+    start: float,
+    end: float,
+    *,
+    smoothstep: bool = True,
+) -> torch.Tensor:
+    value = torch.as_tensor(progress).detach()
+    fraction = value.clamp(0.0, 1.0)
+    if smoothstep:
+        fraction = fraction * fraction * (3.0 - 2.0 * fraction)
+    return torch.as_tensor(start) + fraction * (float(end) - float(start))
+
+
 def _mean_metric(tensor: torch.Tensor) -> float:
     return float(tensor.detach().float().mean().item())
 

@@ -4,7 +4,7 @@ import os
 import random
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, Mapping, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -296,6 +296,185 @@ def aggregate_results(records: Iterable[Union[TriggerValidationResult, Mapping[s
         float(record['effective_gap']) > 0.0 for record in normalized
     ) / len(normalized)
     return aggregate
+
+
+def should_run_validation(completed_updates: int, config: 'TriggerValidationConfig') -> bool:
+    if not isinstance(completed_updates, int) or completed_updates < 0:
+        raise ValueError('completed_updates must be a non-negative integer')
+    steps = tuple(getattr(config, 'steps', ()) or ())
+    if steps:
+        return completed_updates in steps
+    every = int(getattr(config, 'every', 0))
+    return every > 0 and completed_updates % every == 0
+
+
+def assert_probe_split_disjoint(train_item_ids: Iterable[str], heldout_item_ids: Iterable[str]) -> None:
+    train = {str(item).replace('\\', '/') for item in train_item_ids}
+    heldout = {str(item).replace('\\', '/') for item in heldout_item_ids}
+    overlap = sorted(train & heldout)
+    if overlap:
+        raise ValueError(f'train/held-out probe leakage detected: {overlap}')
+
+
+def build_fixed_probe_sets(
+    items: Iterable[Mapping[str, Any]],
+    manifest: Mapping[str, Any],
+    *,
+    seed: int,
+    limit: Optional[int] = None,
+) -> Dict[str, List[Dict[str, Any]]]:
+    if seed < 0:
+        raise ValueError('probe seed must be non-negative')
+    train_ids = {str(value).replace('\\', '/') for value in manifest.get('train_item_ids', [])}
+    heldout_ids = {str(value).replace('\\', '/') for value in manifest.get('heldout_item_ids', [])}
+    assert_probe_split_disjoint(train_ids, heldout_ids)
+    by_id = {}
+    for item in items:
+        item_id = str(item.get('dataset_relative_item_id', item.get('item_id', ''))).replace('\\', '/')
+        if not item_id:
+            raise ValueError('probe item is missing dataset_relative_item_id')
+        if item_id in by_id:
+            raise ValueError(f'duplicate probe item ID: {item_id}')
+        by_id[item_id] = dict(item)
+    rng = random.Random(seed)
+    result = {}
+    for split, allowed in (('train', train_ids), ('heldout', heldout_ids)):
+        selected = [by_id[item_id] for item_id in sorted(allowed) if item_id in by_id]
+        rng.shuffle(selected)
+        if limit is not None:
+            if limit <= 0:
+                raise ValueError('probe limit must be positive')
+            selected = selected[:limit]
+        for index, item in enumerate(selected):
+            item['probe_index'] = index
+            item['probe_split'] = split
+        result[split] = selected
+    if not result['train'] or not result['heldout']:
+        raise ValueError('fixed probes require at least one item in each split')
+    return result
+
+
+def write_fixed_probe_results(
+    output_dir: str,
+    config: Any,
+    *,
+    step: int,
+    probe_sets: Mapping[str, Iterable[Mapping[str, Any]]],
+    evaluate: Callable[[Mapping[str, Any], str, int], Mapping[str, Any]],
+) -> Dict[str, Any]:
+    if step < 0:
+        raise ValueError('validation step must be non-negative')
+    aggregates = {}
+    for split in ('train', 'heldout'):
+        filename_field = 'train_probe_output_filename' if split == 'train' else 'heldout_output_filename'
+        writer = IdempotentJSONLWriter(
+            output_dir,
+            getattr(config, filename_field),
+            key_fields=('step', 'probe_split', 'dataset_relative_item_id', 'probe_index'),
+        )
+        records = []
+        for item in probe_sets.get(split, []):
+            record = dict(evaluate(item, split, step))
+            record.update({'step': step, 'probe_split': split, 'dataset_relative_item_id': item['dataset_relative_item_id'], 'probe_index': item.get('probe_index')})
+            writer.write(record)
+            records.append(record)
+        if not records:
+            raise ValueError(f'no fixed probes available for split {split}')
+        if all(SEMANTIC_METRIC_ALLOWLIST.issubset(record) for record in records):
+            aggregates[split] = {'step': step, 'probe_split': split, **aggregate_semantic_metrics(records)}
+        else:
+            aggregates[split] = {'step': step, 'probe_split': split, 'count': len(records)}
+            for key in records[0]:
+                values = [float(record[key]) for record in records if isinstance(record.get(key), (int, float)) and not isinstance(record[key], bool)]
+                if values and all(math.isfinite(value) for value in values):
+                    aggregates[split][key] = sum(values) / len(values)
+    JSONLWriter(output_dir, config.aggregate_output_filename).write({'step': step, 'probe_splits': aggregates})
+    return aggregates
+
+
+SEMANTIC_VALIDATION_SCHEMA = 'ai-toolkit.semantic-scaffold-validation'
+SEMANTIC_VALIDATION_SCHEMA_VERSION = 1
+SEMANTIC_METRIC_ALLOWLIST = frozenset({
+    'gain_active', 'gain_helper', 'active_helper_gap', 'target_mse',
+    'prediction_delta', 'disturbance_beta', 'semantic_cosine',
+})
+
+
+def semantic_prediction_metrics(
+    *,
+    neutral_prediction: torch.Tensor,
+    helper_prediction: torch.Tensor,
+    bypass_prediction: torch.Tensor,
+    semantic_prediction: torch.Tensor,
+    full_prediction: torch.Tensor,
+    target: torch.Tensor,
+    epsilon: float = 1.0e-6,
+) -> Dict[str, float]:
+    tensors = (neutral_prediction, helper_prediction, bypass_prediction, semantic_prediction, full_prediction, target)
+    if any(tensor.shape != target.shape for tensor in tensors):
+        raise ValueError('semantic validation predictions and target must have matching shapes')
+    def mse(value):
+        return float(F.mse_loss(value.float(), target.float()).detach().cpu().item())
+    neutral_mse = mse(neutral_prediction)
+    helper_mse = mse(helper_prediction)
+    full_mse = mse(full_prediction)
+    gain_active = 1.0 - full_mse / (neutral_mse + epsilon)
+    gain_helper = 1.0 - helper_mse / (neutral_mse + epsilon)
+    semantic_delta = (semantic_prediction.float() - bypass_prediction.float()).flatten()
+    full_delta = (full_prediction.float() - bypass_prediction.float()).flatten()
+    target_delta = (target.float() - bypass_prediction.float()).flatten()
+    return {
+        'gain_active': gain_active,
+        'gain_helper': gain_helper,
+        'active_helper_gap': gain_active - gain_helper,
+        'target_mse': full_mse,
+        'prediction_delta': float(torch.linalg.vector_norm(full_delta).detach().cpu().item()),
+        'disturbance_beta': float((full_delta.square().mean() / (target_delta.square().mean() + epsilon)).detach().cpu().item()),
+        'semantic_cosine': float(F.cosine_similarity(full_delta[None], semantic_delta[None], dim=1, eps=epsilon).detach().cpu().item()),
+    }
+
+
+def aggregate_semantic_metrics(records: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    if not records:
+        raise ValueError('semantic metric aggregation requires records')
+    aggregate = {'count': len(records)}
+    for metric in sorted(SEMANTIC_METRIC_ALLOWLIST):
+        values = [float(record[metric]) for record in records]
+        if any(not math.isfinite(value) for value in values):
+            raise ValueError(f'non-finite semantic validation metric: {metric}')
+        sorted_values = sorted(values)
+        aggregate[metric] = {
+            'mean': float(np.mean(values)),
+            'median': float(np.median(values)),
+            'p10': float(np.percentile(values, 10)),
+            'p90': float(np.percentile(values, 90)),
+            'std': float(np.std(values)),
+            'positive_fraction': sum(value > 0 for value in values) / len(values),
+        }
+    return aggregate
+
+
+class IdempotentJSONLWriter:
+    def __init__(self, output_dir: str, filename: str, *, key_fields: Tuple[str, ...]):
+        _validate_filename(filename, 'filename')
+        self.path = os.path.join(output_dir, filename)
+        self.key_fields = tuple(key_fields)
+
+    def write(self, record: Mapping[str, Any]) -> bool:
+        payload = dict(record)
+        key = tuple(payload[field] for field in self.key_fields)
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        existing = set()
+        if os.path.isfile(self.path):
+            with open(self.path, 'r', encoding='utf-8') as handle:
+                for line in handle:
+                    current = json.loads(line)
+                    existing.add(tuple(current[field] for field in self.key_fields))
+        if key in existing:
+            return False
+        with open(self.path, 'a', encoding='utf-8') as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False) + '\n')
+        return True
 
 
 class JSONLWriter:
