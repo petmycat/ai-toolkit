@@ -2611,8 +2611,18 @@ class SDTrainer(BaseSDTrainProcess):
         )
         helper_loss = config.helper_loss.weight * helper_result.loss
         if config.helper_loss.mode == 'conditioning_effect_cosine':
-            semantic_conditioning = semantic_embeds.text_embeds[0] - bypass_embeds.text_embeds[0]
-            helper_conditioning = helper_embeds.text_embeds[0] - neutral_embeds.text_embeds[0]
+            def conditioning_vectors(embeds):
+                vectors = []
+                for text_embed in embeds.text_embeds:
+                    text_embed = text_embed.float()
+                    vectors.append(torch.cat([
+                        text_embed.mean(dim=0),
+                        text_embed.square().mean(dim=0).sqrt(),
+                    ], dim=0))
+                return torch.stack(vectors, dim=0)
+
+            semantic_conditioning = conditioning_vectors(semantic_embeds) - conditioning_vectors(bypass_embeds)
+            helper_conditioning = conditioning_vectors(helper_embeds) - conditioning_vectors(neutral_embeds)
             conditioning_result = loss_module.effect_direction_cosine(
                 semantic_conditioning,
                 helper_conditioning,
