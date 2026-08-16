@@ -1148,10 +1148,14 @@ def validate_three_phase_trigger_training_config(
                     raise ValueError(f'semantic scaffold calibration.{name} must be in [0, 1]')
             if calibration.max_train_heldout_gap < 0:
                 raise ValueError('semantic scaffold calibration.max_train_heldout_gap must be non-negative')
-            if semantic.helper_bank.selection_mode != 'calibrated':
-                raise ValueError('semantic scaffold helper_bank.selection_mode must be calibrated')
-            if semantic.helper_bank.sampling_mode != 'usefulness_weighted':
-                raise ValueError('semantic scaffold helper_bank.sampling_mode must be usefulness_weighted')
+            expected_selection_mode = 'calibrated' if calibration.enabled else 'manual'
+            if semantic.helper_bank.selection_mode != expected_selection_mode:
+                raise ValueError(
+                    f'semantic scaffold helper_bank.selection_mode must be {expected_selection_mode} '
+                    f'when calibration.enabled is {calibration.enabled}'
+                )
+            if semantic.helper_bank.sampling_mode not in ('usefulness_weighted', 'uniform'):
+                raise ValueError('semantic scaffold helper_bank.sampling_mode must be usefulness_weighted or uniform')
             if semantic.helper_bank.teacher_mode != 'sampled_helper':
                 raise ValueError('semantic scaffold helper_bank.teacher_mode must be sampled_helper')
             if semantic.helper_bank.sampling_floor < 0 or not math.isfinite(semantic.helper_bank.sampling_floor):
