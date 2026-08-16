@@ -858,8 +858,17 @@ class SDTrainer(BaseSDTrainProcess):
                         continue
                     try:
                         with open(caption_path, 'r', encoding='utf-8') as handle:
-                            loaded = json.load(handle) if extension == '.json' else handle.read()
-                        caption = loaded if isinstance(loaded, str) else str(loaded.get('text', loaded.get('caption', '')))
+                            raw_caption = handle.read()
+                        if extension == '.json':
+                            loaded = json.loads(raw_caption)
+                            if isinstance(loaded, str):
+                                caption = loaded
+                            elif isinstance(loaded, dict) and ('text' in loaded or 'caption' in loaded):
+                                caption = str(loaded.get('text', loaded.get('caption', '')))
+                            else:
+                                caption = raw_caption
+                        else:
+                            caption = raw_caption
                     except (OSError, ValueError, TypeError):
                         caption = ''
                     break
