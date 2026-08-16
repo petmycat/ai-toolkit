@@ -8,6 +8,7 @@ import math
 import os
 import statistics
 import tempfile
+import time
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 
 import torch
@@ -229,20 +230,34 @@ def run_calibration(
     os.makedirs(output_dir, exist_ok=True)
     _atomic_write_json(os.path.join(output_dir, probe_manifest_filename), probe_payload)
     records: Dict[str, List[Dict[str, Any]]] = {phrase: [] for phrase in helper_phrases}
+    total_predictions = len(cases) * (1 + len(helper_phrases))
+    completed_predictions = 0
+    started_at = time.perf_counter()
+    print(f'  - Semantic scaffold calibration: {len(cases)} cases, {len(helper_phrases)} helpers, {total_predictions} predictions', flush=True)
     with torch.inference_mode(), isolated_rng(0):
-        for case in cases:
+        for case_index, case in enumerate(cases, start=1):
+            case_started_at = time.perf_counter()
+            print(f'  - Calibration case {case_index}/{len(cases)} [{case.split}] {case.item_id}', flush=True)
             prepared = dict(prepare_case(case))
             required = {'target'}
             if not required.issubset(prepared):
                 raise ValueError('prepared calibration case must contain target')
             neutral_prediction = predict_phrase(neutral_phrase, prepared).detach()
+            completed_predictions += 1
+            print(f'    neutral complete ({completed_predictions}/{total_predictions})', flush=True)
             for phrase in helper_phrases:
                 prediction = predict_phrase(phrase, prepared).detach()
+                completed_predictions += 1
+                gain = helper_gain(prediction, neutral_prediction, prepared['target'])
                 records[phrase].append({
                     'probe_case_id': case.probe_case_id,
                     'split': case.split,
-                    'gain': helper_gain(prediction, neutral_prediction, prepared['target']),
+                    'gain': gain,
                 })
+                print(f'    helper {phrase!r} complete ({completed_predictions}/{total_predictions}), gain={gain:.6f}', flush=True)
+            elapsed = time.perf_counter() - case_started_at
+            print(f'    case complete in {elapsed:.1f}s', flush=True)
+    print(f'  - Semantic scaffold calibration complete in {time.perf_counter() - started_at:.1f}s', flush=True)
     selection = select_helpers(records, **selection_kwargs)
     manifest = {
         'schema': CALIBRATION_SCHEMA,
