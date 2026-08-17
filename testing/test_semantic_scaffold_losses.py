@@ -45,6 +45,12 @@ class SemanticScaffoldLossTest(unittest.TestCase):
         weight = smooth_progress_weight(progress, 1.0, 0.0)
         self.assertFalse(weight.requires_grad)
 
+    def test_fixed_helper_schedule_decays_monotonically(self):
+        weights = [float(smooth_progress_weight(step / 4.0, 1.0, 0.0)) for step in range(5)]
+        self.assertEqual(weights[0], 1.0)
+        self.assertEqual(weights[-1], 0.0)
+        self.assertTrue(all(left >= right for left, right in zip(weights, weights[1:])))
+
 
 if __name__ == '__main__':
     unittest.main()

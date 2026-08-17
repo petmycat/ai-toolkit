@@ -663,6 +663,10 @@ class SemanticScaffoldHelperLossConfig:
 
 class SemanticScaffoldHelperDecayConfig:
     def __init__(self, **kwargs):
+        self.schedule_mode = str(kwargs.get('schedule_mode', 'fixed'))
+        self.start_step = int(kwargs.get('start_step', 0))
+        self.end_step = kwargs.get('end_step', None)
+        self.end_step = None if self.end_step is None else int(self.end_step)
         self.gain_ema_decay = float(kwargs.get('gain_ema_decay', 0.95))
         self.progress_start = float(kwargs.get('progress_start', 1.0))
         self.progress_end = float(kwargs.get('progress_end', 0.0))
@@ -704,6 +708,8 @@ class SemanticScaffoldDisturbanceCapConfig:
 class SemanticScaffoldTapSpecializationConfig:
     def __init__(self, **kwargs):
         self.initially_disabled = bool(kwargs.get('initially_disabled', True))
+        self.schedule_mode = str(kwargs.get('schedule_mode', 'fixed'))
+        self.fixed_unlock_step = int(kwargs.get('fixed_unlock_step', 1))
         self.unlock_min_step = int(kwargs.get('unlock_min_step', 25))
         self.unlock_min_progress = float(kwargs.get('unlock_min_progress', 0.0))
         self.unlock_min_semantic_cosine = float(kwargs.get('unlock_min_semantic_cosine', 0.0))
@@ -711,8 +717,13 @@ class SemanticScaffoldTapSpecializationConfig:
         self.max_wait_step = int(kwargs.get('max_wait_step', 100))
         self.gate_patience = int(kwargs.get('gate_patience', 3))
         self.lr_ramp_steps = int(kwargs.get('lr_ramp_steps', 25))
+        self.gain_weight = float(kwargs.get('gain_weight', 1.0))
+        self.min_gain_delta = float(kwargs.get('min_gain_delta', 0.0))
+        self.gain_temperature = float(kwargs.get('gain_temperature', 0.05))
         self.prototype_ema_decay = float(kwargs.get('prototype_ema_decay', 0.95))
         self.consistency_weight = float(kwargs.get('consistency_weight', 1.0))
+        self.relative_rms_low = float(kwargs.get('relative_rms_low', 0.0))
+        self.relative_rms_high = float(kwargs.get('relative_rms_high', 1.0))
         self.magnitude_band_weight = float(kwargs.get('magnitude_band_weight', 0.0))
 
 
@@ -1169,6 +1180,17 @@ def validate_three_phase_trigger_training_config(
                 raise ValueError('semantic scaffold helper_loss weight and epsilon are invalid')
             if helper_loss.minimum_teacher_effect_norm < 0 or helper_loss.minimum_private_effect_norm < 0:
                 raise ValueError('semantic scaffold helper effect norm thresholds must be non-negative')
+            helper_decay = semantic.helper_decay
+            if helper_decay.schedule_mode not in ('fixed', 'adaptive'):
+                raise ValueError('semantic scaffold helper_decay.schedule_mode must be fixed or adaptive')
+            if helper_decay.start_step < 0 or (
+                helper_decay.end_step is not None and helper_decay.end_step <= helper_decay.start_step
+            ):
+                raise ValueError('semantic scaffold helper_decay start/end steps are invalid')
+            if not 0.0 <= helper_decay.gain_ema_decay < 1.0:
+                raise ValueError('semantic scaffold helper_decay.gain_ema_decay must be in [0, 1)')
+            if helper_decay.progress_start < 0 or helper_decay.progress_end < 0:
+                raise ValueError('semantic scaffold helper_decay weights must be non-negative')
             if len(semantic.semantic_channel.tap_layers) != 13 or semantic.semantic_channel.tap_layers != [0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 35]:
                 raise ValueError('semantic scaffold semantic_channel.tap_layers must exactly match Ideogram4 taps')
             for value, name in (
@@ -1180,10 +1202,20 @@ def validate_three_phase_trigger_training_config(
             if semantic.semantic_channel.warmup_steps < 0:
                 raise ValueError('semantic scaffold semantic_channel.warmup_steps must be non-negative')
             tap = semantic.tap_specialization
+            if tap.schedule_mode not in ('fixed', 'adaptive'):
+                raise ValueError('semantic scaffold tap_specialization.schedule_mode must be fixed or adaptive')
+            if tap.fixed_unlock_step < 0 or tap.fixed_unlock_step >= phases['a1'].steps:
+                raise ValueError('semantic scaffold tap fixed_unlock_step must be within phase A1')
             if tap.unlock_min_step < 0 or tap.max_wait_step < tap.unlock_min_step:
                 raise ValueError('semantic scaffold tap unlock min/max steps are invalid')
             if tap.gate_patience <= 0 or tap.lr_ramp_steps < 0:
                 raise ValueError('semantic scaffold tap gate patience/ramp steps are invalid')
+            if tap.gain_weight < 0 or tap.gain_temperature <= 0:
+                raise ValueError('semantic scaffold tap gain objective configuration is invalid')
+            if tap.consistency_weight < 0 or tap.magnitude_band_weight < 0:
+                raise ValueError('semantic scaffold tap prototype/band weights must be non-negative')
+            if tap.relative_rms_low < 0 or tap.relative_rms_high < tap.relative_rms_low:
+                raise ValueError('semantic scaffold tap relative RMS band is invalid')
             if tap.initially_disabled is not True:
                 raise ValueError('semantic scaffold tap_specialization.initially_disabled must be true for A1')
             target = semantic.target_usefulness

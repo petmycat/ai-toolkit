@@ -31,6 +31,7 @@ from toolkit.trigger_validation import (
     assert_probe_split_disjoint,
     build_fixed_probe_sets,
     write_fixed_probe_results,
+    semantic_prediction_metrics,
 )
 
 
@@ -119,6 +120,28 @@ class TriggerValidationTest(unittest.TestCase):
                 config.aggregate_output_filename,
             ):
                 self.assertTrue(os.path.isfile(os.path.join(output_dir, filename)))
+
+    def test_semantic_prediction_metrics_isolate_tap_contribution(self):
+        target = torch.zeros(1, 2)
+        neutral = torch.tensor([[2.0, 2.0]])
+        bypass = torch.tensor([[2.0, 2.0]])
+        semantic = torch.tensor([[1.5, 1.5]])
+        full = torch.tensor([[1.0, 1.0]])
+        metrics = semantic_prediction_metrics(
+            neutral_prediction=neutral,
+            helper_prediction=torch.tensor([[1.25, 1.25]]),
+            bypass_prediction=bypass,
+            semantic_prediction=semantic,
+            full_prediction=full,
+            target=target,
+        )
+        self.assertGreater(metrics['gain_full'], metrics['gain_semantic_only'])
+        self.assertAlmostEqual(
+            metrics['tap_gain_delta'],
+            metrics['gain_full'] - metrics['gain_semantic_only'],
+        )
+        self.assertGreater(metrics['tap_prediction_delta'], 0.0)
+        self.assertGreater(metrics['tap_relative_rms'], 0.0)
 
     def test_rng_isolation_restores_all_global_states(self):
         random.seed(101)

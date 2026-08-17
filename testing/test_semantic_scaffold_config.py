@@ -46,6 +46,45 @@ class SemanticScaffoldConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'unique'):
             validate_three_phase_trigger_training_config(config, '<x>')
 
+    def test_fixed_handoff_schedule_is_valid(self):
+        raw = self._raw()
+        objective = raw['phase_a1']['losses']['semantic_scaffold_control_channel']
+        objective['helper_decay'] = {
+            'schedule_mode': 'fixed',
+            'start_step': 0,
+            'end_step': 5,
+            'progress_start': 1.0,
+            'progress_end': 0.0,
+        }
+        objective['tap_specialization'] = {
+            'initially_disabled': True,
+            'schedule_mode': 'fixed',
+            'fixed_unlock_step': 2,
+            'lr_ramp_steps': 2,
+            'gain_weight': 1.0,
+            'min_gain_delta': 0.0,
+            'gain_temperature': 0.05,
+            'consistency_weight': 0.25,
+            'relative_rms_low': 0.01,
+            'relative_rms_high': 1.0,
+            'magnitude_band_weight': 0.05,
+        }
+        validate_three_phase_trigger_training_config(
+            ThreePhaseTriggerTrainingConfig(**raw), '<x>'
+        )
+
+    def test_fixed_tap_unlock_must_be_inside_phase(self):
+        raw = self._raw()
+        raw['phase_a1']['losses']['semantic_scaffold_control_channel']['tap_specialization'] = {
+            'initially_disabled': True,
+            'schedule_mode': 'fixed',
+            'fixed_unlock_step': 5,
+        }
+        with self.assertRaisesRegex(ValueError, 'fixed_unlock_step'):
+            validate_three_phase_trigger_training_config(
+                ThreePhaseTriggerTrainingConfig(**raw), '<x>'
+            )
+
 
 if __name__ == '__main__':
     unittest.main()

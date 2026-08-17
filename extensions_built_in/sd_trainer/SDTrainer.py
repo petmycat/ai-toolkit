@@ -1021,7 +1021,29 @@ class SDTrainer(BaseSDTrainProcess):
                     })
             if any(not values for values in self._trigger_binding_probe_sets.values()):
                 raise RuntimeError('manual semantic scaffold helper bank requires train and heldout validation probes')
-            self._trigger_binding_probe_manifest_hash = fingerprint([case.as_dict() for case in probe_cases])
+            phase_root = os.path.join(
+                self.three_phase_trigger_training.run_root or self.save_root,
+                f'phase_{self.runtime_phase}',
+            )
+            os.makedirs(phase_root, exist_ok=True)
+            probe_manifest = {
+                'schema': 'ai-toolkit.semantic-scaffold-probes',
+                'schema_version': 1,
+                'identity': dict(self._semantic_scaffold_manifest['identity']),
+                'cases': [case.as_dict() for case in probe_cases],
+            }
+            probe_manifest['probe_manifest_hash'] = fingerprint(probe_manifest)
+            self._trigger_binding_probe_manifest_hash = probe_manifest['probe_manifest_hash']
+            manifest_path = os.path.join(phase_root, calibration.manifest_filename)
+            probe_manifest_path = os.path.join(phase_root, calibration.probe_manifest_filename)
+            for path, payload in (
+                (manifest_path, self._semantic_scaffold_manifest),
+                (probe_manifest_path, probe_manifest),
+            ):
+                temp_path = f'{path}.tmp-{os.getpid()}'
+                with open(temp_path, 'w', encoding='utf-8') as handle:
+                    json.dump(payload, handle, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False)
+                os.replace(temp_path, path)
             self._semantic_scaffold_fixed_probe_evaluator = self._evaluate_semantic_scaffold_probe
             print(
                 f'  - Semantic scaffold calibration disabled; using manual helpers {helpers}',
@@ -1141,8 +1163,10 @@ class SDTrainer(BaseSDTrainProcess):
         prepared = self._semantic_scaffold_prepare_case(case)
         template = prepared['prompt_template']
         placeholder = prepared['placeholder']
-        neutral = self._semantic_scaffold_config().calibration.neutral_phrase
-        helper = next(iter(self._semantic_scaffold_helper_weights), self._semantic_scaffold_config().calibration.helper_candidates[0])
+        calibration = self._semantic_scaffold_config().calibration
+        neutral = calibration.neutral_phrase
+        configured_helpers = calibration.manual_helpers if not calibration.enabled else calibration.helper_candidates
+        helper = next(iter(self._semantic_scaffold_helper_weights), configured_helpers[0])
         def prompt_for(value):
             return [template.replace(placeholder, value)]
         def prediction(prompts, mode):
@@ -2525,13 +2549,34 @@ class SDTrainer(BaseSDTrainProcess):
     ):
         config = self._semantic_scaffold_config()
         loss_module = self._load_trigger_binding_modules()['losses']
+        if self._semantic_scaffold_state is None:
+            state_module = importlib.import_module('toolkit.semantic_scaffold_state')
+            self._semantic_scaffold_state = state_module.SemanticScaffoldState(
+                tuple(config.semantic_channel.tap_layers)
+            )
+        state = self._semantic_scaffold_state
+        tap_cfg = config.tap_specialization
+        if tap_cfg.schedule_mode == 'fixed' and int(self.step_num) >= tap_cfg.fixed_unlock_step:
+            if state.curriculum.unlock_step is None:
+                state.curriculum.unlock_step = tap_cfg.fixed_unlock_step
+                state.curriculum.stage = 'a1.1'
+            self._semantic_scaffold_tap_lr_ramp = state.curriculum.advance_ramp(
+                step=int(self.step_num),
+                ramp_steps=tap_cfg.lr_ramp_steps,
+            )
+            self._sync_semantic_scaffold_tap_runtime()
         prompts = [
             getattr(item, 'caption_template', None) or item.raw_caption
             for item in batch.file_items
         ]
         placeholder = self.three_phase_trigger_training.placeholder
         neutral_phrase = config.calibration.neutral_phrase
-        helper_phrase = config.calibration.helper_candidates[0]
+        configured_helpers = (
+            config.calibration.manual_helpers
+            if not config.calibration.enabled
+            else config.calibration.helper_candidates
+        )
+        helper_phrase = configured_helpers[0]
         if self._semantic_scaffold_helper_weights:
             helper_names = list(self._semantic_scaffold_helper_weights)
             helper_weights = torch.tensor(
@@ -2584,21 +2629,35 @@ class SDTrainer(BaseSDTrainProcess):
         helper_prediction, helper_embeds = predict(helper_prompts, 'stock_literal', detach=True)
         bypass_prediction, bypass_embeds = predict(prompts, 'activator_bypass', detach=True)
         semantic_prediction, semantic_embeds = predict(prompts, 'semantic_only', details=True)
-        full_prediction, full_embeds = predict(prompts, 'full', details=True)
+
+        semantic_parameters = [
+            parameter
+            for name, parameter in self.text_activator.named_parameters()
+            if 'tap_adapters' not in name and parameter.requires_grad
+        ]
+        for parameter in semantic_parameters:
+            parameter.requires_grad_(False)
+        try:
+            full_prediction, full_embeds = predict(prompts, 'full', details=True)
+        finally:
+            for parameter in semantic_parameters:
+                parameter.requires_grad_(True)
 
         neutral_mse = loss_module.per_item_diffusion_mse(neutral_prediction, target)
         semantic_mse = loss_module.per_item_diffusion_mse(semantic_prediction, target)
         full_mse = loss_module.per_item_diffusion_mse(full_prediction, target)
-        gain = loss_module.normalized_gain_vs_neutral(full_mse, neutral_mse)
+        semantic_gain = loss_module.normalized_gain_vs_neutral(semantic_mse, neutral_mse)
+        full_gain = loss_module.normalized_gain_vs_neutral(full_mse, neutral_mse)
+        tap_gain_delta = full_gain - semantic_gain.detach()
         target_cfg = config.target_usefulness
         target_floor = loss_module.soft_gain_floor(
-            gain,
+            semantic_gain,
             target_cfg.min_gain,
             target_cfg.soft_hinge_temperature,
         )
         target_loss = target_cfg.weight * target_floor
         if target_cfg.direct_mse_weight:
-            target_loss = target_loss + target_cfg.direct_mse_weight * full_mse
+            target_loss = target_loss + target_cfg.direct_mse_weight * semantic_mse
 
         helper_effect = helper_prediction - neutral_prediction
         semantic_effect = semantic_prediction - bypass_prediction
@@ -2631,30 +2690,126 @@ class SDTrainer(BaseSDTrainProcess):
                 minimum_private_norm=config.helper_loss.minimum_private_effect_norm,
             )
             helper_loss = config.helper_loss.weight * conditioning_result.loss
-        beta = loss_module.normalized_disturbance_beta(full_prediction, bypass_prediction, target)
+        phase_steps = max(int(self._phase_config().steps), 1)
+        helper_decay = config.helper_decay
+        helper_end_step = phase_steps if helper_decay.end_step is None else helper_decay.end_step
+        helper_progress = min(max(
+            (int(self.step_num) - helper_decay.start_step)
+            / float(max(helper_end_step - helper_decay.start_step, 1)),
+            0.0,
+        ), 1.0)
+        helper_weight = loss_module.smooth_progress_weight(
+            helper_progress,
+            helper_decay.progress_start,
+            helper_decay.progress_end,
+            smoothstep=helper_decay.smoothstep,
+        ).to(device=semantic_prediction.device, dtype=semantic_prediction.dtype)
+        if helper_decay.schedule_mode == 'adaptive' and state.helper_latch.latched:
+            helper_weight = torch.zeros_like(helper_weight)
+        weighted_helper_loss = helper_weight * helper_loss
+
+        beta = loss_module.normalized_disturbance_beta(semantic_prediction, bypass_prediction, target)
         disturbance_loss = config.disturbance_cap.weight * loss_module.disturbance_cap_penalty(
             beta, config.disturbance_cap.max_beta
         )
         progress = min(1.0, max(0.0, float(self.step_num) / max(config.semantic_channel.warmup_steps, 1)))
         semantic_consistency = loss_module.effect_direction_cosine(
-            full_prediction - bypass_prediction,
-            semantic_prediction.detach() - bypass_prediction,
+            semantic_prediction - bypass_prediction,
+            helper_effect,
             epsilon=config.helper_loss.cosine_epsilon,
             minimum_teacher_norm=config.helper_loss.minimum_teacher_effect_norm,
             minimum_private_norm=config.helper_loss.minimum_private_effect_norm,
         )
+        semantic_prototype_losses = []
+        for batch_details in semantic_embeds.activator_details:
+            for layer_index, layer_id in enumerate(config.semantic_channel.tap_layers):
+                observation = batch_details['pre_taps'][layer_index].float().mean(dim=0)
+                prototype = state.semantic_prototypes.get(str(layer_id))
+                if prototype is not None:
+                    semantic_prototype_losses.append(
+                        1.0 - F.cosine_similarity(
+                            observation.flatten()[None],
+                            prototype.detach().to(observation).flatten()[None],
+                            dim=1,
+                            eps=config.helper_loss.cosine_epsilon,
+                        ).mean()
+                    )
+        zero = semantic_prediction.sum() * 0.0
+        semantic_prototype_loss = (
+            torch.stack(semantic_prototype_losses).mean()
+            if semantic_prototype_losses else zero
+        )
         consistency_weight = config.semantic_channel.consistency_weight * progress
-        total = target_loss.mean() + helper_loss + disturbance_loss.mean() + consistency_weight * semantic_consistency.loss
+
+        tap_gain_loss = loss_module.soft_gain_floor(
+            tap_gain_delta,
+            tap_cfg.min_gain_delta,
+            tap_cfg.gain_temperature,
+        ).mean()
+        tap_prototype_losses = []
+        tap_relative_rms_values = []
+        for batch_details in full_embeds.activator_details:
+            for layer_index, layer_id in enumerate(config.semantic_channel.tap_layers):
+                residual = batch_details['tap_residuals'][layer_index].float().mean(dim=0)
+                semantic_reference = batch_details['pre_taps'][layer_index].detach().float().mean(dim=0)
+                prototype = state.tap_prototypes.get(str(layer_id))
+                if prototype is not None:
+                    tap_prototype_losses.append(
+                        1.0 - F.cosine_similarity(
+                            residual.flatten()[None],
+                            prototype.detach().to(residual).flatten()[None],
+                            dim=1,
+                            eps=config.helper_loss.cosine_epsilon,
+                        ).mean()
+                    )
+                tap_relative_rms_values.append(loss_module.relative_residual_rms(
+                    residual,
+                    semantic_reference,
+                    epsilon=config.helper_loss.cosine_epsilon,
+                ))
+        tap_zero = full_prediction.sum() * 0.0
+        tap_prototype_loss = torch.stack(tap_prototype_losses).mean() if tap_prototype_losses else tap_zero
+        tap_relative_rms = torch.stack(tap_relative_rms_values).mean() if tap_relative_rms_values else zero
+        tap_band_loss = loss_module.broad_band_penalty(
+            tap_relative_rms,
+            tap_cfg.relative_rms_low,
+            tap_cfg.relative_rms_high,
+        )
+        tap_scale = float(self._semantic_scaffold_tap_lr_ramp)
+        tap_objective = tap_scale * (
+            tap_cfg.gain_weight * tap_gain_loss
+            + tap_cfg.consistency_weight * tap_prototype_loss
+            + tap_cfg.magnitude_band_weight * tap_band_loss
+        )
+        total = (
+            target_loss.mean()
+            + weighted_helper_loss
+            + disturbance_loss.mean()
+            + helper_weight * consistency_weight * semantic_consistency.loss
+            + consistency_weight * semantic_prototype_loss
+            + tap_objective
+        )
         metrics = {
-            'a1/semantic_scaffold/target_gain': float(gain.detach().mean().item()),
+            'a1/semantic_scaffold/target_gain': float(semantic_gain.detach().mean().item()),
+            'a1/semantic_scaffold/gain_semantic_only': float(semantic_gain.detach().mean().item()),
+            'a1/semantic_scaffold/gain_full': float(full_gain.detach().mean().item()),
+            'a1/semantic_scaffold/tap_gain_delta': float(tap_gain_delta.detach().mean().item()),
             'a1/semantic_scaffold/target_loss': float(target_loss.detach().mean().item()),
             'a1/semantic_scaffold/helper_effect_cosine': float(helper_result.cosine_per_item.detach().mean().item()),
             'a1/semantic_scaffold/helper_effect_loss': float(helper_loss.detach().item()),
+            'a1/semantic_scaffold/helper_weight': float(helper_weight.detach().item()),
+            'a1/semantic_scaffold/helper_weighted_loss': float(weighted_helper_loss.detach().item()),
             'a1/semantic_scaffold/disturbance_beta': float(beta.detach().mean().item()),
             'a1/semantic_scaffold/disturbance_loss': float(disturbance_loss.detach().mean().item()),
             'a1/semantic_scaffold/semantic_consistency': float(semantic_consistency.loss.detach().item()),
+            'a1/semantic_scaffold/semantic_prototype_loss': float(semantic_prototype_loss.detach().item()),
+            'a1/semantic_scaffold/tap_gain_loss': float(tap_gain_loss.detach().item()),
+            'a1/semantic_scaffold/tap_prototype_loss': float(tap_prototype_loss.detach().item()),
+            'a1/semantic_scaffold/tap_relative_rms': float(tap_relative_rms.detach().item()),
+            'a1/semantic_scaffold/tap_band_loss': float(tap_band_loss.detach().item()),
+            'a1/semantic_scaffold/tap_objective': float(tap_objective.detach().item()),
             'a1/semantic_scaffold/progress': progress,
-            'a1/semantic_scaffold/tap_gate_stage': self._semantic_scaffold_state.curriculum.stage if self._semantic_scaffold_state is not None else 'a1.0',
+            'a1/semantic_scaffold/tap_gate_stage': state.curriculum.stage,
             'a1/semantic_scaffold/tap_lr_ramp': self._semantic_scaffold_tap_lr_ramp,
         }
         self._trigger_binding_last_metrics = metrics
@@ -2666,13 +2821,7 @@ class SDTrainer(BaseSDTrainProcess):
             else:
                 self.additional_logs[log_key] = value
         self._semantic_scaffold_last_embeddings = (semantic_embeds, full_embeds)
-        if self._semantic_scaffold_state is None:
-            state_module = importlib.import_module('toolkit.semantic_scaffold_state')
-            self._semantic_scaffold_state = state_module.SemanticScaffoldState(
-                tuple(config.semantic_channel.tap_layers)
-            )
-        state = self._semantic_scaffold_state
-        gain_value = float(gain.detach().mean().item())
+        gain_value = float(semantic_gain.detach().mean().item())
         decay = config.helper_decay.gain_ema_decay
         state.gain_ema = gain_value if state.gain_ema is None else decay * state.gain_ema + (1.0 - decay) * gain_value
         helper_gain_value = float(loss_module.normalized_gain_vs_neutral(
@@ -2709,23 +2858,24 @@ class SDTrainer(BaseSDTrainProcess):
                     )
         state.last_update_step = int(self.step_num)
         gate = state.curriculum
-        gate.observe_gate(
-            step=int(self.step_num),
-            progress=progress,
-            semantic_cosine=float(semantic_consistency.cosine_per_item.detach().mean().item()),
-            relative_rms=float(torch.linalg.vector_norm(semantic_effect.detach()).item()),
-            min_step=config.tap_specialization.unlock_min_step,
-            min_progress=config.tap_specialization.unlock_min_progress,
-            min_semantic_cosine=config.tap_specialization.unlock_min_semantic_cosine,
-            min_relative_rms=config.tap_specialization.unlock_min_relative_rms,
-            patience=config.tap_specialization.gate_patience,
-            max_wait_step=config.tap_specialization.max_wait_step,
-        )
-        self._semantic_scaffold_tap_lr_ramp = gate.advance_ramp(
-            step=int(self.step_num),
-            ramp_steps=config.tap_specialization.lr_ramp_steps,
-        )
-        self._sync_semantic_scaffold_tap_runtime()
+        if tap_cfg.schedule_mode == 'adaptive':
+            gate.observe_gate(
+                step=int(self.step_num),
+                progress=progress,
+                semantic_cosine=float(semantic_consistency.cosine_per_item.detach().mean().item()),
+                relative_rms=float(torch.linalg.vector_norm(semantic_effect.detach()).item()),
+                min_step=tap_cfg.unlock_min_step,
+                min_progress=tap_cfg.unlock_min_progress,
+                min_semantic_cosine=tap_cfg.unlock_min_semantic_cosine,
+                min_relative_rms=tap_cfg.unlock_min_relative_rms,
+                patience=tap_cfg.gate_patience,
+                max_wait_step=tap_cfg.max_wait_step,
+            )
+            self._semantic_scaffold_tap_lr_ramp = gate.advance_ramp(
+                step=int(self.step_num),
+                ramp_steps=tap_cfg.lr_ramp_steps,
+            )
+            self._sync_semantic_scaffold_tap_runtime()
         if gate.unlock_step is not None and int(self.step_num) > gate.unlock_step + 1 and self._semantic_scaffold_tap_lr_ramp > 0.0:
             tap_up_delta = 0.0
             for name, parameter in self.text_activator.named_parameters():

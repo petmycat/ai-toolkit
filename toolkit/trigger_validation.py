@@ -395,8 +395,10 @@ def write_fixed_probe_results(
 SEMANTIC_VALIDATION_SCHEMA = 'ai-toolkit.semantic-scaffold-validation'
 SEMANTIC_VALIDATION_SCHEMA_VERSION = 1
 SEMANTIC_METRIC_ALLOWLIST = frozenset({
-    'gain_active', 'gain_helper', 'active_helper_gap', 'target_mse',
-    'prediction_delta', 'disturbance_beta', 'semantic_cosine',
+    'gain_active', 'gain_full', 'gain_semantic_only', 'gain_helper',
+    'active_helper_gap', 'tap_gain_delta', 'target_mse',
+    'prediction_delta', 'tap_prediction_delta', 'tap_relative_rms',
+    'disturbance_beta', 'semantic_cosine',
 })
 
 
@@ -417,18 +419,28 @@ def semantic_prediction_metrics(
         return float(F.mse_loss(value.float(), target.float()).detach().cpu().item())
     neutral_mse = mse(neutral_prediction)
     helper_mse = mse(helper_prediction)
+    semantic_mse = mse(semantic_prediction)
     full_mse = mse(full_prediction)
-    gain_active = 1.0 - full_mse / (neutral_mse + epsilon)
+    gain_full = 1.0 - full_mse / (neutral_mse + epsilon)
+    gain_semantic_only = 1.0 - semantic_mse / (neutral_mse + epsilon)
     gain_helper = 1.0 - helper_mse / (neutral_mse + epsilon)
     semantic_delta = (semantic_prediction.float() - bypass_prediction.float()).flatten()
     full_delta = (full_prediction.float() - bypass_prediction.float()).flatten()
+    tap_delta = (full_prediction.float() - semantic_prediction.float()).flatten()
     target_delta = (target.float() - bypass_prediction.float()).flatten()
+    semantic_rms = torch.sqrt(semantic_delta.square().mean() + epsilon)
+    tap_rms = torch.sqrt(tap_delta.square().mean() + epsilon)
     return {
-        'gain_active': gain_active,
+        'gain_active': gain_full,
+        'gain_full': gain_full,
+        'gain_semantic_only': gain_semantic_only,
         'gain_helper': gain_helper,
-        'active_helper_gap': gain_active - gain_helper,
+        'active_helper_gap': gain_full - gain_helper,
+        'tap_gain_delta': gain_full - gain_semantic_only,
         'target_mse': full_mse,
         'prediction_delta': float(torch.linalg.vector_norm(full_delta).detach().cpu().item()),
+        'tap_prediction_delta': float(torch.linalg.vector_norm(tap_delta).detach().cpu().item()),
+        'tap_relative_rms': float((tap_rms / semantic_rms).detach().cpu().item()),
         'disturbance_beta': float((full_delta.square().mean() / (target_delta.square().mean() + epsilon)).detach().cpu().item()),
         'semantic_cosine': float(F.cosine_similarity(full_delta[None], semantic_delta[None], dim=1, eps=epsilon).detach().cpu().item()),
     }
