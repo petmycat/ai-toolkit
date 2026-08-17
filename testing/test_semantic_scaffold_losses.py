@@ -9,6 +9,7 @@ from toolkit.trigger_binding_losses import (
     normalized_disturbance_beta,
     normalized_gain_vs_neutral,
     prototype_consistency_ready,
+    prototype_consistency_scale,
     relative_residual_rms,
     smooth_progress_weight,
     soft_gain_floor,
@@ -63,6 +64,24 @@ class SemanticScaffoldLossTest(unittest.TestCase):
         self.assertTrue(prototype_consistency_ready(
             3, prototype, warmup_observations=3, minimum_prototype_norm=1.0e-6
         ))
+
+    def test_prototype_consistency_scale_ramps_smoothly(self):
+        prototype = torch.tensor([3.0, 4.0])
+        scales = [
+            prototype_consistency_scale(
+                count,
+                prototype,
+                warmup_observations=3,
+                ramp_observations=4,
+                minimum_prototype_norm=1.0e-6,
+            )
+            for count in range(2, 7)
+        ]
+        self.assertEqual(scales[0], 0.0)
+        self.assertGreater(scales[1], 0.0)
+        self.assertLess(scales[1], 1.0)
+        self.assertEqual(scales[-1], 1.0)
+        self.assertTrue(all(left <= right for left, right in zip(scales, scales[1:])))
 
 
 if __name__ == '__main__':

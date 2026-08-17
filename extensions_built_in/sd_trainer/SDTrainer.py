@@ -2745,6 +2745,7 @@ class SDTrainer(BaseSDTrainProcess):
             tap_cfg.gain_temperature,
         ).mean()
         tap_prototype_losses = []
+        tap_prototype_scales = []
         tap_activation_relative_rms_values = []
         for batch_details in full_embeds.activator_details:
             for layer_index, layer_id in enumerate(config.semantic_channel.tap_layers):
@@ -2752,20 +2753,22 @@ class SDTrainer(BaseSDTrainProcess):
                 semantic_reference = batch_details['pre_taps'][layer_index].detach().float().mean(dim=0)
                 prototype_key = str(layer_id)
                 prototype = state.tap_prototypes.get(prototype_key)
-                if loss_module.prototype_consistency_ready(
+                prototype_scale = loss_module.prototype_consistency_scale(
                     state.tap_observation_counts.get(prototype_key, 0),
                     prototype,
                     warmup_observations=tap_cfg.prototype_warmup_observations,
+                    ramp_observations=tap_cfg.prototype_ramp_observations,
                     minimum_prototype_norm=tap_cfg.minimum_prototype_norm,
-                ):
-                    tap_prototype_losses.append(
-                        1.0 - F.cosine_similarity(
-                            residual.flatten()[None],
-                            prototype.detach().to(residual).flatten()[None],
-                            dim=1,
-                            eps=config.helper_loss.cosine_epsilon,
-                        ).mean()
-                    )
+                )
+                if prototype_scale > 0.0:
+                    prototype_loss = 1.0 - F.cosine_similarity(
+                        residual.flatten()[None],
+                        prototype.detach().to(residual).flatten()[None],
+                        dim=1,
+                        eps=config.helper_loss.cosine_epsilon,
+                    ).mean()
+                    tap_prototype_losses.append(prototype_scale * prototype_loss)
+                    tap_prototype_scales.append(prototype_scale)
                 tap_activation_relative_rms_values.append(loss_module.relative_residual_rms(
                     residual,
                     semantic_reference,
@@ -2813,6 +2816,10 @@ class SDTrainer(BaseSDTrainProcess):
             'a1/semantic_scaffold/tap_gain_loss': float(tap_gain_loss.detach().item()),
             'a1/semantic_scaffold/tap_prototype_loss': float(tap_prototype_loss.detach().item()),
             'a1/semantic_scaffold/tap_prototype_valid_layers': float(len(tap_prototype_losses)),
+            'a1/semantic_scaffold/tap_prototype_ramp': (
+                float(sum(tap_prototype_scales) / len(tap_prototype_scales))
+                if tap_prototype_scales else 0.0
+            ),
             'a1/semantic_scaffold/tap_activation_relative_rms': float(tap_activation_relative_rms.detach().item()),
             'a1/semantic_scaffold/tap_band_loss': float(tap_band_loss.detach().item()),
             'a1/semantic_scaffold/tap_objective': float(tap_objective.detach().item()),

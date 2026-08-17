@@ -59,6 +59,26 @@ def _scalar_like(value: TensorOrFloat, reference: torch.Tensor) -> torch.Tensor:
     return torch.as_tensor(value, device=reference.device, dtype=reference.dtype)
 
 
+def prototype_consistency_scale(
+    observation_count: int,
+    prototype: Optional[torch.Tensor],
+    *,
+    warmup_observations: int,
+    ramp_observations: int,
+    minimum_prototype_norm: float,
+) -> float:
+    if warmup_observations < 0 or ramp_observations < 0 or minimum_prototype_norm < 0:
+        raise ValueError('prototype warmup, ramp, and norm thresholds must be non-negative')
+    if prototype is None or int(observation_count) < warmup_observations:
+        return 0.0
+    if float(prototype.detach().float().norm().item()) < minimum_prototype_norm:
+        return 0.0
+    if ramp_observations == 0:
+        return 1.0
+    progress = min(1.0, max(0.0, (int(observation_count) - warmup_observations + 1) / ramp_observations))
+    return progress * progress * (3.0 - 2.0 * progress)
+
+
 def prototype_consistency_ready(
     observation_count: int,
     prototype: Optional[torch.Tensor],
@@ -66,11 +86,13 @@ def prototype_consistency_ready(
     warmup_observations: int,
     minimum_prototype_norm: float,
 ) -> bool:
-    if warmup_observations < 0 or minimum_prototype_norm < 0:
-        raise ValueError('prototype warmup and norm thresholds must be non-negative')
-    if prototype is None or int(observation_count) < warmup_observations:
-        return False
-    return float(prototype.detach().float().norm().item()) >= minimum_prototype_norm
+    return prototype_consistency_scale(
+        observation_count,
+        prototype,
+        warmup_observations=warmup_observations,
+        ramp_observations=0,
+        minimum_prototype_norm=minimum_prototype_norm,
+    ) > 0.0
 
 
 def per_item_diffusion_mse(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:

@@ -144,6 +144,22 @@ class TriggerValidationTest(unittest.TestCase):
         self.assertGreater(metrics['tap_prediction_relative_rms'], 0.0)
         self.assertNotIn('tap_relative_rms', metrics)
 
+    def test_semantic_prediction_relative_rms_is_zero_without_tap_delta(self):
+        target = torch.zeros(1, 2)
+        neutral = torch.tensor([[2.0, 2.0]])
+        bypass = torch.tensor([[2.0, 2.0]])
+        semantic = torch.tensor([[1.5, 1.5]])
+        metrics = semantic_prediction_metrics(
+            neutral_prediction=neutral,
+            helper_prediction=torch.tensor([[1.25, 1.25]]),
+            bypass_prediction=bypass,
+            semantic_prediction=semantic,
+            full_prediction=semantic.clone(),
+            target=target,
+        )
+        self.assertEqual(metrics['tap_prediction_delta'], 0.0)
+        self.assertEqual(metrics['tap_prediction_relative_rms'], 0.0)
+
     def test_rng_isolation_restores_all_global_states(self):
         random.seed(101)
         np.random.seed(202)

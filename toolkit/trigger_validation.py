@@ -428,8 +428,8 @@ def semantic_prediction_metrics(
     full_delta = (full_prediction.float() - bypass_prediction.float()).flatten()
     tap_delta = (full_prediction.float() - semantic_prediction.float()).flatten()
     target_delta = (target.float() - bypass_prediction.float()).flatten()
-    semantic_rms = torch.sqrt(semantic_delta.square().mean() + epsilon)
-    tap_rms = torch.sqrt(tap_delta.square().mean() + epsilon)
+    semantic_rms = torch.sqrt(semantic_delta.square().mean()).clamp_min(epsilon)
+    tap_rms = torch.sqrt(tap_delta.square().mean())
     return {
         'gain_active': gain_full,
         'gain_full': gain_full,
