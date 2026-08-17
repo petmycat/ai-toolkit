@@ -74,7 +74,7 @@ class SemanticScaffoldConfigTest(unittest.TestCase):
             'min_gain_delta': 0.0,
             'gain_temperature': 0.05,
             'prototype_warmup_observations': 3,
-            'prototype_ramp_observations': 5,
+            'prototype_ramp_steps': 5,
             'minimum_prototype_norm': 1.0e-6,
             'consistency_weight': 0.25,
             'relative_rms_low': 0.01,
@@ -98,7 +98,7 @@ class SemanticScaffoldConfigTest(unittest.TestCase):
             )
 
     def test_tap_prototype_warmup_thresholds_must_be_non_negative(self):
-        for field in ('prototype_warmup_observations', 'prototype_ramp_observations'):
+        for field in ('prototype_warmup_observations', 'prototype_ramp_steps'):
             with self.subTest(field=field):
                 raw = self._raw()
                 raw['phase_a1']['losses']['semantic_scaffold_control_channel']['tap_specialization'] = {

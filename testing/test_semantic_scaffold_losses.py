@@ -65,23 +65,18 @@ class SemanticScaffoldLossTest(unittest.TestCase):
             3, prototype, warmup_observations=3, minimum_prototype_norm=1.0e-6
         ))
 
-    def test_prototype_consistency_scale_ramps_smoothly(self):
-        prototype = torch.tensor([3.0, 4.0])
+    def test_prototype_consistency_scale_ramps_by_optimizer_step(self):
         scales = [
-            prototype_consistency_scale(
-                count,
-                prototype,
-                warmup_observations=3,
-                ramp_observations=4,
-                minimum_prototype_norm=1.0e-6,
-            )
-            for count in range(2, 7)
+            prototype_consistency_scale(step, 7, ramp_steps=4)
+            for step in range(7, 11)
         ]
-        self.assertEqual(scales[0], 0.0)
-        self.assertGreater(scales[1], 0.0)
-        self.assertLess(scales[1], 1.0)
+        self.assertGreater(scales[0], 0.0)
+        self.assertLess(scales[0], 1.0)
         self.assertEqual(scales[-1], 1.0)
         self.assertTrue(all(left <= right for left, right in zip(scales, scales[1:])))
+
+    def test_prototype_consistency_scale_can_enable_immediately(self):
+        self.assertEqual(prototype_consistency_scale(7, 7, ramp_steps=0), 1.0)
 
 
 if __name__ == '__main__':

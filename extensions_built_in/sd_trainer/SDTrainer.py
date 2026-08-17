@@ -2753,14 +2753,22 @@ class SDTrainer(BaseSDTrainProcess):
                 semantic_reference = batch_details['pre_taps'][layer_index].detach().float().mean(dim=0)
                 prototype_key = str(layer_id)
                 prototype = state.tap_prototypes.get(prototype_key)
-                prototype_scale = loss_module.prototype_consistency_scale(
+                prototype_ready = loss_module.prototype_consistency_ready(
                     state.tap_observation_counts.get(prototype_key, 0),
                     prototype,
                     warmup_observations=tap_cfg.prototype_warmup_observations,
-                    ramp_observations=tap_cfg.prototype_ramp_observations,
                     minimum_prototype_norm=tap_cfg.minimum_prototype_norm,
                 )
-                if prototype_scale > 0.0:
+                if prototype_ready:
+                    valid_since_step = state.tap_prototype_valid_since_step.setdefault(
+                        prototype_key,
+                        int(self.step_num),
+                    )
+                    prototype_scale = loss_module.prototype_consistency_scale(
+                        int(self.step_num),
+                        valid_since_step,
+                        ramp_steps=tap_cfg.prototype_ramp_steps,
+                    )
                     prototype_loss = 1.0 - F.cosine_similarity(
                         residual.flatten()[None],
                         prototype.detach().to(residual).flatten()[None],

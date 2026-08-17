@@ -110,6 +110,7 @@ class SemanticScaffoldState:
     tap_prototypes: Dict[str, torch.Tensor] = field(default_factory=dict)
     semantic_observation_counts: Dict[str, int] = field(default_factory=dict)
     tap_observation_counts: Dict[str, int] = field(default_factory=dict)
+    tap_prototype_valid_since_step: Dict[str, int] = field(default_factory=dict)
     gain_ema: Optional[float] = None
     semantic_helper_cosine_ema: Optional[float] = None
     semantic_prototype_loss_ema: Optional[float] = None
@@ -118,7 +119,7 @@ class SemanticScaffoldState:
     helper_latch: HelperLatchState = field(default_factory=HelperLatchState)
     curriculum: TapCurriculumState = field(default_factory=TapCurriculumState)
     last_update_step: int = 0
-    schema_version: int = 1
+    schema_version: int = 2
 
     def __post_init__(self) -> None:
         self.tap_layers = tuple(int(layer) for layer in self.tap_layers)
@@ -160,6 +161,7 @@ class SemanticScaffoldState:
             'tap_prototypes': {key: value.detach().cpu() for key, value in self.tap_prototypes.items()},
             'semantic_observation_counts': dict(self.semantic_observation_counts),
             'tap_observation_counts': dict(self.tap_observation_counts),
+            'tap_prototype_valid_since_step': dict(self.tap_prototype_valid_since_step),
             'gain_ema': self.gain_ema,
             'semantic_helper_cosine_ema': self.semantic_helper_cosine_ema,
             'semantic_prototype_loss_ema': self.semantic_prototype_loss_ema,
@@ -182,6 +184,9 @@ class SemanticScaffoldState:
                 target[str(key)] = tensor.to(device=device) if device is not None else tensor
         result.semantic_observation_counts.update({str(k): int(v) for k, v in dict(state.get('semantic_observation_counts', {})).items()})
         result.tap_observation_counts.update({str(k): int(v) for k, v in dict(state.get('tap_observation_counts', {})).items()})
+        result.tap_prototype_valid_since_step.update({
+            str(k): int(v) for k, v in dict(state.get('tap_prototype_valid_since_step', {})).items()
+        })
         result.gain_ema = state.get('gain_ema')
         result.semantic_helper_cosine_ema = state.get('semantic_helper_cosine_ema')
         result.semantic_prototype_loss_ema = state.get('semantic_prototype_loss_ema')

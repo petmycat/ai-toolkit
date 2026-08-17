@@ -729,7 +729,7 @@ class SemanticScaffoldTapSpecializationConfig:
         self.gain_temperature = float(kwargs.get('gain_temperature', 0.05))
         self.prototype_ema_decay = float(kwargs.get('prototype_ema_decay', 0.95))
         self.prototype_warmup_observations = int(kwargs.get('prototype_warmup_observations', 3))
-        self.prototype_ramp_observations = int(kwargs.get('prototype_ramp_observations', 10))
+        self.prototype_ramp_steps = int(kwargs.get('prototype_ramp_steps', 10))
         self.minimum_prototype_norm = float(kwargs.get('minimum_prototype_norm', 1.0e-6))
         self.consistency_weight = float(kwargs.get('consistency_weight', 1.0))
         self.relative_rms_low = float(kwargs.get('relative_rms_low', 0.0))
@@ -1232,7 +1232,7 @@ def validate_three_phase_trigger_training_config(
                 raise ValueError('semantic scaffold tap prototype/band weights must be non-negative')
             if (
                 tap.prototype_warmup_observations < 0
-                or tap.prototype_ramp_observations < 0
+                or tap.prototype_ramp_steps < 0
                 or tap.minimum_prototype_norm < 0
             ):
                 raise ValueError('semantic scaffold tap prototype warmup/ramp/norm thresholds must be non-negative')

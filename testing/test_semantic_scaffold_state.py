@@ -76,6 +76,7 @@ class SemanticScaffoldStateTest(unittest.TestCase):
     def test_state_round_trip(self):
         state = SemanticScaffoldState((0, 3))
         state.update_ema('0', torch.tensor([1.0, 2.0]), decay=0.5, kind='semantic')
+        state.tap_prototype_valid_since_step['0'] = 7
         state.gain_ema = 0.25
         state.helper_gain_ema['h'] = 0.3
         with tempfile.TemporaryDirectory() as directory:
@@ -86,6 +87,7 @@ class SemanticScaffoldStateTest(unittest.TestCase):
         torch.testing.assert_close(restored.semantic_prototypes['0'], state.semantic_prototypes['0'])
         self.assertEqual(restored.gain_ema, state.gain_ema)
         self.assertEqual(restored.tap_layers, state.tap_layers)
+        self.assertEqual(restored.tap_prototype_valid_since_step, {'0': 7})
 
 
 if __name__ == '__main__':
