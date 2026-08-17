@@ -19,10 +19,13 @@ def _load_runtime_methods():
     class_node = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'SDTrainer')
     names = {
         'three_phase_enabled', '_load_trigger_binding_modules', '_call_supported', '_first_callable',
-        '_phase_config', '_activator_component_flags', '_configure_phase_trainability',
+        '_phase_config', '_phase_runtime_objective', '_activator_component_flags', '_configure_phase_trainability',
         'hook_add_extra_train_params', '_activator_mode', '_write_trigger_binding_metrics',
         '_phase_caption_source_weights', '_prompt_tap_batch', '_check_first_trigger_gradient', '_v8_masked_delta_metrics', '_v8_prompt_delta_norms',
-        '_calculate_trigger_binding_loss', '_install_trigger_binding_prompt_encoder', 'encode_static_prompt',
+        '_calculate_trigger_binding_loss', '_calculate_ideogram4_v3_activator_loss',
+        '_v3_segmented_smoothstep_weight', '_v3_schedule_weights',
+        '_v3_probe_target_mse', '_evaluate_ideogram4_v3_fixed_probe',
+        '_install_trigger_binding_prompt_encoder', 'encode_static_prompt',
         '_sync_semantic_scaffold_tap_runtime', 'end_step_hook',
     }
     selected = [node for node in class_node.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names]
@@ -31,6 +34,19 @@ def _load_runtime_methods():
     class RuntimeBase:
         def end_step_hook(self):
             pass
+    from toolkit.semantic_scaffold_calibration import FixedDiffusionProbeCase
+
+    @contextlib.contextmanager
+    def network_disabled(network):
+        previous = None if network is None else network.is_active
+        if network is not None:
+            network.is_active = False
+        try:
+            yield
+        finally:
+            if network is not None:
+                network.is_active = previous
+
     namespace = {
         'RuntimeBase': RuntimeBase,
         'contextlib': contextlib,
@@ -38,12 +54,15 @@ def _load_runtime_methods():
         'inspect': inspect,
         'os': os,
         'MethodType': MethodType,
+        'Mapping': dict,
         'torch': torch,
         'F': torch.nn.functional,
         'get_torch_dtype': lambda _dtype: torch.float32,
         'shared_loss_target': lambda trainer, noise, batch, timesteps: trainer.sd.get_loss_target(
             noise=noise, batch=batch, timesteps=timesteps
         ).detach(),
+        'FixedDiffusionProbeCase': FixedDiffusionProbeCase,
+        'network_disabled': network_disabled,
     }
     exec(compile(module, str(source_path), 'exec'), namespace)
     return namespace['SDTrainerRuntimeHarness']
@@ -172,6 +191,150 @@ class ThreePhaseRuntimeTest(unittest.TestCase):
         selected = {id(parameter) for group in filtered for parameter in group['params']}
         self.assertEqual(selected, {id(parameter) for parameter in trainer.network.parameters()})
         self.assertTrue(all(not parameter.requires_grad for parameter in trainer.text_activator.parameters()))
+
+    def test_v3_builder_tokenizes_before_registration_and_disables_taps(self):
+        source_path = Path(__file__).parents[1] / 'extensions_built_in' / 'sd_trainer' / 'SDTrainer.py'
+        source = source_path.read_text(encoding='utf-8')
+        pre_registration = source.index("source_ids = list(tokenizer(literal, add_special_tokens=False)")
+        registration = source.index("tokenizer.add_tokens([literal], special_tokens=True)")
+        self.assertLess(pre_registration, registration)
+        self.assertIn(
+            "create_tap_adapters=bool(tap_config.enabled and not is_v3_activator)",
+            source,
+        )
+        self.assertIn(
+            "extensions_built_in.ideogram4_v3_activator.literal_initialization",
+            source,
+        )
+
+    def test_v3_segmented_schedule_boundaries_are_exact(self):
+        trainer = self._trainer('a1')
+        self.assertEqual(trainer._v3_schedule_weights(0), {'helper': 1.0, 'dataset': 0.25})
+        self.assertEqual(trainer._v3_schedule_weights(40), {'helper': 0.1, 'dataset': 1.0})
+        self.assertEqual(trainer._v3_schedule_weights(80), {'helper': 0.0, 'dataset': 1.0})
+
+    def test_v3_te_calibration_freezes_embedding_taps_and_active_network(self):
+        trainer = self._trainer('a2')
+        trainer.three_phase_trigger_training.phase_runtime.objective = {
+            'pipeline': 'ideogram4_v3_activator',
+            'name': 'te_calibration',
+            'te_only': True,
+            'v3_active_frozen': True,
+        }
+        params = [{'params': list(trainer.network.parameters()) + list(trainer.text_activator.parameters())}]
+        filtered = trainer.hook_add_extra_train_params(params)
+        selected = {id(parameter) for group in filtered for parameter in group['params']}
+        self.assertEqual(selected, {id(parameter) for parameter in trainer.text_activator.te_adapter.parameters()})
+        self.assertTrue(trainer.network.is_active)
+        self.assertTrue(all(not parameter.requires_grad for parameter in trainer.network.parameters()))
+        self.assertTrue(all(not parameter.requires_grad for parameter in trainer.text_activator.embedding.parameters()))
+        self.assertTrue(all(not parameter.requires_grad for parameter in trainer.text_activator.tap_adapters.parameters()))
+
+    def test_v3_a2_objective_has_one_prediction_and_no_helper(self):
+        from toolkit import trigger_binding_losses
+
+        trainer = self._trainer('a2')
+        trainer.device_torch = torch.device('cpu')
+        trainer.step_num = 0
+        trainer.additional_logs = {}
+        trainer.three_phase_trigger_training.placeholder = '[trigger]'
+        trainer.three_phase_trigger_training.phase_runtime.objective = {
+            'pipeline': 'ideogram4_v3_activator',
+            'name': 'te_calibration',
+            'helper_schedule': {'helpers': ['illustration']},
+        }
+        trainer._trigger_binding_modules = {'losses': trigger_binding_losses}
+        trainer.sd = SimpleNamespace(
+            get_prompt_embeds=lambda prompts: _FakeEmbeds(len(prompts)),
+            get_loss_target=lambda noise, batch, timesteps: noise + 1,
+        )
+        calls = []
+        trainer.predict_noise = lambda **kwargs: calls.append(kwargs) or kwargs['noisy_latents'] * 0.0
+        trainer._activator_mode = lambda mode: patch.object(trainer, '_mode', mode, create=True)
+        batch = SimpleNamespace(
+            file_items=[SimpleNamespace(caption_template='x [trigger]', raw_caption='unused')],
+        )
+        loss = trainer._calculate_ideogram4_v3_activator_loss(
+            noisy_latents=torch.zeros(1, 2),
+            noise=torch.zeros(1, 2),
+            timesteps=torch.tensor([10]),
+            batch=batch,
+            pred_kwargs={},
+            dtype=torch.float32,
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertGreater(float(loss), 0.0)
+        self.assertEqual(trainer._trigger_binding_last_metrics['v3/a2/helper_passes'], 0.0)
+
+    def test_v3_fixed_probe_runs_diffusion_conditions_and_restores_network(self):
+        trainer = self._trainer('a2')
+        trainer.device_torch = torch.device('cpu')
+        trainer.step_num = 0
+        trainer.additional_logs = {}
+        trainer.three_phase_trigger_training.placeholder = '[trigger]'
+        trainer.three_phase_trigger_training.literal = '<atomic>'
+        trainer.three_phase_trigger_training.phase_runtime.objective = {
+            'pipeline': 'ideogram4_v3_activator',
+            'helper_schedule': {'helpers': ['helper-one', 'helper-two']},
+        }
+        trainer.text_activator.original_literal_text = 'old literal words'
+        trainer.network.is_active = False
+        prepared = {
+            'latent': torch.zeros(1, 2),
+            'noise': torch.ones(1, 2),
+            'noisy_latents': torch.zeros(1, 2),
+            'timesteps': torch.tensor([250.0]),
+            'target': torch.ones(1, 2),
+            'prompt_template': 'render [trigger] object',
+            'placeholder': '[trigger]',
+        }
+        trainer._semantic_scaffold_prepare_case = lambda case: prepared
+        trainer._semantic_scaffold_probe_batch = lambda value: SimpleNamespace(latents=value['latent'])
+        calls = []
+
+        class _Embeds:
+            def __init__(self, label):
+                self.label = label
+
+            def to(self, *_args, **_kwargs):
+                return self
+
+        trainer.sd = SimpleNamespace(get_prompt_embeds=lambda prompts: _Embeds(('bound', trainer._mode, prompts[0])))
+        trainer._trigger_binding_prompt_encoder = lambda prompts, runtime_mode: _Embeds(('text', runtime_mode, prompts[0]))
+        trainer._activator_mode = lambda mode: patch.object(trainer, '_mode', mode, create=True)
+
+        def predict_noise(**kwargs):
+            label = kwargs['conditional_embeds'].label
+            calls.append((label, trainer.network.is_active))
+            if label[0] == 'bound' and not trainer.network.is_active:
+                return torch.zeros(1, 2)
+            if label[0] == 'text' and 'old literal words' in label[2]:
+                return torch.full((1, 2), 0.25)
+            if label[0] == 'bound':
+                return torch.full((1, 2), 0.75)
+            return torch.full((1, 2), 0.5)
+
+        trainer.predict_noise = predict_noise
+        case = {
+            'probe_case_id': 'fixed-case', 'split': 'heldout', 'item_id': 'image.png',
+            'caption_hash': 'caption', 'image_hash': 'image', 'noise_seed': 42,
+            'timestep': 250, 'sigma': None, 'target_mode': 'flow', 'transform': {},
+            'dataset_relative_item_id': 'image.png', 'probe_index': 0,
+        }
+        result = trainer._evaluate_ideogram4_v3_fixed_probe(case, 'heldout', 0)
+
+        self.assertFalse(trainer.network.is_active)
+        self.assertEqual(len(calls), 5)
+        self.assertEqual(calls[0][0][:2], ('bound', 'semantic_only'))
+        self.assertFalse(calls[0][1])
+        self.assertEqual(calls[1][0], ('text', 'stock_literal', 'render old literal words object'))
+        self.assertTrue(calls[1][1])
+        self.assertEqual(calls[2][0][:2], ('bound', 'semantic_only'))
+        self.assertTrue(calls[2][1])
+        self.assertNotEqual(result['a_target_mse'], result['c_target_mse'])
+        self.assertAlmostEqual(result['heldout_loss'], 0.0625)
+        self.assertEqual(result['heldout_loss'], result['c_target_mse'])
+        self.assertEqual(set(result['conditions']['D_v3_helpers']), {'helper-one', 'helper-two'})
 
     def test_semantic_scaffold_handoff_freezes_semantic_groups_without_forward_toggle(self):
         trainer = self._trainer('a1')

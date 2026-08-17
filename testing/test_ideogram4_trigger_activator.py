@@ -135,6 +135,26 @@ class Ideogram4TriggerActivatorTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             TextActivator(4, tap_layers=DEFAULT_TAP_LAYERS[:-1])
 
+    def test_structural_tap_free_instantiation_has_no_tap_state_or_runtime_layers(self):
+        activator = TextActivator(4, create_tap_adapters=False)
+
+        self.assertEqual(activator.tap_layers, ())
+        self.assertEqual(len(activator.tap_adapters), 0)
+        self.assertFalse(activator.component_active["tap_adapters"])
+        self.assertFalse(any("tap_adapters" in name for name, _ in activator.named_parameters()))
+        self.assertFalse(any("tap_adapters" in key for key in activator.state_dict()))
+        self.assertNotIn(
+            "text_activator.tap_adapters",
+            [group["name"] for group in activator.parameter_groups(include_frozen=True)],
+        )
+        activator.set_runtime_mode("full")
+        self.assertFalse(activator.component_active["tap_adapters"])
+        qwen = _FakeQwen(4)
+        activator.install_qwen_hooks(qwen, tap_module_names={})
+        self.assertEqual(activator.probe_diagnostics().hook_count, 0)
+        with self.assertRaises(KeyError):
+            activator.apply_tap(DEFAULT_TAP_LAYERS[0], torch.zeros(1, 1, 4))
+
     def test_component_active_trainable_and_parameter_groups(self):
         te_adapter = MaskedLowRankAdapter(4, rank=1)
         activator = TextActivator(4, te_adapter=te_adapter)

@@ -320,6 +320,12 @@ class ToolkitModuleMixin:
         scaled_lora_output = broadcast_and_multiply(lora_output, multiplier)
         scaled_lora_output = scaled_lora_output.to(org_forwarded.dtype)
 
+        residual_runtime = getattr(network, "_residual_ablation_runtime", None)
+        if residual_runtime is not None:
+            apply_residual = getattr(residual_runtime, "apply", None)
+            if callable(apply_residual):
+                scaled_lora_output = apply_residual(self, scaled_lora_output)
+
         if self.__class__.__name__ == "DoRAModule":
             # ref https://github.com/huggingface/peft/blob/1e6d1d73a0850223b0916052fd8d2382a90eae5a/src/peft/tuners/lora/layer.py#L417
             # x = dropout(x)
@@ -517,6 +523,7 @@ class ToolkitNetworkMixin:
         self.network_config: NetworkConfig = network_config
         self.module_losses: List[torch.Tensor] = []
         self.lorm_train_mode: Literal['local', None] = None
+        self._residual_ablation_runtime = None
         self.can_merge_in = not is_lorm
         # will prevent optimizer from loading as it will have double states
         self.did_change_weights = False

@@ -251,13 +251,25 @@ class SDTrainer(BaseSDTrainProcess):
     def _phase_config(self):
         return getattr(self.three_phase_trigger_training, f'phase_{self.runtime_phase}')
 
+    def _phase_runtime_objective(self):
+        runtime = getattr(self.three_phase_trigger_training, 'phase_runtime', None)
+        objective = getattr(runtime, 'objective', {}) if runtime is not None else {}
+        return objective if isinstance(objective, dict) else {}
+
     def _activator_component_flags(self):
         train = self._phase_config().train
-        return {
+        objective = self._phase_runtime_objective()
+        flags = {
             'embedding': bool(train.get('embedding', train.get('trigger_embedding', False))),
             'te_adapter': bool(train.get('internal', train.get('te_adapter', train.get('text_encoder_adapter', False)))),
             'tap_adapters': bool(train.get('tap', train.get('tap_adapters', False))),
         }
+        if objective.get('pipeline') == 'ideogram4_v3_activator':
+            if objective.get('te_only', False):
+                flags.update({'embedding': False, 'te_adapter': True, 'tap_adapters': False})
+            elif objective.get('name') == 'semantic_activator':
+                flags.update({'embedding': True, 'te_adapter': True, 'tap_adapters': False})
+        return flags
 
     def _configure_phase_trainability(self):
         flags = self._activator_component_flags()
@@ -295,7 +307,11 @@ class SDTrainer(BaseSDTrainProcess):
         if semantic and not tap_unlocked:
             self.text_activator.set_component_mode('tap_adapters', active=False, trainable=False)
         if self.network is not None:
+            objective = self._phase_runtime_objective()
             network_trainable = bool(self._phase_config().train.get('diffusion_lora', phase_is_b))
+            if objective.get('pipeline') == 'ideogram4_v3_activator' and objective.get('v3_active_frozen', False):
+                network_trainable = False
+                self.network.is_active = True
             self.network.requires_grad_(network_trainable)
         return flags
 
@@ -326,21 +342,73 @@ class SDTrainer(BaseSDTrainProcess):
         hidden_size = int(getattr(language_model.config, 'hidden_size'))
         literal = self.three_phase_trigger_training.literal
         tokenizer = self.sd.tokenizer
+        objective = self._phase_runtime_objective()
+        is_v3_activator = objective.get('pipeline') == 'ideogram4_v3_activator'
+        embedding_table = language_model.embed_tokens
+        if is_v3_activator:
+            source_ids = list(tokenizer(literal, add_special_tokens=False)['input_ids'])
+            safe_ids = [token_id for token_id in source_ids if token_id < embedding_table.num_embeddings]
+            original_literal_pieces = [
+                tokenizer.decode([token_id], skip_special_tokens=False)
+                for token_id in safe_ids
+            ]
+            original_literal_text = ''.join(original_literal_pieces)
+            if original_literal_text == literal:
+                original_literal_text = ' '.join(piece for piece in original_literal_pieces if piece)
+            if len(safe_ids) != len(source_ids) or not safe_ids:
+                raise RuntimeError('V3 literal pre-registration token IDs are outside the frozen Qwen embedding table')
+            initializer_ids = torch.tensor(safe_ids, device=embedding_table.weight.device, dtype=torch.long)
+            init_module = importlib.import_module(
+                'extensions_built_in.ideogram4_v3_activator.literal_initialization'
+            )
+            init_options = dict(objective.get('literal_initialization', {}))
+            init_root = str(objective.get('literal_initialization_root') or os.path.join(
+                self.three_phase_trigger_training.run_root or self.save_root, 'phase_a1'
+            ))
+            artifact_filename = str(init_options.get('artifact_filename', 'literal_initialization.safetensors'))
+            manifest_filename = str(init_options.get('manifest_filename', 'literal_initialization_manifest.json'))
+            artifact_path = os.path.join(init_root, artifact_filename)
+            manifest_path = os.path.join(init_root, manifest_filename)
+            if self.runtime_phase == 'a2' and os.path.isfile(artifact_path):
+                initializer = load_file(artifact_path, device='cpu')['embeddings']
+            else:
+                with torch.no_grad():
+                    source_embeddings = embedding_table(initializer_ids).detach().float().cpu()
+                initializer = init_module.map_literal_embeddings_to_four(source_embeddings)
+                init_config = init_module.LiteralInitializationConfig(
+                    enabled=True,
+                    target_vectors=4,
+                    dtype='float32',
+                    manifest_filename=manifest_filename,
+                    artifact_filename=artifact_filename,
+                )
+                manifest = init_module.build_literal_initialization_manifest(
+                    literal=literal,
+                    token_ids=safe_ids,
+                    source_embeddings=source_embeddings,
+                    mapped_embeddings=initializer,
+                    tokenizer={'class': tokenizer.__class__.__name__},
+                    config=init_config,
+                )
+                init_module.atomic_save_manifest(manifest_path, manifest)
+                init_module.atomic_save_literal_initialization(artifact_path, initializer, manifest)
+            embedding_tokens = 4
+        else:
+            init_ids = tokenizer(config.embedding.init_words, add_special_tokens=False)['input_ids']
+            if not init_ids:
+                raise RuntimeError('text activator semantic initializer produced no tokens')
+            safe_ids = [token_id for token_id in init_ids if token_id < embedding_table.num_embeddings]
+            if not safe_ids:
+                raise RuntimeError('text activator initializer token IDs are outside the Qwen embedding table')
+            initializer_ids = torch.tensor(safe_ids, device=embedding_table.weight.device, dtype=torch.long)
+            with torch.no_grad():
+                initializer = embedding_table(initializer_ids).float().mean(dim=0, keepdim=True)
+            embedding_tokens = config.embedding.tokens
         tokenizer.add_tokens([literal], special_tokens=True)
         atomic_ids = tokenizer(literal, add_special_tokens=False)['input_ids']
         if len(atomic_ids) != 1:
             raise RuntimeError(f'failed to register atomic trigger token {literal!r}: {atomic_ids}')
         atomic_token_id = int(atomic_ids[0])
-        init_ids = tokenizer(config.embedding.init_words, add_special_tokens=False)['input_ids']
-        if not init_ids:
-            raise RuntimeError('text activator semantic initializer produced no tokens')
-        embedding_table = language_model.embed_tokens
-        safe_ids = [token_id for token_id in init_ids if token_id < embedding_table.num_embeddings]
-        if not safe_ids:
-            raise RuntimeError('text activator initializer token IDs are outside the Qwen embedding table')
-        initializer_ids = torch.tensor(safe_ids, device=embedding_table.weight.device, dtype=torch.long)
-        with torch.no_grad():
-            initializer = embedding_table(initializer_ids).float().mean(dim=0, keepdim=True)
         te_config = config.te_adapter
         te_mode = getattr(te_config, 'mode', 'shared_post_layer')
         te_adapter = None
@@ -368,7 +436,7 @@ class SDTrainer(BaseSDTrainProcess):
         activator = TextActivator(
             embedding_dim=hidden_size,
             hidden_size=hidden_size,
-            embedding_tokens=config.embedding.tokens,
+            embedding_tokens=embedding_tokens,
             initializer=initializer,
             te_adapter=te_adapter,
             te_adapter_mode=te_mode,
@@ -379,6 +447,7 @@ class SDTrainer(BaseSDTrainProcess):
             te_parent_modules=getattr(te_config, 'parent_modules', ()),
             te_layers=te_config.layers,
             tap_layers=tap_config.tap_layers,
+            create_tap_adapters=bool(tap_config.enabled and not is_v3_activator),
             tap_rank=tap_config.rank,
             tap_alpha=tap_config.alpha,
             tap_dropout=tap_config.dropout,
@@ -393,6 +462,9 @@ class SDTrainer(BaseSDTrainProcess):
         ).to(self.device_torch, dtype=get_torch_dtype(config.embedding.dtype))
         activator.atomic_token_id = atomic_token_id
         activator.lookup_token_id = int(safe_ids[0])
+        if is_v3_activator:
+            activator.original_literal_token_ids = tuple(int(value) for value in safe_ids)
+            activator.original_literal_text = original_literal_text
         module_lora_installer = getattr(activator, 'install_module_lora', None)
         if callable(module_lora_installer):
             module_lora_installer(language_model)
@@ -1204,6 +1276,40 @@ class SDTrainer(BaseSDTrainProcess):
         manifest_path = getattr(config, 'data_split_manifest', None) or getattr(split_config, 'manifest_path', None)
         if config is None or not getattr(config, 'enabled', False) or not manifest_path:
             return
+        if self.ideogram4_v3_activator_enabled:
+            manifest, items = self._semantic_scaffold_items()
+            cases = build_fixed_probe_cases(
+                items,
+                {
+                    'train_item_ids': manifest.train_item_ids,
+                    'heldout_item_ids': manifest.heldout_item_ids,
+                },
+                noise_seeds=[int(getattr(config, 'seed', 0))],
+                fixed_timesteps=list(getattr(config, 'fixed_timesteps', ())),
+                fixed_sigmas=list(getattr(config, 'fixed_sigmas', ())),
+                probe_scope='split',
+            )
+            items_by_id = {
+                str(item['dataset_relative_item_id']).replace('\\', '/'): item
+                for item in items
+            }
+            self._semantic_scaffold_probe_case_by_id = {
+                case.probe_case_id: items_by_id[case.item_id]
+                for case in cases
+            }
+            self._trigger_binding_probe_sets = {'train': [], 'heldout': []}
+            for case in cases:
+                self._trigger_binding_probe_sets[case.split].append({
+                    **case.as_dict(),
+                    'dataset_relative_item_id': case.item_id,
+                    'probe_index': len(self._trigger_binding_probe_sets[case.split]),
+                })
+            self._trigger_binding_probe_manifest_hash = fingerprint({
+                'schema': 'ai-toolkit.ideogram4-v3-activator-fixed-probes',
+                'schema_version': 1,
+                'cases': [case.as_dict() for case in cases],
+            })
+            return
         split_module = importlib.import_module('toolkit.trigger_data_split')
         manifest = split_module.load_data_split_manifest(manifest_path)
         items = []
@@ -1250,6 +1356,12 @@ class SDTrainer(BaseSDTrainProcess):
         self._prepare_v8_fixed_probe_sets()
         if self.semantic_scaffold_enabled:
             self._maybe_run_v8_fixed_validation()
+        elif self.ideogram4_v3_activator_enabled and self.runtime_phase == 'a2':
+            self._v3_preflight_validation = True
+            try:
+                self._maybe_run_v8_fixed_validation()
+            finally:
+                self._v3_preflight_validation = False
         if self.three_phase_enabled:
             probe_config = self.three_phase_trigger_training.reachability_probe
             if probe_config.get('enabled', True):
@@ -2360,6 +2472,15 @@ class SDTrainer(BaseSDTrainProcess):
         )
 
     @property
+    def ideogram4_v3_activator_enabled(self):
+        return bool(
+            self.three_phase_enabled
+            and getattr(self.three_phase_trigger_training, 'schema_version', 7) == 8
+            and getattr(self.three_phase_trigger_training, 'objective_mode', None) == 'ideogram4_v3_activator'
+            and self._phase_runtime_objective().get('pipeline') == 'ideogram4_v3_activator'
+        )
+
+    @property
     def semantic_scaffold_enabled(self):
         return bool(
             self.three_phase_enabled
@@ -2541,6 +2662,142 @@ class SDTrainer(BaseSDTrainProcess):
             raise_on_error=True,
         )
         self._trigger_gradient_reachability_checked = True
+
+    @staticmethod
+    def _v3_segmented_smoothstep_weight(step, *, start, middle, end, first_end=40, second_end=80):
+        step = max(0, int(step))
+        if step <= 0:
+            return float(start)
+        if step == first_end:
+            return float(middle)
+        if step >= second_end:
+            return float(end)
+        if step < first_end:
+            progress = min(float(step) / max(float(first_end), 1.0), 1.0)
+            smooth = progress * progress * (3.0 - 2.0 * progress)
+            return float(start) + smooth * (float(middle) - float(start))
+        progress = min(float(step - first_end) / max(float(second_end - first_end), 1.0), 1.0)
+        smooth = progress * progress * (3.0 - 2.0 * progress)
+        return float(middle) + smooth * (float(end) - float(middle))
+
+    def _v3_schedule_weights(self, step=None):
+        current = int(self.step_num if step is None else step)
+        return {
+            'helper': self._v3_segmented_smoothstep_weight(
+                current, start=1.0, middle=0.1, end=0.0
+            ),
+            'dataset': self._v3_segmented_smoothstep_weight(
+                current, start=0.25, middle=1.0, end=1.0
+            ),
+        }
+
+    def _calculate_ideogram4_v3_activator_loss(
+        self,
+        noisy_latents,
+        noise,
+        timesteps,
+        batch,
+        pred_kwargs,
+        dtype,
+    ):
+        objective = self._phase_runtime_objective()
+        loss_module = self._load_trigger_binding_modules()['losses']
+        prompts = [
+            getattr(item, 'caption_template', None) or item.raw_caption
+            for item in batch.file_items
+        ]
+        target = shared_loss_target(self, noise, batch, timesteps).detach()
+
+        def predict(prompt_batch, mode, *, detach=False):
+            with self._activator_mode(mode):
+                embeds = self.sd.get_prompt_embeds(prompt_batch)
+                prediction = self.predict_noise(
+                    noisy_latents=noisy_latents,
+                    timesteps=timesteps,
+                    conditional_embeds=embeds.to(self.device_torch, dtype=dtype),
+                    unconditional_embeds=None,
+                    batch=batch,
+                    is_primary_pred=not detach,
+                    **pred_kwargs,
+                )
+            return prediction.detach() if detach else prediction
+
+        semantic_prediction = predict(prompts, 'semantic_only')
+        semantic_mse = loss_module.per_item_diffusion_mse(semantic_prediction, target)
+        if self.runtime_phase == 'a2':
+            total = semantic_mse.mean()
+            metrics = {
+                'v3/a2/loss': float(total.detach().item()),
+                'v3/a2/diffusion_mse': float(semantic_mse.detach().mean().item()),
+                'v3/a2/helper_weight': 0.0,
+                'v3/a2/helper_passes': 0.0,
+            }
+        else:
+            bypass_prediction = predict(prompts, 'activator_bypass', detach=True)
+            bypass_mse = loss_module.per_item_diffusion_mse(bypass_prediction, target)
+            semantic_effect = semantic_prediction - bypass_prediction
+            helper_schedule = dict(objective.get('helper_schedule', {}))
+            helpers = tuple(str(value) for value in helper_schedule.get('helpers', ()) if str(value))
+            if not helpers:
+                raise ValueError('ideogram4_v3_activator A1 requires a non-empty fixed helper bank')
+            placeholder = self.three_phase_trigger_training.placeholder
+            helper_losses = []
+            for helper in helpers:
+                helper_prompts = [prompt.replace(placeholder, helper) for prompt in prompts]
+                helper_prediction = predict(helper_prompts, 'stock_literal', detach=True)
+                helper_effect = helper_prediction - bypass_prediction
+                helper_losses.append(loss_module.effect_direction_cosine(
+                    semantic_effect,
+                    helper_effect,
+                    minimum_teacher_norm=1.0e-6,
+                    minimum_private_norm=1.0e-6,
+                ).loss)
+            helper_loss = torch.stack(helper_losses).mean()
+            schedules = self._v3_schedule_weights()
+            prototype = getattr(self, '_v3_semantic_prototype', None)
+            semantic_vector = semantic_effect.float().flatten(1).mean(0)
+            zero = semantic_mse.sum() * 0.0
+            prototype_loss = zero
+            if prototype is not None:
+                prototype_loss = 1.0 - F.cosine_similarity(
+                    semantic_vector[None], prototype.detach().to(semantic_vector)[None], dim=1
+                ).mean()
+            decay = float(objective.get('prototype_ema_decay', 0.95))
+            detached_vector = semantic_vector.detach()
+            self._v3_semantic_prototype = (
+                detached_vector if prototype is None
+                else decay * prototype.to(detached_vector) + (1.0 - decay) * detached_vector
+            )
+            disturbance_beta = loss_module.normalized_disturbance_beta(
+                semantic_prediction, bypass_prediction, target
+            )
+            disturbance = loss_module.disturbance_cap_penalty(
+                disturbance_beta, float(objective.get('disturbance_max_beta', 1.0))
+            ).mean()
+            total = (
+                schedules['dataset'] * semantic_mse.mean()
+                + schedules['helper'] * helper_loss
+                + float(objective.get('prototype_weight', 0.1)) * prototype_loss
+                + float(objective.get('disturbance_weight', 0.1)) * disturbance
+            )
+            metrics = {
+                'v3/a1/loss': float(total.detach().item()),
+                'v3/a1/diffusion_mse': float(semantic_mse.detach().mean().item()),
+                'v3/a1/bypass_diffusion_mse': float(bypass_mse.detach().mean().item()),
+                'v3/a1/helper_loss': float(helper_loss.detach().item()),
+                'v3/a1/helper_weight': schedules['helper'],
+                'v3/a1/dataset_weight': schedules['dataset'],
+                'v3/a1/helper_passes': float(len(helpers)),
+                'v3/a1/prototype_consistency': float(prototype_loss.detach().item()),
+                'v3/a1/disturbance_beta': float(disturbance_beta.detach().mean().item()),
+                'v3/a1/disturbance_loss': float(disturbance.detach().item()),
+            }
+        self._trigger_binding_last_metrics = metrics
+        for key, value in metrics.items():
+            self.additional_logs[f'phase/{self.runtime_phase}/{key}'] = value
+        self._trigger_binding_metrics_pending_loss = total.detach()
+        self._trigger_binding_metrics_pending_step = self.step_num
+        return total
 
     def _calculate_semantic_scaffold_a1_loss(
         self,
@@ -3917,11 +4174,201 @@ class SDTrainer(BaseSDTrainProcess):
             return None
         return getattr(self.three_phase_trigger_training, 'validation', None)
 
+    @staticmethod
+    def _v3_probe_target_mse(prediction, target):
+        return float(F.mse_loss(
+            prediction.detach().float(), target.detach().float(), reduction='mean'
+        ).cpu().item())
+
+    def _evaluate_ideogram4_v3_fixed_probe(self, item, split, step):
+        case = item
+        if isinstance(item, Mapping):
+            case = FixedDiffusionProbeCase(
+                probe_case_id=str(item['probe_case_id']),
+                split=str(item['split']),
+                item_id=str(item['item_id']),
+                caption_hash=str(item['caption_hash']),
+                image_hash=str(item['image_hash']),
+                noise_seed=int(item['noise_seed']),
+                timestep=None if item.get('timestep') is None else int(item['timestep']),
+                sigma=None if item.get('sigma') is None else float(item['sigma']),
+                target_mode=str(item['target_mode']),
+                transform=dict(item.get('transform', {})),
+                latent_hash=item.get('latent_hash'),
+            )
+        prepared = self._semantic_scaffold_prepare_case(case)
+        template = prepared['prompt_template']
+        placeholder = prepared['placeholder']
+        if placeholder not in template:
+            raise RuntimeError(
+                f'Ideogram4 V3 fixed probe lacks placeholder {placeholder!r}: {template[:200]!r}'
+            )
+        objective = self._phase_runtime_objective()
+        helpers = tuple(
+            str(value) for value in objective.get('helper_schedule', {}).get('helpers', ())
+            if str(value)
+        )
+        original_literal = str(getattr(
+            self.text_activator,
+            'original_literal_text',
+            self.three_phase_trigger_training.literal,
+        ))
+        probe_batch = self._semantic_scaffold_probe_batch(prepared)
+
+        def predict_bound(mode, *, disable_network=False):
+            network_context = network_disabled(self.network) if disable_network else contextlib.nullcontext()
+            with network_context, self._activator_mode(mode):
+                embeds = self.sd.get_prompt_embeds([template])
+                return self.predict_noise(
+                    noisy_latents=prepared['noisy_latents'],
+                    timesteps=prepared['timesteps'],
+                    conditional_embeds=embeds.to(
+                        self.device_torch, dtype=prepared['noisy_latents'].dtype
+                    ),
+                    unconditional_embeds=None,
+                    batch=probe_batch,
+                    is_primary_pred=False,
+                )
+
+        def predict_text(phrase):
+            prompt = template.replace(placeholder, phrase)
+            embeds = self._trigger_binding_prompt_encoder(
+                [prompt], runtime_mode='stock_literal'
+            )
+            return self.predict_noise(
+                noisy_latents=prepared['noisy_latents'],
+                timesteps=prepared['timesteps'],
+                conditional_embeds=embeds.to(
+                    self.device_torch, dtype=prepared['noisy_latents'].dtype
+                ),
+                unconditional_embeds=None,
+                batch=probe_batch,
+                is_primary_pred=False,
+            )
+
+        network_was_active = None if self.network is None else bool(self.network.is_active)
+        try:
+            if self.network is not None:
+                self.network.is_active = True
+            with torch.no_grad():
+                prediction_a = predict_bound(
+                    'activator_bypass' if self.runtime_phase == 'a1' else 'semantic_only',
+                    disable_network=True,
+                )
+                prediction_b = predict_text(original_literal)
+                prediction_c = predict_bound(
+                    'semantic_only',
+                    disable_network=self.runtime_phase == 'a1',
+                )
+                helper_predictions = {
+                    helper: predict_text(helper)
+                    for helper in helpers
+                }
+        finally:
+            if self.network is not None:
+                self.network.is_active = network_was_active
+
+        target = prepared['target']
+        mse_a = self._v3_probe_target_mse(prediction_a, target)
+        mse_b = self._v3_probe_target_mse(prediction_b, target)
+        mse_c = self._v3_probe_target_mse(prediction_c, target)
+        helper_mses = {
+            helper: self._v3_probe_target_mse(prediction, target)
+            for helper, prediction in helper_predictions.items()
+        }
+        epsilon = 1.0e-6
+        baseline_cache = getattr(self, '_v3_probe_step0_c_mse', None)
+        if baseline_cache is None:
+            baseline_cache = {}
+            self._v3_probe_step0_c_mse = baseline_cache
+        if int(step) == 0:
+            baseline_cache[case.probe_case_id] = mse_c
+        baseline_c = baseline_cache.get(case.probe_case_id)
+        gain_vs_step0 = None if baseline_c is None else (baseline_c - mse_c) / (abs(baseline_c) + epsilon)
+        gain_vs_a = (mse_a - mse_c) / (abs(mse_a) + epsilon)
+        gain_vs_b = (mse_b - mse_c) / (abs(mse_b) + epsilon)
+
+        semantic_effect = (prediction_c - prediction_a).detach().float().flatten()
+        helper_cosines = {}
+        for helper, prediction in helper_predictions.items():
+            helper_effect = (prediction - prediction_a).detach().float().flatten()
+            helper_cosines[helper] = float(F.cosine_similarity(
+                semantic_effect[None], helper_effect[None], dim=1, eps=epsilon
+            ).cpu().item())
+        helper_values = list(helper_mses.values())
+        helper_cosine_values = list(helper_cosines.values())
+        disturbance = float((
+            semantic_effect.square().mean()
+            / ((target.detach().float() - prediction_a.detach().float()).flatten().square().mean() + epsilon)
+        ).cpu().item())
+        prototype = getattr(self, '_v3_semantic_prototype', None)
+        prototype_consistency = None
+        if prototype is not None:
+            current = semantic_effect
+            reference = prototype.detach().to(current).flatten()
+            if current.numel() == reference.numel():
+                prototype_consistency = float(F.cosine_similarity(
+                    current[None], reference[None], dim=1, eps=epsilon
+                ).cpu().item())
+        parameter_norms = {
+            name: float(parameter.detach().float().norm().cpu().item())
+            for name, parameter in self.text_activator.named_parameters()
+            if name.startswith('embedding') or 'module_lora' in name or name.startswith('te_adapter')
+        }
+        return {
+            'validation_schema': 'ai-toolkit.ideogram4-v3-activator-fixed-diffusion',
+            'validation_schema_version': 2,
+            'probe_case_id': case.probe_case_id,
+            'fixed_timestep': case.timestep,
+            'fixed_sigma': case.sigma,
+            'noise_seed': case.noise_seed,
+            'conditions': {
+                'A_base_activator_no_v3': {'target_mse': mse_a},
+                'B_v3_original_literal': {
+                    'target_mse': mse_b,
+                    'original_literal_text': original_literal,
+                },
+                'C_v3_current_activator': {'target_mse': mse_c},
+                'D_v3_helpers': {
+                    helper: {
+                        'target_mse': helper_mses[helper],
+                        'semantic_effect_cosine': helper_cosines[helper],
+                    }
+                    for helper in helpers
+                },
+            },
+            'a_target_mse': mse_a,
+            'b_target_mse': mse_b,
+            'c_target_mse': mse_c,
+            'heldout_loss': mse_c,
+            'c_gain_vs_step0': gain_vs_step0,
+            'c_gain_vs_a': gain_vs_a,
+            'c_gain_vs_b': gain_vs_b,
+            'semantic_target_gain': gain_vs_a,
+            'helper_target_mse_mean': (
+                sum(helper_values) / len(helper_values) if helper_values else None
+            ),
+            'helper_target_mse_min': min(helper_values) if helper_values else None,
+            'helper_target_mse_max': max(helper_values) if helper_values else None,
+            'helper_cosine_mean': (
+                sum(helper_cosine_values) / len(helper_cosine_values)
+                if helper_cosine_values else None
+            ),
+            'prototype_consistency': prototype_consistency,
+            'disturbance_beta': disturbance,
+            'parameter_norms': parameter_norms,
+            'probe_available': True,
+        }
+
     def _maybe_run_v8_fixed_validation(self):
         config = self._v8_validation_config()
         if config is None or not getattr(config, 'enabled', False):
             return
-        completed_updates = int(self.step_num)
+        completed_updates = (
+            0 if getattr(self, '_v3_preflight_validation', False)
+            else int(self.step_num) + 1 if self.ideogram4_v3_activator_enabled
+            else int(self.step_num)
+        )
         if not should_run_validation(completed_updates, config):
             return
         if completed_updates in self._trigger_binding_validation_steps:
@@ -3938,6 +4385,8 @@ class SDTrainer(BaseSDTrainProcess):
                     raise RuntimeError('semantic scaffold validation requires a fixed prediction evaluator')
                 return self._semantic_scaffold_fixed_probe_evaluator(item, split, step)
             prompt = item.get('caption', '')
+            if self.ideogram4_v3_activator_enabled:
+                return self._evaluate_ideogram4_v3_fixed_probe(item, split, step)
             if self.trigger_word:
                 prompt = self.sd.inject_trigger_into_prompt(prompt, trigger=self.trigger_word, add_if_not_present=False)
             with torch.no_grad():
@@ -4731,7 +5180,17 @@ class SDTrainer(BaseSDTrainProcess):
                     )
                 else:
                     tst_loss = None
-                    if self.semantic_scaffold_enabled:
+                    if self.ideogram4_v3_activator_enabled:
+                        with self.timer('ideogram4_v3_activator_predict_and_loss'):
+                            tst_loss = self._calculate_ideogram4_v3_activator_loss(
+                                noisy_latents=noisy_latents.to(self.device_torch, dtype=dtype),
+                                noise=noise.to(self.device_torch, dtype=dtype).detach(),
+                                timesteps=timesteps,
+                                batch=batch,
+                                pred_kwargs=pred_kwargs,
+                                dtype=dtype,
+                            )
+                    elif self.semantic_scaffold_enabled:
                         with self.timer('semantic_scaffold_control_channel_predict_and_loss'):
                             tst_loss = self._calculate_semantic_scaffold_a1_loss(
                                 noisy_latents=noisy_latents.to(self.device_torch, dtype=dtype),
@@ -4922,13 +5381,14 @@ class SDTrainer(BaseSDTrainProcess):
             f'phase_{self.runtime_phase}',
         )
         final_step = max(int(self._phase_config().steps) - 1, 0)
-        is_final_save = int(self.step_num) >= final_step or int(self.step_num) >= int(self._phase_config().steps)
+        completed_step = int(self.step_num) + 1 if self.ideogram4_v3_activator_enabled else int(self.step_num)
+        is_final_save = int(self.step_num) >= final_step or completed_step >= int(self._phase_config().steps)
         output_dir = os.path.join(
             phase_root,
             artifact_config.final_dir if is_final_save else artifact_config.checkpoint_dir,
         )
         if not is_final_save:
-            output_dir = os.path.join(output_dir, str(self.step_num))
+            output_dir = os.path.join(output_dir, str(completed_step))
         os.makedirs(output_dir, exist_ok=True)
         te_artifact_module = getattr(self.text_activator, 'te_adapter_artifact_module', None)
         te_artifact_module = (
@@ -4956,7 +5416,7 @@ class SDTrainer(BaseSDTrainProcess):
                     config=self.three_phase_trigger_training.text_activator,
                     extra={
                         'runtime_phase': self.runtime_phase,
-                        'step': self.step_num,
+                        'step': completed_step,
                         'metrics': self._trigger_binding_last_metrics,
                         'parameter_change_proof': proof,
                     },

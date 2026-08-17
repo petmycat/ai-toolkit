@@ -1,0 +1,108 @@
+---
+job: extension
+config:
+  name: ideogram4_v3_activator_example
+  process:
+    - type: ideogram4_v3_activator
+      name: ideogram4_v3_activator_example
+      training_folder: out/ideogram4_v3
+      trigger_word: "<replace-with-atomic-literal>"
+      model:
+        arch: ideogram4
+        name_or_path: /path/to/ideogram4/base
+      datasets:
+        - folder_path: /path/to/dataset
+          caption_ext: json
+          default_caption: "[trigger]"
+          resolution: 1024
+          buckets: true
+      train:
+        dtype: bf16
+        batch_size: 1
+        gradient_checkpointing: true
+        lr_scheduler: constant
+        loss_target: noise
+      save:
+        dtype: bf16
+        max_step_saves_to_keep: 8
+      three_phase_trigger_training:
+        trigger:
+          placeholder: "[trigger]"
+          literal: "<replace-with-atomic-literal>"
+        text_activator:
+          architecture_mode: module_lora
+          embedding:
+            enabled: true
+            tokens: 4
+            init_mode: literal_initialization
+            init_words: ""
+            dtype: bf16
+          te_adapter:
+            enabled: true
+            mode: module_lora
+            rank: 4
+            alpha: 4
+            dropout: 0.0
+            target_modules: [down_proj]
+          tap_adapters:
+            enabled: false
+      ideogram4_v3_activator:
+        enabled: true
+        output_root: out/ideogram4_v3/example_run
+        v3_weights: /path/to/user/v3_snapshot_or_weights.safetensors
+        literal_initialization:
+          strategy: frozen_qwen_interval_overlap
+          target_vectors: 4
+          fallback_literal: "<replace-with-atomic-literal>"
+          manifest_filename: literal_initialization_manifest.json
+          artifact_filename: literal_initialization.safetensors
+        helper_schedule:
+          mode: fixed
+          helpers: [illustration]
+          weights: [1.0]
+        dataset_schedule:
+          enabled: true
+          sources:
+            - name: structured
+              use_main_dataset: true
+              caption_ext: .json
+              format: json
+          schedule:
+            interpolation: smoothstep
+            normalize_weights: true
+            keyframes:
+              - step: 0
+                structured: 1.0
+              - step: 80
+                structured: 1.0
+        fixed_validation:
+          seed: 42
+          fixed_timesteps: [250, 500, 750]
+          data_split_manifest: /path/to/fixed_data_split_manifest.json
+        semantic_activator:
+          steps: 80
+          optimizer: adamw
+          optimizer_params:
+            weight_decay: 0.0
+          learning_rates:
+            embedding: 0.0005
+            te_adapter: 0.0001
+          save_steps: [20, 40, 60, 80]
+          validation_steps: [20, 40, 60, 80]
+        te_calibration:
+          steps: 80
+          optimizer: adamw
+          optimizer_params:
+            weight_decay: 0.0
+          learning_rates:
+            embedding: 0.0
+            te_adapter: 0.00005
+          save_steps: [20, 40, 60, 80]
+          validation_steps: [0, 20, 40, 60, 80]
+        terminal_manual_ablation:
+          mode: manual
+          automatic: false
+          residual_ablation_implemented: false
+          instruction: Run external/manual V3 residual ablation after pipeline STOP.
+meta:
+  name: "[name]"

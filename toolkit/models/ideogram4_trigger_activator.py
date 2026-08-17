@@ -388,6 +388,7 @@ class TextActivator(nn.Module):
         te_parent_modules: Sequence[str] = (),
         te_layers: Any = "all",
         tap_layers: Sequence[int] = DEFAULT_TAP_LAYERS,
+        create_tap_adapters: bool = True,
         tap_rank: int = 1,
         tap_alpha: Optional[float] = None,
         tap_dropout: float = 0.0,
@@ -402,8 +403,9 @@ class TextActivator(nn.Module):
     ) -> None:
         super().__init__()
         hidden_size = int(hidden_size or embedding_dim)
-        layers = tuple(int(layer) for layer in tap_layers)
-        if len(layers) != 13 or len(set(layers)) != 13:
+        self.create_tap_adapters = bool(create_tap_adapters)
+        layers = tuple(int(layer) for layer in tap_layers) if self.create_tap_adapters else ()
+        if self.create_tap_adapters and (len(layers) != 13 or len(set(layers)) != 13):
             raise ValueError("Ideogram 4 requires exactly 13 unique tap layer keys")
         if te_adapter_mode not in SUPPORTED_TE_ADAPTER_MODES:
             raise ValueError(f"unsupported te adapter mode: {te_adapter_mode}")
@@ -445,13 +447,15 @@ class TextActivator(nn.Module):
         self.component_active = {
             "embedding": True,
             "te_adapter": self.te_adapter is not None or self.te_adapter_mode == "module_lora",
-            "tap_adapters": True,
+            "tap_adapters": self.create_tap_adapters,
         }
         self.gamma = BoundedGamma(gamma_init, gamma_min, gamma_max, gamma_trainable)
         gamma_modules: Dict[str, BoundedGamma] = {}
         for component, options in (component_gammas or {}).items():
             if component not in self.COMPONENTS:
                 raise ValueError(f"unknown component gamma: {component}")
+            if component == "tap_adapters" and not self.create_tap_adapters:
+                continue
             opts = dict(options)
             gamma_modules[component] = BoundedGamma(
                 initial=float(opts.pop("initial", gamma_init)),
@@ -516,15 +520,18 @@ class TextActivator(nn.Module):
             raise KeyError(f"unknown component: {component}")
         module = getattr(self, component)
         if active is not None:
-            self.component_active[component] = bool(active)
+            effective_active = bool(active) and not (
+                component == "tap_adapters" and not self.create_tap_adapters
+            )
+            self.component_active[component] = effective_active
             if module is not None and hasattr(module, "active"):
-                module.active = bool(active)
+                module.active = effective_active
             if component == "te_adapter":
                 for adapter in self.module_lora_adapters.values():
-                    adapter.active = bool(active)
+                    adapter.active = effective_active
             if component == "tap_adapters":
                 for adapter in self.tap_adapters.values():
-                    adapter.active = bool(active)
+                    adapter.active = effective_active
         if trainable is not None:
             if module is not None:
                 module.requires_grad_(bool(trainable))
@@ -755,6 +762,7 @@ class TextActivator(nn.Module):
             "te_target_modules": list(self.te_target_modules),
             "te_layers": self.te_layers if self.te_layers == "all" else list(self.te_layers),
             "te_rank": self.te_rank,
+            "tap_adapters_created": self.create_tap_adapters,
             "tap_layers": list(self.tap_layers),
             "tap_ranks": {key: adapter.rank for key, adapter in self.tap_adapters.items()},
             "gamma": self.gamma_values(),

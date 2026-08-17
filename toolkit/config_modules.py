@@ -839,6 +839,7 @@ class TriggerBindingPhaseRuntimeConfig:
         self.save_steps: List[int] = [int(step) for step in kwargs.get('save_steps', [])]
         self.resume = TriggerBindingResumeConfig(**kwargs.get('resume', {}))
         self.sources = TriggerBindingResolvedSourcesConfig(**kwargs.get('sources', {}))
+        self.objective: Dict = dict(kwargs.get('objective', {}))
 
 
 class TriggerBindingExecutionConfig:
@@ -966,11 +967,15 @@ def validate_three_phase_trigger_training_config(
         raise ValueError('three_phase_trigger_training.schema_version must be 7 or 8')
     is_v8 = config.schema_version == 8
     if is_v8:
-        allowed_objectives = {'conditional_response_v8', 'semantic_scaffold_control_channel'}
+        allowed_objectives = {
+            'conditional_response_v8',
+            'semantic_scaffold_control_channel',
+            'ideogram4_v3_activator',
+        }
         if config.objective_mode not in allowed_objectives:
             raise ValueError(
-                'three_phase_trigger_training.objective_mode must be conditional_response_v8 '
-                'or semantic_scaffold_control_channel for schema_version=8'
+                'three_phase_trigger_training.objective_mode must be conditional_response_v8, '
+                'semantic_scaffold_control_channel, or ideogram4_v3_activator for schema_version=8'
             )
         if config.execution.start_phase not in config.PHASE_NAMES:
             raise ValueError('three_phase_trigger_training.execution.start_phase must be a1, b or a2')

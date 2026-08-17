@@ -1,0 +1,194 @@
+---
+job: extension
+config:
+  name: ig4_TST_v9
+  process:
+    - type: ideogram4_v3_activator
+      name: ig4_TST_v9
+      training_folder: /data/train/models/ig4_TST_v9
+      device: cuda
+      trigger_word: <r1X1dOn9mA2>
+      performance_log_every: 20
+
+      model:
+        name_or_path: ideogram-ai/ideogram-4-fp8
+        arch: ideogram4
+        quantize: true
+        qtype: qfloat8
+        quantize_te: true
+        qtype_te: qfloat8
+        low_vram: false
+        compile: false
+        layer_offloading: false
+        layer_offloading_text_encoder_percent: 1
+        layer_offloading_transformer_percent: 1
+        unconditional_lora_path: ostris/ideogram_4_unconditional_lora/ideogram_4_unconditional_lora_r16.safetensors
+
+      datasets:
+        - folder_path: /data/train/datasets/en_ig4_r1X1dOn9mA2
+          caption_ext: json
+          default_caption: ""
+          caption_dropout_rate: 0.0
+          cache_latents_to_disk: false
+          cache_text_embeddings: false
+          resolution: [256, 768, 1280]
+          buckets: true
+          num_repeats: 1
+          trigger_data_split_manifest: /data/train/models/ig4_TST_v8_a1_4/data_split_manifest.json
+          trigger_data_split_name: train
+
+      train:
+        dtype: bf16
+        batch_size: 2
+        gradient_accumulation: 1
+        gradient_checkpointing: true
+        cache_text_embeddings: false
+        unload_text_encoder: false
+        noise_scheduler: flowmatch
+        timestep_type: sigmoid
+        loss_type: mse
+        lr_scheduler: constant
+        train_unet: false
+        train_text_encoder: false
+        disable_sampling: true
+
+      save:
+        dtype: bf16
+        save_every: null
+        max_step_saves_to_keep: 10
+        save_format: safetensors
+        push_to_hub: false
+
+      sample:
+        samples: []
+
+      # Set linear/linear_alpha to the rank and alpha used by your frozen V3 LoRA.
+      v3_network:
+        type: lora
+        linear: 32
+        linear_alpha: 32
+        transformer_only: true
+
+      three_phase_trigger_training:
+        trigger:
+          placeholder: "[trigger]"
+          literal: <r1X1dOn9mA2>
+          span_detection: offsets
+          mask_all_occurrences: true
+          occurrence_mode: additive
+        text_activator:
+          architecture_mode: module_lora
+          embedding:
+            enabled: true
+            tokens: 4
+            init_mode: literal_initialization
+            init_words: ""
+            dtype: bf16
+          amplification:
+            enabled: true
+            trainable: false
+            initial: 1.0
+            minimum: 0.25
+            maximum: 4.0
+            per_component: false
+            regularization_weight: 0.01
+          te_adapter:
+            enabled: true
+            mode: module_lora
+            type: lora
+            rank: 4
+            alpha: 4
+            dropout: 0.0
+            parent_modules: [Qwen3VLTextMLP]
+            child_modules: [down_proj]
+            target_modules: [down_proj]
+            layers: all
+            token_mask_mode: trigger_span
+          tap_adapters:
+            enabled: false
+
+      ideogram4_v3_activator:
+        enabled: true
+        output_root: /data/train/models/ig4_TST_v9
+
+        # Fill this in before running A1+A2. A1 itself does not load it; the
+        # pipeline validates it up front because A2 must use this frozen LoRA.
+        v3_weights: ""
+
+        literal_initialization:
+          strategy: frozen_qwen_interval_overlap
+          target_vectors: 4
+          fallback_literal: <r1X1dOn9mA2>
+          manifest_filename: literal_initialization_manifest.json
+          artifact_filename: literal_initialization.safetensors
+
+        # Manual helper bank copied from v8 a1_4.
+        helper_schedule:
+          mode: fixed
+          helpers:
+            - Ghibli anime
+            - watercolor illustration
+            - whimsical illustration
+            - soft pastel illustration
+            - storybook illustration
+            - children's book illustration
+          weights:
+            - 0.16666666666666666
+            - 0.16666666666666666
+            - 0.16666666666666666
+            - 0.16666666666666666
+            - 0.16666666666666666
+            - 0.16666666666666666
+
+        dataset_schedule:
+          enabled: true
+          sources:
+            - name: structured
+              use_main_dataset: true
+              caption_ext: .json
+              format: json
+          schedule:
+            interpolation: smoothstep
+            normalize_weights: true
+            keyframes:
+              - step: 0
+                structured: 1.0
+              - step: 80
+                structured: 1.0
+
+        fixed_validation:
+          seed: 42
+          fixed_timesteps: [100, 500, 900]
+          data_split_manifest: /data/train/models/ig4_TST_v8_a1_4/data_split_manifest.json
+
+        semantic_activator:
+          steps: 80
+          optimizer: adamw8bit
+          optimizer_params:
+            weight_decay: 0.00005
+          learning_rates:
+            embedding: 0.001
+            te_adapter: 0.0001
+          save_steps: [20, 40, 60, 80]
+          validation_steps: [20, 40, 60, 80]
+
+        te_calibration:
+          steps: 100
+          optimizer: adamw8bit
+          optimizer_params:
+            weight_decay: 0.00005
+          learning_rates:
+            embedding: 0.0
+            te_adapter: 0.00005
+          save_steps: [20, 40, 60, 80, 100]
+          validation_steps: [0, 20, 40, 60, 80, 100]
+
+        terminal_manual_ablation:
+          mode: manual
+          automatic: false
+          residual_ablation_implemented: true
+          instruction: Run ideogram4_v3_residual_ablation manually after reviewing the A2 contract and best-heldout artifacts.
+
+meta:
+  name: "[Gen2_IG4_r1X1dOn9mA2_v9]"
+  version: "9.0"
