@@ -115,19 +115,32 @@ def test_metrics_formulas_and_zero_vector_cosine_are_json_safe():
     json.dumps(zero, allow_nan=False)
 
 
-def _write_probe(root: Path, item_id: str, caption, suffix=".json"):
+def _write_probe(root: Path, item_id: str, caption, suffix=".json", structured=False):
     image_path = root / item_id
     image_path.parent.mkdir(parents=True, exist_ok=True)
     image_path.write_bytes(b"fake-image")
     sidecar = image_path.with_suffix(suffix)
-    sidecar.write_text(json.dumps({"text": caption}) if suffix == ".json" else caption, encoding="utf-8")
+    if suffix == ".json":
+        payload = (
+            {"compositional_deconstruction": {"subject": caption}}
+            if structured
+            else {"text": caption}
+        )
+        sidecar.write_text(json.dumps(payload), encoding="utf-8")
+    else:
+        sidecar.write_text(caption, encoding="utf-8")
 
 
 def test_probe_selection_is_sorted_uses_all_heldout_and_requires_placeholder(tmp_path):
     train = [f"train/{index:02d}.png" for index in range(10)]
     heldout = [f"heldout/{index:02d}.png" for index in range(4)]
-    for item_id in train + heldout:
-        _write_probe(tmp_path, item_id, f"subject [trigger] {item_id}")
+    for index, item_id in enumerate(train + heldout):
+        _write_probe(
+            tmp_path,
+            item_id,
+            f"subject [trigger] {item_id}",
+            structured=index == 0,
+        )
     manifest = {"train_item_ids": list(reversed(train)), "heldout_item_ids": list(reversed(heldout))}
     selected = select_probe_items(tmp_path, manifest, train_limit=8, expected_heldout=4)
     assert [item["dataset_relative_item_id"] for item in selected[:8]] == sorted(train)[:8]

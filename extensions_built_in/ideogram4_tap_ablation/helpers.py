@@ -201,8 +201,13 @@ def read_sidecar_caption(image_path: os.PathLike | str) -> Tuple[str, str]:
                 caption = payload.strip()
             elif isinstance(payload, Mapping) and ("text" in payload or "caption" in payload):
                 caption = str(payload.get("text", payload.get("caption", ""))).strip()
+            elif isinstance(payload, Mapping):
+                # A1's structured caption source uses format="text": the JSON
+                # document itself is the model-ready caption, not a wrapper with
+                # a dedicated caption field. Keep its full structure intact.
+                caption = raw.strip()
             else:
-                raise ValueError(f"caption JSON must be a string or contain text/caption: {path}")
+                raise ValueError(f"caption JSON must be a string or object: {path}")
         if not caption:
             raise ValueError(f"caption is empty: {path}")
         return caption, path
