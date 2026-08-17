@@ -32,6 +32,30 @@ class SemanticScaffoldConfigTest(unittest.TestCase):
         validate_three_phase_trigger_training_config(config, '<x>')
         self.assertEqual(config.execution_phase_names(), ('a1',))
 
+    def test_v3_activator_accepts_literal_initialization_mode(self):
+        raw = self._raw()
+        raw['objective_mode'] = 'ideogram4_v3_activator'
+        raw['text_activator']['embedding']['init_mode'] = 'literal_initialization'
+        raw['text_activator']['tap_adapters'] = {'enabled': False}
+        raw['phase_a1']['train']['tap_adapters'] = False
+        raw['phase_a1']['learning_rates'].pop('tap_adapters')
+        raw['phase_a1']['losses'] = {'semantic_helper_consistency': {'enabled': True}}
+        raw['phase_runtime'] = {
+            'objective': {'pipeline': 'ideogram4_v3_activator'},
+            'save_steps': [5],
+        }
+        validate_three_phase_trigger_training_config(
+            ThreePhaseTriggerTrainingConfig(**raw), '<x>'
+        )
+
+    def test_other_objectives_reject_literal_initialization_mode(self):
+        raw = self._raw()
+        raw['text_activator']['embedding']['init_mode'] = 'literal_initialization'
+        with self.assertRaisesRegex(ValueError, 'semantic, random or checkpoint'):
+            validate_three_phase_trigger_training_config(
+                ThreePhaseTriggerTrainingConfig(**raw), '<x>'
+            )
+
     def test_semantic_objective_rejects_b_execution(self):
         raw = self._raw()
         raw['execution'] = {'start_phase': 'a1', 'stop_after_phase': 'b'}

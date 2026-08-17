@@ -80,7 +80,6 @@ class Ideogram4V3ActivatorConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "structured/json"):
             load_config(raw)
 
-
 class Ideogram4V3ActivatorPipelineTest(unittest.TestCase):
     def _process(self, temp_dir):
         v3 = os.path.join(temp_dir, "v3.safetensors")

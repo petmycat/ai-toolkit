@@ -1011,8 +1011,14 @@ def validate_three_phase_trigger_training_config(
     if embedding.enabled:
         if embedding.tokens not in (1, 2, 4):
             raise ValueError('three_phase_trigger_training.text_activator.embedding.tokens must be 1, 2 or 4')
-        if embedding.init_mode not in ('semantic', 'random', 'checkpoint'):
-            raise ValueError('embedding.init_mode must be semantic, random or checkpoint')
+        allowed_embedding_init_modes = {'semantic', 'random', 'checkpoint'}
+        if config.objective_mode == 'ideogram4_v3_activator':
+            allowed_embedding_init_modes.add('literal_initialization')
+        if embedding.init_mode not in allowed_embedding_init_modes:
+            raise ValueError(
+                'embedding.init_mode must be semantic, random or checkpoint'
+                + (', or literal_initialization for ideogram4_v3_activator' if config.objective_mode == 'ideogram4_v3_activator' else '')
+            )
         if embedding.init_mode == 'semantic':
             _validate_non_empty_string(embedding.init_words, 'embedding.init_words')
         if embedding.init_mode == 'checkpoint':
