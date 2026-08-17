@@ -59,6 +59,20 @@ def _scalar_like(value: TensorOrFloat, reference: torch.Tensor) -> torch.Tensor:
     return torch.as_tensor(value, device=reference.device, dtype=reference.dtype)
 
 
+def prototype_consistency_ready(
+    observation_count: int,
+    prototype: Optional[torch.Tensor],
+    *,
+    warmup_observations: int,
+    minimum_prototype_norm: float,
+) -> bool:
+    if warmup_observations < 0 or minimum_prototype_norm < 0:
+        raise ValueError('prototype warmup and norm thresholds must be non-negative')
+    if prototype is None or int(observation_count) < warmup_observations:
+        return False
+    return float(prototype.detach().float().norm().item()) >= minimum_prototype_norm
+
+
 def per_item_diffusion_mse(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     if prediction.shape != target.shape:
         raise ValueError('prediction and target shapes must match')

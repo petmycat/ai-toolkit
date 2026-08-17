@@ -393,11 +393,11 @@ def write_fixed_probe_results(
 
 
 SEMANTIC_VALIDATION_SCHEMA = 'ai-toolkit.semantic-scaffold-validation'
-SEMANTIC_VALIDATION_SCHEMA_VERSION = 1
+SEMANTIC_VALIDATION_SCHEMA_VERSION = 2
 SEMANTIC_METRIC_ALLOWLIST = frozenset({
     'gain_active', 'gain_full', 'gain_semantic_only', 'gain_helper',
     'active_helper_gap', 'tap_gain_delta', 'target_mse',
-    'prediction_delta', 'tap_prediction_delta', 'tap_relative_rms',
+    'prediction_delta', 'tap_prediction_delta', 'tap_prediction_relative_rms',
     'disturbance_beta', 'semantic_cosine',
 })
 
@@ -440,7 +440,7 @@ def semantic_prediction_metrics(
         'target_mse': full_mse,
         'prediction_delta': float(torch.linalg.vector_norm(full_delta).detach().cpu().item()),
         'tap_prediction_delta': float(torch.linalg.vector_norm(tap_delta).detach().cpu().item()),
-        'tap_relative_rms': float((tap_rms / semantic_rms).detach().cpu().item()),
+        'tap_prediction_relative_rms': float((tap_rms / semantic_rms).detach().cpu().item()),
         'disturbance_beta': float((full_delta.square().mean() / (target_delta.square().mean() + epsilon)).detach().cpu().item()),
         'semantic_cosine': float(F.cosine_similarity(full_delta[None], semantic_delta[None], dim=1, eps=epsilon).detach().cpu().item()),
     }

@@ -73,6 +73,8 @@ class SemanticScaffoldConfigTest(unittest.TestCase):
             'gain_weight': 1.0,
             'min_gain_delta': 0.0,
             'gain_temperature': 0.05,
+            'prototype_warmup_observations': 3,
+            'minimum_prototype_norm': 1.0e-6,
             'consistency_weight': 0.25,
             'relative_rms_low': 0.01,
             'relative_rms_high': 1.0,
@@ -90,6 +92,19 @@ class SemanticScaffoldConfigTest(unittest.TestCase):
             'fixed_unlock_step': 5,
         }
         with self.assertRaisesRegex(ValueError, 'fixed_unlock_step'):
+            validate_three_phase_trigger_training_config(
+                ThreePhaseTriggerTrainingConfig(**raw), '<x>'
+            )
+
+    def test_tap_prototype_warmup_thresholds_must_be_non_negative(self):
+        raw = self._raw()
+        raw['phase_a1']['losses']['semantic_scaffold_control_channel']['tap_specialization'] = {
+            'initially_disabled': True,
+            'schedule_mode': 'fixed',
+            'fixed_unlock_step': 1,
+            'prototype_warmup_observations': -1,
+        }
+        with self.assertRaisesRegex(ValueError, 'prototype warmup'):
             validate_three_phase_trigger_training_config(
                 ThreePhaseTriggerTrainingConfig(**raw), '<x>'
             )

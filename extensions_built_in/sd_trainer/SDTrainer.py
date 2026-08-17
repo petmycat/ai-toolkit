@@ -1193,7 +1193,7 @@ class SDTrainer(BaseSDTrainProcess):
             bypass_prediction=bypass_prediction, semantic_prediction=semantic_prediction,
             full_prediction=full_prediction, target=prepared['target'],
         )
-        return {'schema': 'ai-toolkit.semantic-scaffold-validation', 'schema_version': 1, 'probe_case_id': case.probe_case_id, **metrics, 'fixed_timestep': case.timestep, 'fixed_sigma': case.sigma}
+        return {'schema': 'ai-toolkit.semantic-scaffold-validation', 'schema_version': 2, 'probe_case_id': case.probe_case_id, **metrics, 'fixed_timestep': case.timestep, 'fixed_sigma': case.sigma}
 
     def _prepare_v8_fixed_probe_sets(self):
         if self.semantic_scaffold_enabled:
@@ -2318,6 +2318,10 @@ class SDTrainer(BaseSDTrainProcess):
     def end_of_training_loop(self):
         pass
 
+    def end_step_hook(self):
+        super().end_step_hook()
+        self._maybe_run_v8_fixed_validation()
+
     def predict_noise(
         self,
         noisy_latents: torch.Tensor,
@@ -2741,13 +2745,19 @@ class SDTrainer(BaseSDTrainProcess):
             tap_cfg.gain_temperature,
         ).mean()
         tap_prototype_losses = []
-        tap_relative_rms_values = []
+        tap_activation_relative_rms_values = []
         for batch_details in full_embeds.activator_details:
             for layer_index, layer_id in enumerate(config.semantic_channel.tap_layers):
                 residual = batch_details['tap_residuals'][layer_index].float().mean(dim=0)
                 semantic_reference = batch_details['pre_taps'][layer_index].detach().float().mean(dim=0)
-                prototype = state.tap_prototypes.get(str(layer_id))
-                if prototype is not None:
+                prototype_key = str(layer_id)
+                prototype = state.tap_prototypes.get(prototype_key)
+                if loss_module.prototype_consistency_ready(
+                    state.tap_observation_counts.get(prototype_key, 0),
+                    prototype,
+                    warmup_observations=tap_cfg.prototype_warmup_observations,
+                    minimum_prototype_norm=tap_cfg.minimum_prototype_norm,
+                ):
                     tap_prototype_losses.append(
                         1.0 - F.cosine_similarity(
                             residual.flatten()[None],
@@ -2756,16 +2766,19 @@ class SDTrainer(BaseSDTrainProcess):
                             eps=config.helper_loss.cosine_epsilon,
                         ).mean()
                     )
-                tap_relative_rms_values.append(loss_module.relative_residual_rms(
+                tap_activation_relative_rms_values.append(loss_module.relative_residual_rms(
                     residual,
                     semantic_reference,
                     epsilon=config.helper_loss.cosine_epsilon,
                 ))
         tap_zero = full_prediction.sum() * 0.0
         tap_prototype_loss = torch.stack(tap_prototype_losses).mean() if tap_prototype_losses else tap_zero
-        tap_relative_rms = torch.stack(tap_relative_rms_values).mean() if tap_relative_rms_values else zero
+        tap_activation_relative_rms = (
+            torch.stack(tap_activation_relative_rms_values).mean()
+            if tap_activation_relative_rms_values else zero
+        )
         tap_band_loss = loss_module.broad_band_penalty(
-            tap_relative_rms,
+            tap_activation_relative_rms,
             tap_cfg.relative_rms_low,
             tap_cfg.relative_rms_high,
         )
@@ -2799,7 +2812,8 @@ class SDTrainer(BaseSDTrainProcess):
             'a1/semantic_scaffold/semantic_prototype_loss': float(semantic_prototype_loss.detach().item()),
             'a1/semantic_scaffold/tap_gain_loss': float(tap_gain_loss.detach().item()),
             'a1/semantic_scaffold/tap_prototype_loss': float(tap_prototype_loss.detach().item()),
-            'a1/semantic_scaffold/tap_relative_rms': float(tap_relative_rms.detach().item()),
+            'a1/semantic_scaffold/tap_prototype_valid_layers': float(len(tap_prototype_losses)),
+            'a1/semantic_scaffold/tap_activation_relative_rms': float(tap_activation_relative_rms.detach().item()),
             'a1/semantic_scaffold/tap_band_loss': float(tap_band_loss.detach().item()),
             'a1/semantic_scaffold/tap_objective': float(tap_objective.detach().item()),
             'a1/semantic_scaffold/progress': progress,
@@ -4990,9 +5004,6 @@ class SDTrainer(BaseSDTrainProcess):
         else:
             # gradient accumulation. Just a place for breakpoint
             pass
-
-        if not self.is_grad_accumulation_step:
-            self._maybe_run_v8_fixed_validation()
 
         # TODO Should we only step scheduler on grad step? If so, need to recalculate last step
         with self.timer('scheduler_step'):

@@ -23,12 +23,16 @@ def _load_runtime_methods():
         'hook_add_extra_train_params', '_activator_mode', '_write_trigger_binding_metrics',
         '_phase_caption_source_weights', '_prompt_tap_batch', '_check_first_trigger_gradient', '_v8_masked_delta_metrics', '_v8_prompt_delta_norms',
         '_calculate_trigger_binding_loss', '_install_trigger_binding_prompt_encoder', 'encode_static_prompt',
-        '_sync_semantic_scaffold_tap_runtime',
+        '_sync_semantic_scaffold_tap_runtime', 'end_step_hook',
     }
     selected = [node for node in class_node.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names]
-    module = ast.Module(body=[ast.ClassDef(name='SDTrainerRuntimeHarness', bases=[], keywords=[], body=selected, decorator_list=[])], type_ignores=[])
+    module = ast.Module(body=[ast.ClassDef(name='SDTrainerRuntimeHarness', bases=[ast.Name(id='RuntimeBase', ctx=ast.Load())], keywords=[], body=selected, decorator_list=[])], type_ignores=[])
     ast.fix_missing_locations(module)
+    class RuntimeBase:
+        def end_step_hook(self):
+            pass
     namespace = {
+        'RuntimeBase': RuntimeBase,
         'contextlib': contextlib,
         'importlib': importlib,
         'inspect': inspect,
@@ -140,6 +144,16 @@ class ThreePhaseRuntimeTest(unittest.TestCase):
             phase_runtime=SimpleNamespace(caption_sources={}),
         )
         return trainer
+
+    def test_end_step_hook_runs_validation_after_completed_update_increment(self):
+        trainer = self._trainer('a1')
+        observed_steps = []
+        trainer.step_num = 8
+        trainer._maybe_run_v8_fixed_validation = lambda: observed_steps.append(trainer.step_num)
+
+        trainer.end_step_hook()
+
+        self.assertEqual(observed_steps, [8])
 
     def test_phase_whitelist_freezes_non_targets(self):
         trainer = self._trainer('a2')

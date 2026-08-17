@@ -728,6 +728,8 @@ class SemanticScaffoldTapSpecializationConfig:
         self.min_gain_delta = float(kwargs.get('min_gain_delta', 0.0))
         self.gain_temperature = float(kwargs.get('gain_temperature', 0.05))
         self.prototype_ema_decay = float(kwargs.get('prototype_ema_decay', 0.95))
+        self.prototype_warmup_observations = int(kwargs.get('prototype_warmup_observations', 3))
+        self.minimum_prototype_norm = float(kwargs.get('minimum_prototype_norm', 1.0e-6))
         self.consistency_weight = float(kwargs.get('consistency_weight', 1.0))
         self.relative_rms_low = float(kwargs.get('relative_rms_low', 0.0))
         self.relative_rms_high = float(kwargs.get('relative_rms_high', 1.0))
@@ -1227,6 +1229,8 @@ def validate_three_phase_trigger_training_config(
                 raise ValueError('semantic scaffold tap gain objective configuration is invalid')
             if tap.consistency_weight < 0 or tap.magnitude_band_weight < 0:
                 raise ValueError('semantic scaffold tap prototype/band weights must be non-negative')
+            if tap.prototype_warmup_observations < 0 or tap.minimum_prototype_norm < 0:
+                raise ValueError('semantic scaffold tap prototype warmup/norm thresholds must be non-negative')
             if tap.relative_rms_low < 0 or tap.relative_rms_high < tap.relative_rms_low:
                 raise ValueError('semantic scaffold tap relative RMS band is invalid')
             if tap.initially_disabled is not True:

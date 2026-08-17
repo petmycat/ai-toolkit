@@ -141,7 +141,8 @@ class TriggerValidationTest(unittest.TestCase):
             metrics['gain_full'] - metrics['gain_semantic_only'],
         )
         self.assertGreater(metrics['tap_prediction_delta'], 0.0)
-        self.assertGreater(metrics['tap_relative_rms'], 0.0)
+        self.assertGreater(metrics['tap_prediction_relative_rms'], 0.0)
+        self.assertNotIn('tap_relative_rms', metrics)
 
     def test_rng_isolation_restores_all_global_states(self):
         random.seed(101)
