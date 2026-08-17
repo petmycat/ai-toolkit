@@ -149,9 +149,12 @@ class Ideogram4V3ActivatorPipelineTest(unittest.TestCase):
             )
             self.assertEqual(a2["network"]["pretrained_lora_path"], process.v3_weights_path)
             self.assertEqual(a2["save"]["save_steps"], [19, 39, 59, 79])
+            validation = a2["three_phase_trigger_training"]["validation"]
+            self.assertEqual(validation["steps"], [0, 20, 40, 60, 80])
+            self.assertEqual(validation["caption_sources"], ["structured"])
             self.assertEqual(
-                a2["three_phase_trigger_training"]["validation"]["steps"],
-                [0, 20, 40, 60, 80],
+                validation["negative_phrases"],
+                ["photorealistic photograph", "technical drawing"],
             )
             process.v3_config = load_config({
                 **_block(process.v3_weights_path, process.v3_config.fixed_validation["data_split_manifest"]),

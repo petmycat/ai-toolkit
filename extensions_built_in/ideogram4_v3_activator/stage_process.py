@@ -118,6 +118,13 @@ class Ideogram4V3ActivatorStageProcess:
                 "seed": int(self.pipeline.v3_config.fixed_validation["seed"]),
                 "fixed_timesteps": list(self.pipeline.v3_config.fixed_validation["fixed_timesteps"]),
                 "data_split_manifest": self.pipeline.v3_config.fixed_validation["data_split_manifest"],
+                "caption_sources": ["structured"],
+                "negative_phrases": list(
+                    self.pipeline.v3_config.fixed_validation.get(
+                        "negative_phrases",
+                        ["photorealistic photograph", "technical drawing"],
+                    )
+                ),
                 "heldout_output_filename": self.stage.artifacts.validation_file,
             },
             "phase_a1": phase if is_a1 else {"enabled": False},
