@@ -23,6 +23,7 @@ def _load_runtime_methods():
         'hook_add_extra_train_params', '_activator_mode', '_write_trigger_binding_metrics',
         '_phase_caption_source_weights', '_prompt_tap_batch', '_check_first_trigger_gradient', '_v8_masked_delta_metrics', '_v8_prompt_delta_norms',
         '_calculate_trigger_binding_loss', '_install_trigger_binding_prompt_encoder', 'encode_static_prompt',
+        '_sync_semantic_scaffold_tap_runtime',
     }
     selected = [node for node in class_node.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names]
     module = ast.Module(body=[ast.ClassDef(name='SDTrainerRuntimeHarness', bases=[], keywords=[], body=selected, decorator_list=[])], type_ignores=[])
@@ -79,7 +80,8 @@ class _FakeActivator(torch.nn.Module):
         super().__init__()
         self.embedding = torch.nn.Linear(2, 2, bias=False)
         self.te_adapter = torch.nn.Linear(2, 2, bias=False)
-        self.tap_adapters = torch.nn.Linear(2, 2, bias=False)
+        self.tap_adapters = torch.nn.ModuleDict({'0': torch.nn.Linear(2, 2, bias=False)})
+        self.module_lora_adapters = torch.nn.ModuleDict()
         self.component_active = {}
 
     def set_component_mode(self, component, active=None, trainable=None):
@@ -156,6 +158,35 @@ class ThreePhaseRuntimeTest(unittest.TestCase):
         selected = {id(parameter) for group in filtered for parameter in group['params']}
         self.assertEqual(selected, {id(parameter) for parameter in trainer.network.parameters()})
         self.assertTrue(all(not parameter.requires_grad for parameter in trainer.text_activator.parameters()))
+
+    def test_semantic_scaffold_handoff_freezes_semantic_groups_without_forward_toggle(self):
+        trainer = self._trainer('a1')
+        trainer.semantic_scaffold_enabled = True
+        trainer._semantic_scaffold_state = SimpleNamespace(
+            curriculum=SimpleNamespace(unlock_step=2)
+        )
+        trainer._semantic_scaffold_tap_lr_ramp = 0.5
+        trainer.three_phase_trigger_training.phase_a1.learning_rates.update({
+            'te_adapter': 3e-3,
+        })
+        trainer._phase_config = lambda: trainer.three_phase_trigger_training.phase_a1
+        groups = trainer.text_activator.parameter_groups(
+            trainer.three_phase_trigger_training.phase_a1.learning_rates
+        )
+        for group in groups:
+            group['name'] = f"text_activator.{group['name']}"
+        trainer.params = groups
+        trainer.optimizer = None
+
+        trainer._sync_semantic_scaffold_tap_runtime()
+
+        self.assertTrue(all(not parameter.requires_grad for parameter in trainer.text_activator.embedding.parameters()))
+        self.assertTrue(all(not parameter.requires_grad for parameter in trainer.text_activator.te_adapter.parameters()))
+        self.assertTrue(all(parameter.requires_grad for parameter in trainer.text_activator.tap_adapters.parameters()))
+        lrs = {group['name']: group['lr'] for group in groups}
+        self.assertEqual(lrs['text_activator.embedding'], 0.0)
+        self.assertEqual(lrs['text_activator.te_adapter'], 0.0)
+        self.assertEqual(lrs['text_activator.tap_adapters'], 1e-3)
 
     def test_static_prompt_bypasses_required_trigger_binding(self):
         trainer = self._trainer('a1')

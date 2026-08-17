@@ -39,42 +39,55 @@ class TapCurriculumState:
     ramp_progress: float = 0.0
     failure: bool = False
     failure_reason: Optional[str] = None
+    forced_handoff: bool = False
+    handoff_reason: Optional[str] = None
+    unmet_conditions: tuple[str, ...] = ()
 
-    def observe_gate(
+    def observe_maturity(
         self,
         *,
         step: int,
-        progress: float,
-        semantic_cosine: float,
-        relative_rms: float,
+        semantic_gain: float,
+        helper_cosine: float,
+        prototype_loss: float,
+        gain_drift: float,
+        minimum_observations: int,
         min_step: int,
-        min_progress: float,
-        min_semantic_cosine: float,
-        min_relative_rms: float,
+        min_semantic_gain: float,
+        min_helper_cosine: float,
+        max_helper_cosine: float,
+        max_prototype_loss: float,
+        max_gain_drift: float,
+        required_observations: int,
         patience: int,
         max_wait_step: int,
     ) -> str:
-        if self.failure:
-            return 'failed'
         if self.unlock_step is not None:
             return 'unlocked'
-        passed = (
-            step >= min_step
-            and progress >= min_progress
-            and semantic_cosine >= min_semantic_cosine
-            and relative_rms >= min_relative_rms
-        )
-        self.evidence_streak = self.evidence_streak + 1 if passed else 0
+        conditions = {
+            'min_step': step >= min_step,
+            'semantic_gain': semantic_gain >= min_semantic_gain,
+            'helper_cosine_low': helper_cosine >= min_helper_cosine,
+            'helper_cosine_high': helper_cosine <= max_helper_cosine,
+            'prototype_loss': prototype_loss <= max_prototype_loss,
+            'gain_drift': gain_drift <= max_gain_drift,
+            'prototype_observations': minimum_observations >= required_observations,
+        }
+        self.unmet_conditions = tuple(name for name, passed in conditions.items() if not passed)
+        self.evidence_streak = self.evidence_streak + 1 if not self.unmet_conditions else 0
         if self.evidence_streak >= patience:
-            self.stage = 'a1.1'
-            self.unlock_step = int(step)
+            self.stage = 'handoff_pending'
+            self.unlock_step = int(step) + 1
             self.ramp_progress = 0.0
-            return 'unlocked'
+            self.handoff_reason = 'semantic_maturity_gate_passed'
+            return 'handoff_pending'
         if step >= max_wait_step:
-            self.stage = 'failed'
-            self.failure = True
-            self.failure_reason = 'semantic_tap_unlock_gate_not_met'
-            return 'failed'
+            self.stage = 'handoff_pending'
+            self.unlock_step = int(step) + 1
+            self.ramp_progress = 0.0
+            self.forced_handoff = True
+            self.handoff_reason = 'semantic_maturity_max_wait_reached'
+            return 'forced_handoff_pending'
         return 'waiting'
 
     def advance_ramp(self, *, step: int, ramp_steps: int) -> float:
@@ -98,6 +111,9 @@ class SemanticScaffoldState:
     semantic_observation_counts: Dict[str, int] = field(default_factory=dict)
     tap_observation_counts: Dict[str, int] = field(default_factory=dict)
     gain_ema: Optional[float] = None
+    semantic_helper_cosine_ema: Optional[float] = None
+    semantic_prototype_loss_ema: Optional[float] = None
+    semantic_gain_drift_ema: Optional[float] = None
     helper_gain_ema: Dict[str, float] = field(default_factory=dict)
     helper_latch: HelperLatchState = field(default_factory=HelperLatchState)
     curriculum: TapCurriculumState = field(default_factory=TapCurriculumState)
@@ -145,6 +161,9 @@ class SemanticScaffoldState:
             'semantic_observation_counts': dict(self.semantic_observation_counts),
             'tap_observation_counts': dict(self.tap_observation_counts),
             'gain_ema': self.gain_ema,
+            'semantic_helper_cosine_ema': self.semantic_helper_cosine_ema,
+            'semantic_prototype_loss_ema': self.semantic_prototype_loss_ema,
+            'semantic_gain_drift_ema': self.semantic_gain_drift_ema,
             'helper_gain_ema': dict(self.helper_gain_ema),
             'helper_latch': asdict(self.helper_latch),
             'curriculum': asdict(self.curriculum),
@@ -164,6 +183,9 @@ class SemanticScaffoldState:
         result.semantic_observation_counts.update({str(k): int(v) for k, v in dict(state.get('semantic_observation_counts', {})).items()})
         result.tap_observation_counts.update({str(k): int(v) for k, v in dict(state.get('tap_observation_counts', {})).items()})
         result.gain_ema = state.get('gain_ema')
+        result.semantic_helper_cosine_ema = state.get('semantic_helper_cosine_ema')
+        result.semantic_prototype_loss_ema = state.get('semantic_prototype_loss_ema')
+        result.semantic_gain_drift_ema = state.get('semantic_gain_drift_ema')
         result.helper_gain_ema = {str(k): float(v) for k, v in dict(state.get('helper_gain_ema', {})).items()}
         result.helper_latch = HelperLatchState(**dict(state.get('helper_latch', {})))
         result.curriculum = TapCurriculumState(**dict(state.get('curriculum', {})))

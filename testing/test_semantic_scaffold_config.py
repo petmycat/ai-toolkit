@@ -58,8 +58,17 @@ class SemanticScaffoldConfigTest(unittest.TestCase):
         }
         objective['tap_specialization'] = {
             'initially_disabled': True,
-            'schedule_mode': 'fixed',
+            'schedule_mode': 'adaptive',
             'fixed_unlock_step': 2,
+            'unlock_min_step': 1,
+            'min_semantic_gain': 0.0,
+            'min_helper_cosine': 0.1,
+            'max_helper_cosine': 0.9,
+            'max_semantic_prototype_loss': 0.25,
+            'max_semantic_gain_drift': 0.05,
+            'min_semantic_observations': 1,
+            'maturity_ema_decay': 0.9,
+            'max_wait_step': 4,
             'lr_ramp_steps': 2,
             'gain_weight': 1.0,
             'min_gain_delta': 0.0,

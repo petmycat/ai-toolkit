@@ -711,6 +711,13 @@ class SemanticScaffoldTapSpecializationConfig:
         self.schedule_mode = str(kwargs.get('schedule_mode', 'fixed'))
         self.fixed_unlock_step = int(kwargs.get('fixed_unlock_step', 1))
         self.unlock_min_step = int(kwargs.get('unlock_min_step', 25))
+        self.min_semantic_gain = float(kwargs.get('min_semantic_gain', 0.0))
+        self.min_helper_cosine = float(kwargs.get('min_helper_cosine', 0.0))
+        self.max_helper_cosine = float(kwargs.get('max_helper_cosine', 0.995))
+        self.max_semantic_prototype_loss = float(kwargs.get('max_semantic_prototype_loss', 0.25))
+        self.max_semantic_gain_drift = float(kwargs.get('max_semantic_gain_drift', 0.05))
+        self.min_semantic_observations = int(kwargs.get('min_semantic_observations', 3))
+        self.maturity_ema_decay = float(kwargs.get('maturity_ema_decay', 0.9))
         self.unlock_min_progress = float(kwargs.get('unlock_min_progress', 0.0))
         self.unlock_min_semantic_cosine = float(kwargs.get('unlock_min_semantic_cosine', 0.0))
         self.unlock_min_relative_rms = float(kwargs.get('unlock_min_relative_rms', 0.0))
@@ -1210,6 +1217,12 @@ def validate_three_phase_trigger_training_config(
                 raise ValueError('semantic scaffold tap unlock min/max steps are invalid')
             if tap.gate_patience <= 0 or tap.lr_ramp_steps < 0:
                 raise ValueError('semantic scaffold tap gate patience/ramp steps are invalid')
+            if tap.min_semantic_observations <= 0 or not 0.0 <= tap.maturity_ema_decay < 1.0:
+                raise ValueError('semantic scaffold maturity observation/EMA configuration is invalid')
+            if not -1.0 <= tap.min_helper_cosine <= tap.max_helper_cosine <= 1.0:
+                raise ValueError('semantic scaffold helper cosine maturity band is invalid')
+            if tap.max_semantic_prototype_loss < 0 or tap.max_semantic_gain_drift < 0:
+                raise ValueError('semantic scaffold maturity stability thresholds must be non-negative')
             if tap.gain_weight < 0 or tap.gain_temperature <= 0:
                 raise ValueError('semantic scaffold tap gain objective configuration is invalid')
             if tap.consistency_weight < 0 or tap.magnitude_band_weight < 0:

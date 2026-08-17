@@ -30,20 +30,37 @@ class SemanticScaffoldStateTest(unittest.TestCase):
         self.assertTrue(latch.latched)
         self.assertFalse(latch.advance(-1.0, margin=0.2, patience=2, step=4))
 
-    def test_tap_gate_and_ramp(self):
+    def test_tap_maturity_gate_handoffs_on_next_step(self):
         curriculum = TapCurriculumState()
-        self.assertEqual(curriculum.observe_gate(
-            step=25, progress=0.5, semantic_cosine=0.8, relative_rms=0.5,
-            min_step=25, min_progress=0.2, min_semantic_cosine=0.5,
-            min_relative_rms=0.2, patience=2, max_wait_step=50,
-        ), 'waiting')
-        self.assertEqual(curriculum.observe_gate(
-            step=26, progress=0.5, semantic_cosine=0.8, relative_rms=0.5,
-            min_step=25, min_progress=0.2, min_semantic_cosine=0.5,
-            min_relative_rms=0.2, patience=2, max_wait_step=50,
-        ), 'unlocked')
-        self.assertEqual(curriculum.advance_ramp(step=31, ramp_steps=10), 0.5)
-        self.assertEqual(curriculum.advance_ramp(step=36, ramp_steps=10), 1.0)
+        inputs = dict(
+            semantic_gain=0.2, helper_cosine=0.6, prototype_loss=0.05,
+            gain_drift=0.01, minimum_observations=10, min_step=25,
+            min_semantic_gain=0.1, min_helper_cosine=0.2, max_helper_cosine=0.9,
+            max_prototype_loss=0.1, max_gain_drift=0.02,
+            required_observations=5, patience=2, max_wait_step=50,
+        )
+        self.assertEqual(curriculum.observe_maturity(step=25, **inputs), 'waiting')
+        self.assertEqual(curriculum.observe_maturity(step=26, **inputs), 'handoff_pending')
+        self.assertEqual(curriculum.unlock_step, 27)
+        self.assertFalse(curriculum.forced_handoff)
+        self.assertEqual(curriculum.advance_ramp(step=32, ramp_steps=10), 0.5)
+        self.assertEqual(curriculum.advance_ramp(step=37, ramp_steps=10), 1.0)
+
+    def test_max_wait_forces_handoff_without_failure(self):
+        curriculum = TapCurriculumState()
+        result = curriculum.observe_maturity(
+            step=10, semantic_gain=-1.0, helper_cosine=1.0,
+            prototype_loss=2.0, gain_drift=1.0, minimum_observations=1,
+            min_step=5, min_semantic_gain=0.1, min_helper_cosine=0.2,
+            max_helper_cosine=0.9, max_prototype_loss=0.1,
+            max_gain_drift=0.02, required_observations=5,
+            patience=2, max_wait_step=10,
+        )
+        self.assertEqual(result, 'forced_handoff_pending')
+        self.assertEqual(curriculum.unlock_step, 11)
+        self.assertTrue(curriculum.forced_handoff)
+        self.assertFalse(curriculum.failure)
+        self.assertIn('semantic_gain', curriculum.unmet_conditions)
 
     def test_empty_state_round_trip(self):
         state = SemanticScaffoldState((0, 3))

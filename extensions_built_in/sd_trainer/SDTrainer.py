@@ -2559,7 +2559,12 @@ class SDTrainer(BaseSDTrainProcess):
         if tap_cfg.schedule_mode == 'fixed' and int(self.step_num) >= tap_cfg.fixed_unlock_step:
             if state.curriculum.unlock_step is None:
                 state.curriculum.unlock_step = tap_cfg.fixed_unlock_step
-                state.curriculum.stage = 'a1.1'
+                state.curriculum.handoff_reason = 'fixed_schedule'
+        if (
+            state.curriculum.unlock_step is not None
+            and int(self.step_num) >= state.curriculum.unlock_step
+        ):
+            state.curriculum.stage = 'a1.1'
             self._semantic_scaffold_tap_lr_ramp = state.curriculum.advance_ramp(
                 step=int(self.step_num),
                 ramp_steps=tap_cfg.lr_ramp_steps,
@@ -2630,18 +2635,7 @@ class SDTrainer(BaseSDTrainProcess):
         bypass_prediction, bypass_embeds = predict(prompts, 'activator_bypass', detach=True)
         semantic_prediction, semantic_embeds = predict(prompts, 'semantic_only', details=True)
 
-        semantic_parameters = [
-            parameter
-            for name, parameter in self.text_activator.named_parameters()
-            if 'tap_adapters' not in name and parameter.requires_grad
-        ]
-        for parameter in semantic_parameters:
-            parameter.requires_grad_(False)
-        try:
-            full_prediction, full_embeds = predict(prompts, 'full', details=True)
-        finally:
-            for parameter in semantic_parameters:
-                parameter.requires_grad_(True)
+        full_prediction, full_embeds = predict(prompts, 'full', details=True)
 
         neutral_mse = loss_module.per_item_diffusion_mse(neutral_prediction, target)
         semantic_mse = loss_module.per_item_diffusion_mse(semantic_prediction, target)
@@ -2811,6 +2805,12 @@ class SDTrainer(BaseSDTrainProcess):
             'a1/semantic_scaffold/progress': progress,
             'a1/semantic_scaffold/tap_gate_stage': state.curriculum.stage,
             'a1/semantic_scaffold/tap_lr_ramp': self._semantic_scaffold_tap_lr_ramp,
+            'a1/semantic_scaffold/semantic_gain_ema': float(state.gain_ema or 0.0),
+            'a1/semantic_scaffold/semantic_helper_cosine_ema': float(state.semantic_helper_cosine_ema or 0.0),
+            'a1/semantic_scaffold/semantic_prototype_loss_ema': float(state.semantic_prototype_loss_ema or 0.0),
+            'a1/semantic_scaffold/semantic_gain_drift_ema': float(state.semantic_gain_drift_ema or 0.0),
+            'a1/semantic_scaffold/semantic_min_observations': float(min(state.semantic_observation_counts.values())),
+            'a1/semantic_scaffold/forced_handoff': float(state.curriculum.forced_handoff),
         }
         self._trigger_binding_last_metrics = metrics
         self.additional_logs['runtime_phase'] = self.runtime_phase
@@ -2822,8 +2822,25 @@ class SDTrainer(BaseSDTrainProcess):
                 self.additional_logs[log_key] = value
         self._semantic_scaffold_last_embeddings = (semantic_embeds, full_embeds)
         gain_value = float(semantic_gain.detach().mean().item())
+        previous_gain_ema = state.gain_ema
         decay = config.helper_decay.gain_ema_decay
         state.gain_ema = gain_value if state.gain_ema is None else decay * state.gain_ema + (1.0 - decay) * gain_value
+        maturity_decay = tap_cfg.maturity_ema_decay
+        helper_cosine_value = float(helper_result.cosine_per_item.detach().mean().item())
+        prototype_loss_value = float(semantic_prototype_loss.detach().item())
+        gain_drift_value = 0.0 if previous_gain_ema is None else abs(gain_value - previous_gain_ema)
+        state.semantic_helper_cosine_ema = (
+            helper_cosine_value if state.semantic_helper_cosine_ema is None
+            else maturity_decay * state.semantic_helper_cosine_ema + (1.0 - maturity_decay) * helper_cosine_value
+        )
+        state.semantic_prototype_loss_ema = (
+            prototype_loss_value if state.semantic_prototype_loss_ema is None
+            else maturity_decay * state.semantic_prototype_loss_ema + (1.0 - maturity_decay) * prototype_loss_value
+        )
+        state.semantic_gain_drift_ema = (
+            gain_drift_value if state.semantic_gain_drift_ema is None
+            else maturity_decay * state.semantic_gain_drift_ema + (1.0 - maturity_decay) * gain_drift_value
+        )
         helper_gain_value = float(loss_module.normalized_gain_vs_neutral(
             loss_module.per_item_diffusion_mse(helper_prediction, target), neutral_mse
         ).detach().mean().item())
@@ -2858,24 +2875,44 @@ class SDTrainer(BaseSDTrainProcess):
                     )
         state.last_update_step = int(self.step_num)
         gate = state.curriculum
-        if tap_cfg.schedule_mode == 'adaptive':
-            gate.observe_gate(
+        if tap_cfg.schedule_mode == 'adaptive' and gate.unlock_step is None:
+            gate_result = gate.observe_maturity(
                 step=int(self.step_num),
-                progress=progress,
-                semantic_cosine=float(semantic_consistency.cosine_per_item.detach().mean().item()),
-                relative_rms=float(torch.linalg.vector_norm(semantic_effect.detach()).item()),
+                semantic_gain=float(state.gain_ema),
+                helper_cosine=float(state.semantic_helper_cosine_ema),
+                prototype_loss=float(state.semantic_prototype_loss_ema),
+                gain_drift=float(state.semantic_gain_drift_ema),
+                minimum_observations=min(state.semantic_observation_counts.values()),
                 min_step=tap_cfg.unlock_min_step,
-                min_progress=tap_cfg.unlock_min_progress,
-                min_semantic_cosine=tap_cfg.unlock_min_semantic_cosine,
-                min_relative_rms=tap_cfg.unlock_min_relative_rms,
+                min_semantic_gain=tap_cfg.min_semantic_gain,
+                min_helper_cosine=tap_cfg.min_helper_cosine,
+                max_helper_cosine=tap_cfg.max_helper_cosine,
+                max_prototype_loss=tap_cfg.max_semantic_prototype_loss,
+                max_gain_drift=tap_cfg.max_semantic_gain_drift,
+                required_observations=tap_cfg.min_semantic_observations,
                 patience=tap_cfg.gate_patience,
                 max_wait_step=tap_cfg.max_wait_step,
             )
-            self._semantic_scaffold_tap_lr_ramp = gate.advance_ramp(
-                step=int(self.step_num),
-                ramp_steps=tap_cfg.lr_ramp_steps,
-            )
-            self._sync_semantic_scaffold_tap_runtime()
+            if gate_result == 'forced_handoff_pending':
+                print(
+                    '  - WARNING: semantic maturity gate reached max_wait_step; '
+                    f'forcing tap handoff at step {gate.unlock_step}. '
+                    f'Unmet conditions: {list(gate.unmet_conditions)}',
+                    flush=True,
+                )
+        maturity_metrics = {
+            'a1/semantic_scaffold/tap_gate_stage': gate.stage,
+            'a1/semantic_scaffold/semantic_gain_ema': float(state.gain_ema or 0.0),
+            'a1/semantic_scaffold/semantic_helper_cosine_ema': float(state.semantic_helper_cosine_ema or 0.0),
+            'a1/semantic_scaffold/semantic_prototype_loss_ema': float(state.semantic_prototype_loss_ema or 0.0),
+            'a1/semantic_scaffold/semantic_gain_drift_ema': float(state.semantic_gain_drift_ema or 0.0),
+            'a1/semantic_scaffold/semantic_min_observations': float(min(state.semantic_observation_counts.values())),
+            'a1/semantic_scaffold/forced_handoff': float(gate.forced_handoff),
+        }
+        metrics.update(maturity_metrics)
+        self._trigger_binding_last_metrics.update(maturity_metrics)
+        for key, value in maturity_metrics.items():
+            self.additional_logs[f'phase/{self.runtime_phase}/{key}'] = float(value) if isinstance(value, (int, float)) else value
         if gate.unlock_step is not None and int(self.step_num) > gate.unlock_step + 1 and self._semantic_scaffold_tap_lr_ramp > 0.0:
             tap_up_delta = 0.0
             for name, parameter in self.text_activator.named_parameters():
@@ -3805,23 +3842,46 @@ class SDTrainer(BaseSDTrainProcess):
             return
         unlocked = self._semantic_scaffold_state.curriculum.unlock_step is not None
         self.text_activator.set_component_mode('tap_adapters', active=unlocked, trainable=unlocked)
+        if unlocked:
+            self.text_activator.set_component_mode('embedding', active=True, trainable=False)
+            self.text_activator.set_component_mode('te_adapter', active=True, trainable=False)
         ramp = float(self._semantic_scaffold_tap_lr_ramp)
         optimizer_groups = getattr(getattr(self, 'optimizer', None), 'param_groups', None)
         groups_to_update = optimizer_groups if optimizer_groups is not None else getattr(self, 'params', [])
-        tap_parameter_ids = {id(parameter) for parameter in self.text_activator.tap_adapters.parameters()}
-        configured_lr = float(self._phase_config().learning_rates.get('tap_adapters', 0.0))
+        component_parameter_ids = {
+            'embedding': {id(parameter) for parameter in self.text_activator.embedding.parameters()},
+            'te_adapter': {
+                id(parameter)
+                for module in (
+                    self.text_activator.te_adapter,
+                    self.text_activator.module_lora_adapters,
+                )
+                if module is not None
+                for parameter in module.parameters()
+            },
+            'tap_adapters': {id(parameter) for parameter in self.text_activator.tap_adapters.parameters()},
+        }
+        configured_lrs = self._phase_config().learning_rates
         for group in groups_to_update or []:
             if not isinstance(group, dict):
                 continue
             group_parameter_ids = {id(parameter) for parameter in group.get('params', [])}
-            is_tap_group = (
-                group.get('name') == 'text_activator.tap_adapters'
-                or bool(tap_parameter_ids.intersection(group_parameter_ids))
-            )
-            if is_tap_group:
-                base_lr = float(group.get('_semantic_scaffold_base_lr', configured_lr))
-                group['_semantic_scaffold_base_lr'] = base_lr
+            component = next((
+                name for name, parameter_ids in component_parameter_ids.items()
+                if group.get('name') == f'text_activator.{name}'
+                or bool(parameter_ids.intersection(group_parameter_ids))
+            ), None)
+            if component is None:
+                continue
+            base_lr = float(group.get(
+                '_semantic_scaffold_base_lr',
+                configured_lrs.get(component, 0.0),
+            ))
+            group['_semantic_scaffold_base_lr'] = base_lr
+            if component == 'tap_adapters':
                 group['lr'] = base_lr * ramp
+            elif unlocked:
+                group['lr'] = 0.0
 
     def _v8_validation_config(self):
         if not self.three_phase_enabled:
