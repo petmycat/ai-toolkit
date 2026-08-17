@@ -125,14 +125,39 @@ def validate_config(config: Ideogram4V3ActivatorConfig) -> None:
     missing = required_validation - set(config.fixed_validation)
     if missing:
         raise ValueError("fixed_validation is missing required fields: " + ", ".join(sorted(missing)))
+    if not config.fixed_validation.get("fixed_timesteps"):
+        raise ValueError("fixed_validation.fixed_timesteps must be non-empty")
+    if any(
+        int(timestep) < 0 or int(timestep) > 1000
+        for timestep in config.fixed_validation["fixed_timesteps"]
+    ):
+        raise ValueError("fixed_validation.fixed_timesteps must lie in [0, 1000]")
+    if not str(config.fixed_validation.get("data_split_manifest", "")).strip():
+        raise ValueError("fixed_validation.data_split_manifest must be a non-empty path")
     if not config.helper_schedule:
         raise ValueError("helper_schedule must be explicitly fixed")
+    helpers = [str(value).strip() for value in config.helper_schedule.get("helpers", [])]
+    helper_weights = config.helper_schedule.get("weights", [])
+    if not helpers or any(not helper for helper in helpers):
+        raise ValueError("helper_schedule.helpers must contain non-empty helper phrases")
+    if len(helper_weights) != len(helpers):
+        raise ValueError("helper_schedule.weights must match helper_schedule.helpers")
+    if any(float(weight) < 0 for weight in helper_weights) or sum(float(weight) for weight in helper_weights) <= 0:
+        raise ValueError("helper_schedule.weights must be non-negative and sum to a positive value")
     if not config.dataset_schedule:
         raise ValueError("dataset_schedule must be explicitly fixed")
     sources = config.dataset_schedule.get("sources", [])
     source_names = [str(source.get("name", "")).lower() for source in sources]
     if len(source_names) != 1 or source_names[0] not in {"structured", "json"}:
         raise ValueError("A1 dataset_schedule must contain exactly one structured/json caption source")
+    source_format = str(sources[0].get("format", "text")).lower()
+    if source_format not in {"text", "json"}:
+        raise ValueError("A1 structured caption source format must be text or json")
+    if source_format == "json" and not str(sources[0].get("caption_field", "")).strip():
+        raise ValueError(
+            "A1 JSON-object captions require dataset_schedule.sources[0].caption_field; "
+            "use format: text when .json sidecars contain raw caption text"
+        )
     if config.terminal_manual_ablation.get("mode") not in {"manual", "external"}:
         raise ValueError("terminal_manual_ablation.mode must declare manual or external")
     if config.terminal_manual_ablation.get("automatic", False):

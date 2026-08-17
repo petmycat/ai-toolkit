@@ -29,7 +29,7 @@ def _block(v3_weights, split_manifest):
         "helper_schedule": {"mode": "fixed", "helpers": ["illustration"], "weights": [1.0]},
         "dataset_schedule": {
             "enabled": True,
-            "sources": [{"name": "structured", "use_main_dataset": True, "caption_ext": ".json", "format": "json"}],
+            "sources": [{"name": "structured", "use_main_dataset": True, "caption_ext": ".json", "format": "text"}],
             "schedule": {"keyframes": [{"step": 0, "structured": 1.0}, {"step": 80, "structured": 1.0}]},
         },
         "fixed_validation": {"seed": 42, "fixed_timesteps": [250, 500], "data_split_manifest": split_manifest},
@@ -78,6 +78,25 @@ class Ideogram4V3ActivatorConfigTest(unittest.TestCase):
         raw = _block("v3.safetensors", "split.json")
         raw["dataset_schedule"]["sources"].append({"name": "natural"})
         with self.assertRaisesRegex(ValueError, "structured/json"):
+            load_config(raw)
+
+    def test_json_object_caption_source_requires_explicit_field(self):
+        raw = _block("v3.safetensors", "split.json")
+        raw["dataset_schedule"]["sources"][0]["format"] = "json"
+        with self.assertRaisesRegex(ValueError, "caption_field"):
+            load_config(raw)
+        raw["dataset_schedule"]["sources"][0]["caption_field"] = "text"
+        config = load_config(raw)
+        self.assertEqual(config.dataset_schedule["sources"][0]["caption_field"], "text")
+
+    def test_rejects_empty_helper_bank_and_probe_timestep_list(self):
+        raw = _block("v3.safetensors", "split.json")
+        raw["helper_schedule"] = {"helpers": [], "weights": []}
+        with self.assertRaisesRegex(ValueError, "helper_schedule.helpers"):
+            load_config(raw)
+        raw = _block("v3.safetensors", "split.json")
+        raw["fixed_validation"]["fixed_timesteps"] = []
+        with self.assertRaisesRegex(ValueError, "fixed_timesteps"):
             load_config(raw)
 
 class Ideogram4V3ActivatorPipelineTest(unittest.TestCase):
@@ -180,6 +199,21 @@ class Ideogram4V3ActivatorPipelineTest(unittest.TestCase):
                 os.path.join("phase_a1", "literal_initialization.safetensors")
             ))
 
+    def test_stage_retry_clears_incomplete_generic_resume_state(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            process = self._process(temp_dir)
+            stage = process.stages["te_calibration"]
+            stale_root = os.path.join(process.run_root, "te_calibration")
+            os.makedirs(stale_root, exist_ok=True)
+            Path(os.path.join(stale_root, "optimizer.pt")).write_bytes(b"stale")
+            stale_phase_root = os.path.join(process.run_root, "phase_a2")
+            os.makedirs(stale_phase_root, exist_ok=True)
+            Path(os.path.join(stale_phase_root, "heldout_validation.jsonl")).write_text("stale\n", encoding="utf-8")
+            with unittest.mock.patch("subprocess.run", return_value=SimpleNamespace(returncode=0)):
+                self.assertEqual(stage.execute(), 0)
+            self.assertFalse(os.path.exists(os.path.join(stale_root, "optimizer.pt")))
+            self.assertFalse(os.path.exists(os.path.join(stale_phase_root, "heldout_validation.jsonl")))
+
     def test_stage_snapshots_contracts_and_best_artifacts_do_not_overwrite(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             process = self._process(temp_dir)
@@ -191,6 +225,7 @@ class Ideogram4V3ActivatorPipelineTest(unittest.TestCase):
             contract = json.loads(Path(process.stages["semantic_activator"].contract_path).read_text(encoding="utf-8"))
             self.assertEqual(contract["automatic_order"], ["semantic_activator", "te_calibration", "STOP"])
             self.assertEqual(contract["training"]["taps"], "disabled")
+            self.assertTrue(all("sha256" in value for value in contract["artifacts"].values()))
 
             artifacts = process._artifact_records("te_calibration")
             os.makedirs(os.path.dirname(artifacts["embedding"]), exist_ok=True)
@@ -199,14 +234,18 @@ class Ideogram4V3ActivatorPipelineTest(unittest.TestCase):
             os.makedirs(os.path.dirname(artifacts["metrics"]), exist_ok=True)
             Path(artifacts["metrics"]).write_text("{}\n", encoding="utf-8")
             Path(artifacts["heldout_validation"]).write_text(
-                json.dumps({"step": 0, "heldout_loss": 0.01}) + "\n"
-                + json.dumps({"step": 80, "heldout_loss": 0.25}) + "\n",
+                json.dumps({"step": 0, "probe_split": "heldout", "probe_case_id": "p1", "heldout_loss": 0.01}) + "\n"
+                + json.dumps({"step": 20, "probe_split": "heldout", "probe_case_id": "p1", "heldout_loss": 0.1}) + "\n"
+                + json.dumps({"step": 20, "probe_split": "heldout", "probe_case_id": "p2", "heldout_loss": 0.9}) + "\n"
+                + json.dumps({"step": 80, "probe_split": "heldout", "probe_case_id": "p1", "heldout_loss": 0.2}) + "\n"
+                + json.dumps({"step": 80, "probe_split": "heldout", "probe_case_id": "p2", "heldout_loss": 0.3}) + "\n",
                 encoding="utf-8",
             )
             process._select_best_a2()
             best_manifest = json.loads(Path(artifacts["best_manifest"]).read_text(encoding="utf-8"))
             self.assertEqual(best_manifest["step"], 80)
             self.assertEqual(best_manifest["heldout_loss"], 0.25)
+            self.assertEqual(best_manifest["probe_count"], 2)
             self.assertEqual(Path(artifacts["best_embedding"]).read_bytes(), b"final-embedding")
             self.assertNotEqual(artifacts["best_embedding"], process.a1_artifact_paths()["embedding"])
 

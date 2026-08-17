@@ -562,6 +562,22 @@ class SDTrainer(BaseSDTrainProcess):
         language_model = getattr(getattr(self.sd, 'text_encoder', None), 'language_model', None)
         if callable(module_lora_installer) and language_model is not None:
             module_lora_installer(language_model)
+        if self.ideogram4_v3_activator_enabled:
+            te_artifact_module = getattr(self.text_activator, 'te_adapter_artifact_module', None)
+            te_artifact_module = (
+                te_artifact_module() if callable(te_artifact_module)
+                else getattr(self.text_activator, 'te_adapter', None)
+            )
+            trainable_te_parameters = [
+                parameter
+                for parameter in te_artifact_module.parameters()
+                if parameter.requires_grad
+            ] if te_artifact_module is not None else []
+            if not trainable_te_parameters:
+                raise RuntimeError(
+                    'Ideogram4 V3 activator installed no trainable TE adapter parameters; '
+                    'verify Qwen target modules and quantized linear compatibility'
+                )
         self._load_activator_source(modules)
         installer = getattr(self.sd, 'install_text_activator', None) or getattr(self.sd, 'set_text_activator', None)
         if not callable(installer):
@@ -1337,8 +1353,34 @@ class SDTrainer(BaseSDTrainProcess):
                 if not os.path.isfile(caption_path):
                     continue
                 with open(caption_path, 'r', encoding='utf-8') as handle:
-                    loaded = handle.read() if extension == '.txt' else __import__('json').load(handle)
-                caption = loaded if isinstance(loaded, str) else str(loaded.get('text', loaded.get('caption', '')))
+                    raw_caption = handle.read()
+                loaded = raw_caption
+                if extension == '.json':
+                    try:
+                        loaded = json.loads(raw_caption)
+                    except (ValueError, TypeError):
+                        loaded = raw_caption
+                if isinstance(loaded, str):
+                    caption = loaded
+                elif isinstance(loaded, dict):
+                    objective = self._phase_runtime_objective()
+                    sources = objective.get('dataset_schedule', {}).get('sources', [])
+                    caption_field = next(
+                        (
+                            str(source.get('caption_field'))
+                            for source in sources
+                            if str(source.get('format', 'text')).lower() == 'json'
+                            and str(source.get('caption_field', '')).strip()
+                        ),
+                        None,
+                    )
+                    fields = [field for field in (caption_field, 'text', 'caption') if field]
+                    field = next((field for field in fields if field in loaded), None)
+                    if field is None:
+                        raise RuntimeError(f'fixed probe JSON caption has none of fields {fields}: {caption_path}')
+                    caption = str(loaded[field])
+                else:
+                    caption = raw_caption
                 break
             items.append({'dataset_relative_item_id': item_id, 'image_path': image_path, 'caption': caption})
         self._trigger_binding_probe_sets = build_fixed_probe_sets(
@@ -2658,7 +2700,11 @@ class SDTrainer(BaseSDTrainProcess):
             # learned embedding starts from its frozen initializer. At step 0,
             # v8 active/bypass outputs may therefore be exactly equal even
             # though real, finite gradients already reach every component.
-            require_output_difference=(self.runtime_phase != 'b' and not zero_initialized_v8),
+            require_output_difference=(
+                self.runtime_phase != 'b'
+                and not zero_initialized_v8
+                and objective_mode != 'ideogram4_v3_activator'
+            ),
             raise_on_error=True,
         )
         self._trigger_gradient_reachability_checked = True
@@ -2792,6 +2838,8 @@ class SDTrainer(BaseSDTrainProcess):
                 'v3/a1/disturbance_beta': float(disturbance_beta.detach().mean().item()),
                 'v3/a1/disturbance_loss': float(disturbance.detach().item()),
             }
+        if total.requires_grad:
+            self._check_first_trigger_gradient(total, semantic_prediction, semantic_prediction.detach())
         self._trigger_binding_last_metrics = metrics
         for key, value in metrics.items():
             self.additional_logs[f'phase/{self.runtime_phase}/{key}'] = value
@@ -4268,6 +4316,12 @@ class SDTrainer(BaseSDTrainProcess):
             if self.network is not None:
                 self.network.is_active = network_was_active
 
+        if self.runtime_phase == 'a2':
+            v3_effect = (prediction_c.detach().float() - prediction_a.detach().float()).abs().max()
+            if not torch.isfinite(v3_effect) or float(v3_effect.cpu().item()) <= 0.0:
+                raise RuntimeError(
+                    'frozen V3 LoRA produced no measurable enabled/disabled prediction difference'
+                )
         target = prepared['target']
         mse_a = self._v3_probe_target_mse(prediction_a, target)
         mse_b = self._v3_probe_target_mse(prediction_b, target)
@@ -5380,9 +5434,8 @@ class SDTrainer(BaseSDTrainProcess):
             self.three_phase_trigger_training.run_root or self.save_root,
             f'phase_{self.runtime_phase}',
         )
-        final_step = max(int(self._phase_config().steps) - 1, 0)
         completed_step = int(self.step_num) + 1 if self.ideogram4_v3_activator_enabled else int(self.step_num)
-        is_final_save = int(self.step_num) >= final_step or completed_step >= int(self._phase_config().steps)
+        is_final_save = completed_step >= int(self._phase_config().steps)
         output_dir = os.path.join(
             phase_root,
             artifact_config.final_dir if is_final_save else artifact_config.checkpoint_dir,

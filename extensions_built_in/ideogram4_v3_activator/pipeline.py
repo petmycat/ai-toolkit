@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import shutil
 from datetime import datetime, timezone
@@ -121,6 +122,16 @@ class Ideogram4V3ActivatorPipeline:
             })
         return records
 
+    def _artifact_provenance(self, stage_name: str) -> Dict[str, Dict[str, Optional[str]]]:
+        return {
+            name: {
+                "path": path,
+                "sha256": self.sha256_file(path) if os.path.isfile(path) else None,
+            }
+            for name, path in self._artifact_records(stage_name).items()
+            if name != "final_dir" and not name.endswith("_dir")
+        }
+
     def completion_contract(self, stage_name: str, status: str, return_code: Optional[int]) -> Dict[str, Any]:
         stage = self.stages[stage_name]
         snapshot_hash = self.sha256_file(stage.snapshot_path) if os.path.isfile(stage.snapshot_path) else None
@@ -139,7 +150,7 @@ class Ideogram4V3ActivatorPipeline:
             "source_fingerprint": hashlib.sha256(
                 json.dumps(self._source_records(stage_name), sort_keys=True).encode("utf-8")
             ).hexdigest(),
-            "artifacts": self._artifact_records(stage_name),
+            "artifacts": self._artifact_provenance(stage_name),
             "training": {
                 "steps": stage.stage.steps,
                 "fresh_optimizer": True,
@@ -164,20 +175,51 @@ class Ideogram4V3ActivatorPipeline:
         artifacts = self._artifact_records("te_calibration")
         validation_path = artifacts["heldout_validation"]
         candidates = []
+        probe_keys_by_step: Dict[int, set[tuple[str, Optional[int], Optional[int]]]] = {}
         if os.path.isfile(validation_path):
             with open(validation_path, "r", encoding="utf-8") as handle:
                 for line in handle:
                     if not line.strip():
                         continue
                     record = json.loads(line)
+                    if record.get("probe_split") != "heldout":
+                        continue
                     metric = next((record.get(key) for key in ("heldout_loss", "target_mse", "loss") if isinstance(record.get(key), (int, float))), None)
                     record_step = int(record.get("step", 0))
-                    if metric is not None and record_step > 0:
+                    if metric is not None and record_step > 0 and math.isfinite(float(metric)):
+                        probe_key = (
+                            str(record.get("probe_case_id", record.get("dataset_relative_item_id", ""))),
+                            record.get("fixed_timestep"),
+                            record.get("noise_seed"),
+                        )
+                        if not probe_key[0]:
+                            raise ValueError("heldout validation record is missing a stable probe identifier")
+                        keys = probe_keys_by_step.setdefault(record_step, set())
+                        if probe_key in keys:
+                            raise ValueError(f"duplicate heldout probe at step {record_step}: {probe_key}")
+                        keys.add(probe_key)
                         candidates.append((float(metric), record_step))
         final_files = [artifacts["embedding"], artifacts["te_adapter"]]
         if not candidates:
             raise RuntimeError("A2 completion requires heldout validation records containing heldout_loss, target_mse, or loss")
-        best_loss, best_step = min(candidates)
+        expected_probe_keys = next(iter(probe_keys_by_step.values()))
+        incomplete_steps = [
+            step for step, keys in probe_keys_by_step.items()
+            if keys != expected_probe_keys
+        ]
+        if incomplete_steps:
+            raise RuntimeError(
+                "A2 heldout candidate steps do not contain the same complete probe set: "
+                + ", ".join(str(step) for step in sorted(incomplete_steps))
+            )
+        losses_by_step: Dict[int, list[float]] = {}
+        for loss, step in candidates:
+            losses_by_step.setdefault(step, []).append(loss)
+        best_step, step_losses = min(
+            losses_by_step.items(),
+            key=lambda item: sum(item[1]) / len(item[1]),
+        )
+        best_loss = sum(step_losses) / len(step_losses)
         checkpoint_dir = os.path.join(self.run_root, "phase_a2", self.v3_config.te_calibration.artifacts.checkpoint_dir, str(best_step))
         sources = [
             os.path.join(checkpoint_dir, self.v3_config.te_calibration.artifacts.embedding_filename),
@@ -200,20 +242,25 @@ class Ideogram4V3ActivatorPipeline:
             "selection": "minimum heldout loss",
             "step": best_step,
             "heldout_loss": best_loss,
+            "probe_count": len(step_losses),
+            "probe_set_sha256": hashlib.sha256(
+                json.dumps(sorted(expected_probe_keys), sort_keys=True).encode("utf-8")
+            ).hexdigest(),
             "artifacts": {
                 "embedding": {"path": destinations[0], "sha256": self.sha256_file(destinations[0])},
                 "te_adapter": {"path": destinations[1], "sha256": self.sha256_file(destinations[1])},
             },
         })
 
-    def _verify_outputs(self, stage_name: str) -> None:
+    def _verify_outputs(self, stage_name: str, *, create_best: bool = True) -> None:
         artifacts = self._artifact_records(stage_name)
         required = [artifacts["metrics"], artifacts["embedding"], artifacts["te_adapter"]]
         if stage_name == "semantic_activator":
             a1 = self.a1_artifact_paths()
             required.extend([a1["literal_initialization"], a1["literal_initialization_manifest"]])
         if stage_name == "te_calibration":
-            self._select_best_a2()
+            if create_best:
+                self._select_best_a2()
             required.extend([artifacts["heldout_validation"], artifacts["best_manifest"], artifacts["best_embedding"], artifacts["best_te_adapter"]])
         missing = [path for path in required if not os.path.isfile(path)]
         if missing:
@@ -232,9 +279,11 @@ class Ideogram4V3ActivatorPipeline:
                 return False
             if contract.get("sources") != self._source_records(stage_name):
                 return False
-            self._verify_outputs(stage_name)
+            self._verify_outputs(stage_name, create_best=False)
+            if contract.get("artifacts") != self._artifact_provenance(stage_name):
+                return False
             return True
-        except (OSError, KeyError, ValueError, json.JSONDecodeError):
+        except (OSError, KeyError, ValueError, RuntimeError, json.JSONDecodeError):
             return False
 
     def run_pipeline(self) -> None:

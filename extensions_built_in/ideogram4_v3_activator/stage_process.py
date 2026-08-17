@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import shutil
 import subprocess
 import sys
 from collections import OrderedDict
@@ -190,6 +191,8 @@ class Ideogram4V3ActivatorStageProcess:
         child["save"] = copy.deepcopy(child.get("save", {}))
         child["save"].update({
             "save_every": None,
+            # BaseSDTrainProcess evaluates save_steps before incrementing step_num,
+            # so completed update N is saved on loop index N - 1.
             "save_steps": [step - 1 for step in self.stage.save_steps],
         })
         child["sample"] = {"samples": []}
@@ -218,5 +221,15 @@ class Ideogram4V3ActivatorStageProcess:
 
     def execute(self) -> int:
         snapshot = self.write_snapshot()
+        generic_save_root = os.path.join(self.pipeline.run_root, self.stage.name)
+        internal_phase = "phase_a1" if self.stage.name == "semantic_activator" else "phase_a2"
+        phase_output_root = os.path.join(self.pipeline.run_root, internal_phase)
+        # The generic trainer resume format only contains the diffusion network and
+        # optimizer, not the matching text activator components. A stage retry must
+        # therefore be a clean attempt rather than a partial implicit resume, and
+        # stale JSONL/artifacts from the failed attempt must not enter selection.
+        for stale_root in (generic_save_root, phase_output_root):
+            if os.path.isdir(stale_root):
+                shutil.rmtree(stale_root)
         command = [sys.executable, os.path.join(TOOLKIT_ROOT, "run.py"), snapshot]
         return subprocess.run(command, cwd=TOOLKIT_ROOT, check=False).returncode
