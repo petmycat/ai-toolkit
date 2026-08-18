@@ -122,6 +122,20 @@ def test_new_activator_a2_contract_is_primary_and_requires_best_artifacts():
     parsed = parse_activator_a2_contract(_new_a2_contract())
     assert parsed["v3_weights"] == "v3.safetensors"
     assert parsed["best_embedding"].endswith("embedding.safetensors")
+    assert parsed["best_manifest_sha256"] is None
+
+    structured = _new_a2_contract()
+    structured["artifacts"] = {
+        "best_embedding": {"path": "best/embedding.safetensors", "sha256": "c" * 64},
+        "best_te_adapter": {"path": "best/te_adapter.safetensors", "sha256": "d" * 64},
+        "best_manifest": {"path": "best/best_heldout.json", "sha256": "e" * 64},
+    }
+    structured_parsed = parse_activator_a2_contract(structured)
+    assert structured_parsed["best_embedding"] == "best/embedding.safetensors"
+    assert structured_parsed["best_embedding_sha256"] == "c" * 64
+    assert structured_parsed["best_manifest"] == "best/best_heldout.json"
+    assert structured_parsed["best_manifest_sha256"] == "e" * 64
+
     invalid = _new_a2_contract()
     invalid["artifacts"].pop("best_te_adapter")
     with pytest.raises(RuntimeError, match="best_te_adapter"):

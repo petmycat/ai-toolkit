@@ -115,16 +115,29 @@ def parse_activator_a2_contract(contract: Mapping[str, Any]) -> Dict[str, Any]:
     artifacts = contract.get("artifacts")
     if not isinstance(sources, Mapping) or not isinstance(artifacts, Mapping):
         raise RuntimeError("A2 contract lacks sources or artifacts")
+    def artifact_reference(name: str) -> Tuple[Any, Optional[str]]:
+        value = artifacts.get(name)
+        if isinstance(value, Mapping):
+            return value.get("path"), value.get("sha256")
+        return value, None
+
+    best_embedding, best_embedding_sha256 = artifact_reference("best_embedding")
+    best_te_adapter, best_te_adapter_sha256 = artifact_reference("best_te_adapter")
+    best_manifest, best_manifest_sha256 = artifact_reference("best_manifest")
     required = {
         "snapshot": contract.get("config_snapshot"),
         "snapshot_sha256": contract.get("config_snapshot_sha256"),
         "v3_weights": (sources.get("v3_weights") or {}).get("path"),
         "v3_weights_sha256": (sources.get("v3_weights") or {}).get("sha256"),
-        "best_embedding": artifacts.get("best_embedding"),
-        "best_te_adapter": artifacts.get("best_te_adapter"),
-        "best_manifest": artifacts.get("best_manifest"),
+        "best_embedding": best_embedding,
+        "best_embedding_sha256": best_embedding_sha256,
+        "best_te_adapter": best_te_adapter,
+        "best_te_adapter_sha256": best_te_adapter_sha256,
+        "best_manifest": best_manifest,
+        "best_manifest_sha256": best_manifest_sha256,
     }
-    missing = sorted(key for key, value in required.items() if not value)
+    required_paths = ("snapshot", "snapshot_sha256", "v3_weights", "v3_weights_sha256", "best_embedding", "best_te_adapter", "best_manifest")
+    missing = sorted(key for key in required_paths if not required.get(key))
     if missing:
         raise RuntimeError(f"A2 activator contract lacks required fields: {missing}")
     return required

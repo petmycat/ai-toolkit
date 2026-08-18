@@ -173,9 +173,14 @@ class Ideogram4V3ResidualAblationProcess(BaseExtensionProcess):
         parsed = parse_activator_a2_contract(contract)
         self.snapshot_path = require_file_hash(parsed["snapshot"], parsed["snapshot_sha256"], "A2 config snapshot")
         self.lora_path = require_file_hash(parsed["v3_weights"], parsed["v3_weights_sha256"], "V3 source weights")
-        best_manifest_path = Path(parsed["best_manifest"])
-        if not best_manifest_path.is_file():
-            raise FileNotFoundError(best_manifest_path)
+        if parsed.get("best_manifest_sha256"):
+            best_manifest_path = require_file_hash(
+                parsed["best_manifest"], parsed["best_manifest_sha256"], "A2 best-heldout manifest"
+            )
+        else:
+            best_manifest_path = Path(parsed["best_manifest"])
+            if not best_manifest_path.is_file():
+                raise FileNotFoundError(best_manifest_path)
         best_manifest = load_json(best_manifest_path)
         if best_manifest.get("schema") != "ai-toolkit.ideogram4-v3-activator-best-heldout" or int(best_manifest.get("schema_version", 0)) != 1:
             raise RuntimeError("invalid A2 best-heldout manifest")
@@ -186,6 +191,10 @@ class Ideogram4V3ResidualAblationProcess(BaseExtensionProcess):
             raise RuntimeError("A2 contract best_embedding disagrees with best-heldout manifest")
         if Path(str(parsed["best_te_adapter"])).resolve() != Path(str(te_ref.get("path", ""))).resolve():
             raise RuntimeError("A2 contract best_te_adapter disagrees with best-heldout manifest")
+        if parsed.get("best_embedding_sha256") and parsed["best_embedding_sha256"] != embedding_ref.get("sha256"):
+            raise RuntimeError("A2 contract best_embedding hash disagrees with best-heldout manifest")
+        if parsed.get("best_te_adapter_sha256") and parsed["best_te_adapter_sha256"] != te_ref.get("sha256"):
+            raise RuntimeError("A2 contract best_te_adapter hash disagrees with best-heldout manifest")
         self.embedding_path = require_file_hash(parsed["best_embedding"], embedding_ref.get("sha256"), "A2 best embedding")
         self.te_adapter_path = require_file_hash(parsed["best_te_adapter"], te_ref.get("sha256"), "A2 best TE adapter")
         source_records = contract.get("sources", {})
