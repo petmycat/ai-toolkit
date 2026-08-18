@@ -26,6 +26,7 @@ def _load_runtime_methods():
         '_v3_diagnostics_config', '_v3_diagnostic_event',
         '_v3_segmented_smoothstep_weight', '_v3_schedule_weights',
         '_v3_probe_target_mse', '_evaluate_ideogram4_v3_fixed_probe',
+        '_v8_validation_config', '_maybe_run_v8_fixed_validation',
         '_install_trigger_binding_prompt_encoder', 'encode_static_prompt',
         '_sync_semantic_scaffold_tap_runtime', 'end_step_hook',
     }
@@ -65,6 +66,8 @@ def _load_runtime_methods():
         'shared_loss_target': lambda trainer, noise, batch, timesteps: trainer.sd.get_loss_target(
             noise=noise, batch=batch, timesteps=timesteps
         ).detach(),
+        'should_run_validation': lambda completed, config: completed in tuple(config.steps),
+        'write_fixed_probe_results': lambda *args, **kwargs: None,
         'FixedDiffusionProbeCase': FixedDiffusionProbeCase,
         'network_disabled': network_disabled,
     }
@@ -179,6 +182,33 @@ class ThreePhaseRuntimeTest(unittest.TestCase):
         trainer.end_step_hook()
 
         self.assertEqual(observed_steps, [8])
+
+    def test_v3_validation_uses_incremented_completed_update_without_plus_one(self):
+        trainer = self._trainer('a1')
+        trainer.step_num = 4
+        trainer.save_root = tempfile.gettempdir()
+        trainer.accelerator = SimpleNamespace(is_main_process=True)
+        trainer._trigger_binding_probe_sets = {'train': [{}], 'heldout': [{}]}
+        trainer._trigger_binding_validation_steps = set()
+        trainer.three_phase_trigger_training.validation = SimpleNamespace(
+            enabled=True,
+            steps=[5],
+        )
+        trainer.three_phase_trigger_training.phase_runtime.objective = {
+            'pipeline': 'ideogram4_v3_activator',
+            'diagnostics': {'enabled': False},
+        }
+        trainer._evaluate_ideogram4_v3_fixed_probe = lambda item, split, step: {}
+        trainer.trigger_word = None
+        trainer.semantic_scaffold_enabled = False
+        trainer.ideogram4_v3_activator_enabled = True
+
+        trainer._maybe_run_v8_fixed_validation()
+        self.assertEqual(trainer._trigger_binding_validation_steps, set())
+
+        trainer.step_num = 5
+        trainer._maybe_run_v8_fixed_validation()
+        self.assertEqual(trainer._trigger_binding_validation_steps, {5})
 
     def test_phase_whitelist_freezes_non_targets(self):
         trainer = self._trainer('a2')

@@ -1305,6 +1305,7 @@ class SDTrainer(BaseSDTrainProcess):
                 noise_seeds=[int(getattr(config, 'seed', 0))],
                 fixed_timesteps=list(getattr(config, 'fixed_timesteps', ())),
                 fixed_sigmas=list(getattr(config, 'fixed_sigmas', ())),
+                limit=int(getattr(config, 'probe_limit', 0)),
                 probe_scope='split',
             )
             items_by_id = {
@@ -4533,13 +4534,23 @@ class SDTrainer(BaseSDTrainProcess):
         config = self._v8_validation_config()
         if config is None or not getattr(config, 'enabled', False):
             return
+        # end_step_hook runs after BaseSDTrainProcess has already incremented
+        # step_num, so it is the number of completed updates here. Only A2
+        # preflight is synthetic step 0. Adding one caused final validation to
+        # start before the last training update and made the 5-step smoke run
+        # appear frozen at 2/5 while it evaluated the entire probe dataset.
         completed_updates = (
             0 if getattr(self, '_v3_preflight_validation', False)
-            else int(self.step_num) + 1 if self.ideogram4_v3_activator_enabled
             else int(self.step_num)
         )
         if not should_run_validation(completed_updates, config):
             return
+        self._v3_diagnostic_event(
+            'validation_start',
+            completed_updates=completed_updates,
+            train_probe_count=len((self._trigger_binding_probe_sets or {}).get('train', [])),
+            heldout_probe_count=len((self._trigger_binding_probe_sets or {}).get('heldout', [])),
+        )
         if completed_updates in self._trigger_binding_validation_steps:
             return
         if not self.accelerator.is_main_process or not self._trigger_binding_probe_sets:
@@ -4573,8 +4584,32 @@ class SDTrainer(BaseSDTrainProcess):
                 'negative_phrases': list(getattr(config, 'negative_phrases', [])),
                 'probe_available': True,
             }
-        write_fixed_probe_results(output_root, config, step=completed_updates, probe_sets=self._trigger_binding_probe_sets, evaluate=evaluate)
+        def evaluate_with_diagnostics(item, split, step):
+            probe_id = item.get('probe_case_id', item.get('dataset_relative_item_id', ''))
+            self._v3_diagnostic_event(
+                'validation_probe_start',
+                completed_updates=completed_updates,
+                probe_split=split,
+                probe_case_id=probe_id,
+            )
+            result = evaluate(item, split, step)
+            self._v3_diagnostic_event(
+                'validation_probe_end',
+                completed_updates=completed_updates,
+                probe_split=split,
+                probe_case_id=probe_id,
+            )
+            return result
+
+        write_fixed_probe_results(
+            output_root,
+            config,
+            step=completed_updates,
+            probe_sets=self._trigger_binding_probe_sets,
+            evaluate=evaluate_with_diagnostics,
+        )
         self._trigger_binding_validation_steps.add(completed_updates)
+        self._v3_diagnostic_event('validation_end', completed_updates=completed_updates)
 
     def train_single_accumulation(self, batch: DataLoaderBatchDTO):
         with torch.no_grad():

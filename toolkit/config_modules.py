@@ -886,6 +886,7 @@ class TriggerValidationConfig:
             'aggregate_output_filename', 'trigger_validation_aggregate.jsonl'
         )
         self.gain_epsilon: float = float(kwargs.get('gain_epsilon', 1.0e-6))
+        self.probe_limit: int = int(kwargs.get('probe_limit', 0))
 
 
 class ThreePhaseTriggerTrainingConfig:

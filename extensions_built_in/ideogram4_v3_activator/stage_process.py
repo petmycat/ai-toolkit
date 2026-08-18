@@ -119,6 +119,12 @@ class Ideogram4V3ActivatorStageProcess:
                 "seed": int(self.pipeline.v3_config.fixed_validation["seed"]),
                 "fixed_timesteps": list(self.pipeline.v3_config.fixed_validation["fixed_timesteps"]),
                 "data_split_manifest": self.pipeline.v3_config.fixed_validation["data_split_manifest"],
+                "probe_limit": int(
+                    self.pipeline.v3_config.fixed_validation.get(
+                        "probe_limit",
+                        1 if self.pipeline.v3_config.smoke_test else 0,
+                    )
+                ),
                 "caption_sources": ["structured"],
                 "negative_phrases": list(
                     self.pipeline.v3_config.fixed_validation.get(

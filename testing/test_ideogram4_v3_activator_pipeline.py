@@ -171,6 +171,29 @@ class Ideogram4V3ActivatorPipelineTest(unittest.TestCase):
             validation = a2["three_phase_trigger_training"]["validation"]
             self.assertEqual(validation["steps"], [0, 20, 40, 60, 80])
             self.assertEqual(validation["caption_sources"], ["structured"])
+            self.assertEqual(validation["probe_limit"], 0)
+            smoke_raw = _block(
+                process.v3_weights_path,
+                process.v3_config.fixed_validation["data_split_manifest"],
+            )
+            smoke_raw["smoke_test"] = True
+            smoke_raw["semantic_activator"].update({
+                "steps": 5,
+                "save_steps": [5],
+                "validation_steps": [5],
+            })
+            smoke_raw["te_calibration"].update({
+                "steps": 5,
+                "save_steps": [5],
+                "validation_steps": [0, 5],
+            })
+            process.v3_config = load_config(smoke_raw)
+            process.initialize_pipeline()
+            smoke_child = process.stages["semantic_activator"].build_child_process_config()
+            self.assertEqual(
+                smoke_child["three_phase_trigger_training"]["validation"]["probe_limit"],
+                1,
+            )
             self.assertEqual(
                 validation["negative_phrases"],
                 ["photorealistic photograph", "technical drawing"],
