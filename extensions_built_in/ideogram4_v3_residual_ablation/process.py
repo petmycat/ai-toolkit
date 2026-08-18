@@ -71,6 +71,19 @@ class Ideogram4V3ResidualAblationProcess(BaseExtensionProcess):
         elapsed = 0.0 if self._run_started_at is None else time.monotonic() - self._run_started_at
         print_acc(f"[V3 residual ablation +{self._format_duration(elapsed)}] {message}")
 
+    def _log_cuda_memory(self, label: str, torch) -> None:
+        if not torch.cuda.is_available():
+            return
+        gib = 1024 ** 3
+        allocated = torch.cuda.memory_allocated() / gib
+        reserved = torch.cuda.memory_reserved() / gib
+        peak = torch.cuda.max_memory_allocated() / gib
+        free, total = torch.cuda.mem_get_info()
+        self._progress(
+            f"CUDA memory {label}: allocated={allocated:.2f} GiB, reserved={reserved:.2f} GiB, "
+            f"peak={peak:.2f} GiB, free={free / gib:.2f}/{total / gib:.2f} GiB"
+        )
+
     def run(self):
         super().run()
         import torch
@@ -87,8 +100,9 @@ class Ideogram4V3ResidualAblationProcess(BaseExtensionProcess):
         self.text_activator = self._build_text_activator(torch)
         self._load_and_install_activator()
         self._freeze()
-        self._disable_checkpointing()
+        self._enable_checkpointing()
         self._progress("model, V3 LoRA, and activator ready")
+        self._log_cuda_memory("after model setup", torch)
 
         registry = build_module_registry(self.network.get_all_modules())
         registry_summary = validate_complete_partition(registry)
@@ -99,10 +113,12 @@ class Ideogram4V3ResidualAblationProcess(BaseExtensionProcess):
         probes, probe_manifest = self._build_probes()
         probe_path = self.output_root / self.ablation.get("probe_manifest_filename", "residual_ablation_probe_manifest.json")
         atomic_write_json(probe_path, probe_manifest)
+        self._precompute_probe_inputs(probes, torch)
         self._progress(
             f"prepared {len(probes)} probe cases across {len(group_to_modules)} groups; "
             f"optimized workload per probe: {len(self.helper_phrases) + 2} references, "
-            f"1 shared center/gradient pass, at most "
+            f"1 no-grad center capture, checkpointed gate-gradient batches of "
+            f"{int(self.ablation.get('gate_gradient_batch_size', 1))}, at most "
             f"{2 * int(self.ablation.get('finite_difference_top_k_groups', 12))} core side-scale passes "
             f"plus family coverage"
         )
@@ -121,7 +137,8 @@ class Ideogram4V3ResidualAblationProcess(BaseExtensionProcess):
             "helpers": self.helper_phrases,
             "candidate_scales": self._candidate_scales(),
             "finite_difference_top_k_groups": int(self.ablation.get("finite_difference_top_k_groups", 12)),
-            "schema_version": 4,
+            "gate_gradient_batch_size": int(self.ablation.get("gate_gradient_batch_size", 1)),
+            "schema_version": 5,
         })
         records_path = self.output_root / self.ablation.get("records_filename", "residual_ablation_records.jsonl")
         existing = load_jsonl(records_path) if self.ablation.get("resume", True) else []
@@ -159,16 +176,16 @@ class Ideogram4V3ResidualAblationProcess(BaseExtensionProcess):
             prepared = self._prepare_case(case, item, torch)
             embed_key = str(case.item_id)
             if embed_key not in self._calibrated_embed_cache:
-                with torch.no_grad():
-                    self._calibrated_embed_cache[embed_key] = self._calibrated_prompt_embeds(prepared["prompt_template"])
-                self._progress(f"probe {case_index}/{len(probes)} cached calibrated text embedding")
-            else:
-                self._progress(f"probe {case_index}/{len(probes)} reused calibrated text embedding")
+                raise RuntimeError(f"missing precomputed calibrated embedding for {embed_key}")
+            self._progress(f"probe {case_index}/{len(probes)} reused calibrated text embedding")
             prepared["calibrated_embeds"] = self._calibrated_embed_cache[embed_key]
             helper_basis, helper_norms, helper_spectra, reference_summary = self._capture_reference_responses(
                 prepared, runtime, torch, case_index=case_index, case_count=len(probes)
             )
             runtime.set_projection_basis(helper_basis)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            self._log_cuda_memory(f"before probe {case_index} center capture", torch)
             case_records = self._evaluate_case(
                 run_id, case, prepared, pending, registry, runtime,
                 helper_norms, helper_spectra, reference_summary, torch,
@@ -207,7 +224,7 @@ class Ideogram4V3ResidualAblationProcess(BaseExtensionProcess):
         }
         atomic_write_json(manifest_path, {
             "schema": "ai-toolkit.ideogram4-v3-residual-ablation",
-            "schema_version": 4,
+            "schema_version": 5,
             "status": "completed",
             "run_id": run_id,
             "diagnostics_only": True,
@@ -222,14 +239,17 @@ class Ideogram4V3ResidualAblationProcess(BaseExtensionProcess):
             },
             "candidate_scales": self._candidate_scales(),
             "evaluation_strategy": {
-                "shared_center_pass_per_probe": True,
-                "joint_gate_gradient_pass_per_probe": True,
-                "finite_difference_selection": "top_absolute_joint_gradient_plus_family_coverage",
+                "shared_center_capture_pass_per_probe": True,
+                "gate_gradients": "checkpointed_batched_backward_without_residual_capture",
+                "gate_gradient_batch_size": int(self.ablation.get("gate_gradient_batch_size", 1)),
+                "finite_difference_selection": "top_absolute_gradient_plus_family_coverage",
                 "finite_difference_top_k_groups": int(self.ablation.get("finite_difference_top_k_groups", 12)),
                 "side_scale_passes_per_selected_group": 2,
                 "calibrated_text_embeddings_cached_per_item": True,
                 "stock_text_embeddings_cached_per_prompt": True,
                 "latents_cached_per_item": True,
+                "conditioning_and_vae_offloaded_after_precompute": True,
+                "residual_statistics": "chunked_without_full_tensor_boolean_copy",
             },
             "probe_case_count": len(probes),
             "group_count": len(group_to_modules),
@@ -425,13 +445,12 @@ class Ideogram4V3ResidualAblationProcess(BaseExtensionProcess):
         if trainable:
             raise RuntimeError(f"diagnostics found trainable parameters: {trainable[:10]}")
 
-    def _disable_checkpointing(self):
-        for module in (self.sd.model, self.network, self.sd.text_encoder):
-            disable = getattr(module, "disable_gradient_checkpointing", None)
-            if callable(disable):
-                disable()
-        if getattr(self.sd.model, "gradient_checkpointing", False):
-            raise RuntimeError("ablation must disable transformer checkpointing")
+    def _enable_checkpointing(self):
+        enable = getattr(self.sd.model, "enable_gradient_checkpointing", None)
+        if callable(enable):
+            enable()
+        if not getattr(self.sd.model, "gradient_checkpointing", False):
+            raise RuntimeError("residual ablation gate gradients require transformer checkpointing")
 
     def _candidate_scales(self):
         values = tuple(float(value) for value in self.ablation.get("candidate_scales", (0.75, 1.0, 1.25)))
@@ -465,6 +484,35 @@ class Ideogram4V3ResidualAblationProcess(BaseExtensionProcess):
         payload = {"schema": "ai-toolkit.ideogram4-v3-residual-ablation-probes", "schema_version": 2, "items": items, "cases": [case.as_dict() for case in cases], "helpers": self.helper_phrases, "neutral_phrase": self.neutral_phrase, "far_phrase": self.far_phrase}
         payload["probe_manifest_hash"] = fingerprint(payload)
         return probes, payload
+
+    def _precompute_probe_inputs(self, probes, torch):
+        from toolkit.basic import flush
+
+        unique_items = {}
+        for case, item in probes:
+            unique_items.setdefault(str(case.item_id), (case, item))
+        self._progress(f"precomputing latents and text embeddings for {len(unique_items)} unique contents")
+        for item_index, (item_id, (case, item)) in enumerate(unique_items.items(), 1):
+            prepared = self._prepare_case(case, item, torch)
+            template = prepared["prompt_template"]
+            with torch.no_grad():
+                self._calibrated_embed_cache[item_id] = self._calibrated_prompt_embeds(template).to("cpu")
+                phrases = list(self.helper_phrases) + [self.neutral_phrase, self.far_phrase]
+                for phrase in phrases:
+                    prompt = template.replace(self.placeholder, phrase)
+                    if prompt not in self._stock_embed_cache:
+                        self._stock_embed_cache[prompt] = self.sd.get_prompt_embeds(
+                            [prompt], runtime_mode="stock_literal"
+                        ).to("cpu")
+            self._latent_cache[item_id] = self._latent_cache[item_id].to("cpu")
+            self._progress(f"precomputed content {item_index}/{len(unique_items)}")
+
+        self.sd.text_encoder.to("cpu")
+        self.text_activator.to("cpu")
+        self.sd.vae.to("cpu")
+        flush()
+        self._progress("offloaded Qwen text encoder, activator, and VAE after precompute")
+        self._log_cuda_memory("after conditioning/VAE offload", torch)
 
     def _prepare_case(self, case, item, torch):
         from PIL import Image
@@ -577,27 +625,56 @@ class Ideogram4V3ResidualAblationProcess(BaseExtensionProcess):
         by_group = {row["group_id"]: row for row in registry}
         scales = self._candidate_scales()
         side_scales = [scale for scale in scales if scale != 1.0]
-        gates = {
-            group: torch.tensor(1.0, device=prepared["target"].device, dtype=torch.float32, requires_grad=True)
-            for group in pending
-        }
-        self._progress(
-            f"probe {case_index}/{case_count} shared center pass + joint gradients for {len(pending)} groups"
-        )
+        self._progress(f"probe {case_index}/{case_count} center capture pass for all {len(pending)} groups")
         center_started = time.monotonic()
+        runtime.capture = True
+        runtime.capture_vectors = True
         with residual_runtime_context(self.network, runtime):
             runtime.reset()
-            runtime.set_gates(gates)
-            prediction = self._predict(prepared, prepared["prompt_template"], "full")
-            loss = torch.mean((prediction.float() - prepared["target"].float()).square())
-            center_loss = float(loss.detach().item())
-            gradients = gate_gradients(loss, gates)
+            runtime.set_gates({})
+            with torch.no_grad():
+                prediction = self._predict(prepared, prepared["prompt_template"], "full")
+            center_loss = float(torch.mean((prediction.float() - prepared["target"].float()).square()).item())
             center_summary = runtime.summary()
             center_vectors = runtime.captured_group_vectors()
         self._progress(
-            f"probe {case_index}/{case_count} shared center/gradient pass finished in "
+            f"probe {case_index}/{case_count} center capture finished in "
             f"{self._format_duration(time.monotonic() - center_started)}"
         )
+        self._log_cuda_memory(f"after probe {case_index} center capture", torch)
+
+        gradient_batch_size = int(self.ablation.get("gate_gradient_batch_size", 1))
+        if gradient_batch_size <= 0:
+            raise ValueError("gate_gradient_batch_size must be positive")
+        gradients = {}
+        runtime.capture = False
+        runtime.capture_vectors = False
+        gradient_batches = [pending[index:index + gradient_batch_size] for index in range(0, len(pending), gradient_batch_size)]
+        for batch_index, batch_groups in enumerate(gradient_batches, 1):
+            batch_started = time.monotonic()
+            gates = {
+                group: torch.tensor(1.0, device=prepared["target"].device, dtype=torch.float32, requires_grad=True)
+                for group in batch_groups
+            }
+            with residual_runtime_context(self.network, runtime):
+                runtime.reset()
+                runtime.set_gates(gates)
+                prediction = self._predict(prepared, prepared["prompt_template"], "full")
+                loss = torch.mean((prediction.float() - prepared["target"].float()).square())
+                gradients.update(gate_gradients(loss, gates))
+            del prediction, loss, gates
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            remaining = len(gradient_batches) - batch_index
+            elapsed = time.monotonic() - batch_started
+            self._progress(
+                f"probe {case_index}/{case_count} gate-gradient batch {batch_index}/{len(gradient_batches)} "
+                f"groups={batch_groups} finished in {self._format_duration(elapsed)}; "
+                f"gradient ETA={self._format_duration(elapsed * remaining)}"
+            )
+            self._log_cuda_memory(f"after gradient batch {batch_index}", torch)
+        runtime.capture = True
+        runtime.capture_vectors = True
 
         finite_difference_top_k = int(self.ablation.get("finite_difference_top_k_groups", 12))
         if finite_difference_top_k <= 0:

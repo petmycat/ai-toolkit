@@ -220,16 +220,35 @@ class _RunningTensorStats:
     max_abs: float = 0.0
     nonfinite: int = 0
 
-    def update(self, tensor: Any) -> None:
-        value = tensor.detach().float()
-        self.count += 1
-        self.numel += value.numel()
-        finite = value.isfinite()
-        self.nonfinite += int((~finite).sum().item())
-        if finite.any():
-            valid = value[finite]
-            self.sum_sq += float(valid.square().sum().item())
-            self.max_abs = max(self.max_abs, float(valid.abs().max().item()))
+    def update(self, tensor: Any, *, chunk_size: int = 262144) -> Tuple[int, int, float, float, int]:
+        import torch
+
+        flat = tensor.detach().reshape(-1)
+        numel = flat.numel()
+        sum_sq = 0.0
+        max_abs = 0.0
+        nonfinite = 0
+        for start in range(0, numel, chunk_size):
+            value = flat[start:start + chunk_size].float()
+            finite = torch.isfinite(value)
+            chunk_nonfinite = int((~finite).sum().item())
+            nonfinite += chunk_nonfinite
+            if chunk_nonfinite == 0:
+                sum_sq += float(value.square().sum().item())
+                max_abs = max(max_abs, float(value.abs().max().item()))
+            elif finite.any():
+                valid = value[finite]
+                sum_sq += float(valid.square().sum().item())
+                max_abs = max(max_abs, float(valid.abs().max().item()))
+        self.add(1, numel, sum_sq, max_abs, nonfinite)
+        return 1, numel, sum_sq, max_abs, nonfinite
+
+    def add(self, count: int, numel: int, sum_sq: float, max_abs: float, nonfinite: int) -> None:
+        self.count += int(count)
+        self.numel += int(numel)
+        self.sum_sq += float(sum_sq)
+        self.max_abs = max(self.max_abs, float(max_abs))
+        self.nonfinite += int(nonfinite)
 
     def as_dict(self) -> Dict[str, Any]:
         finite_numel = self.numel - self.nonfinite
@@ -294,9 +313,9 @@ class ResidualAblationRuntime:
         if group is None:
             raise KeyError(f"LoRA observer saw unregistered module: {name}")
         if self.capture:
-            self._module_stats[name].update(residual)
-            self._group_stats[group].update(residual)
-            flat = residual.detach().float().reshape(-1)
+            stats = self._module_stats[name].update(residual)
+            self._group_stats[group].add(*stats)
+            flat = residual.detach().reshape(-1)
             sketch = pooled_residual_sketch(flat, self.sketch_size)
             if self.capture_vectors:
                 self._group_sketches[group].append(sketch.cpu())

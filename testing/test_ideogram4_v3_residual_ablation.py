@@ -217,6 +217,21 @@ def test_forward_hook_is_default_off_and_backward_compatible():
     assert network._residual_ablation_runtime is None
 
 
+def test_running_stats_chunk_large_residual_without_duplicate_group_scan():
+    group = "block:0:attention"
+    module = FakeRegistryModule("transformer$$layers$$0$$attention$$qkv")
+    runtime = ResidualAblationRuntime(
+        {"transformer.layers.0.attention.qkv": group}, capture_vectors=True, sketch_size=4
+    )
+    residual = torch.arange(600000, dtype=torch.float16)
+    runtime.apply(module, residual)
+    summary = runtime.summary()
+    assert summary["modules"]["transformer.layers.0.attention.qkv"]["numel"] == residual.numel()
+    assert summary["groups"][group]["numel"] == residual.numel()
+    assert summary["groups"][group]["call_count"] == 1
+    assert runtime.captured_group_vectors()[group].numel() == 4
+
+
 def test_runtime_streams_stats_and_applies_temporary_group_gate():
     network, base, lora = _fake_lora()
     runtime = ResidualAblationRuntime({"transformer.layers.0.attention.qkv": "block:0:attention"})
