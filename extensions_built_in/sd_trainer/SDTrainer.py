@@ -2801,7 +2801,10 @@ class SDTrainer(BaseSDTrainProcess):
             helper_loss = torch.stack(helper_losses).mean()
             schedules = self._v3_schedule_weights()
             prototype = getattr(self, '_v3_semantic_prototype', None)
-            semantic_vector = semantic_effect.float().flatten(1).mean(0)
+            # Diffusion buckets have different spatial token counts. Keep only the
+            # channel signature so the EMA prototype is comparable across buckets.
+            reduction_dims = (0,) + tuple(range(2, semantic_effect.ndim))
+            semantic_vector = semantic_effect.float().mean(dim=reduction_dims)
             zero = semantic_mse.sum() * 0.0
             prototype_loss = zero
             if prototype is not None:
@@ -4358,7 +4361,9 @@ class SDTrainer(BaseSDTrainProcess):
         prototype = getattr(self, '_v3_semantic_prototype', None)
         prototype_consistency = None
         if prototype is not None:
-            current = semantic_effect
+            effect_tensor = (prediction_c - prediction_a).detach().float()
+            reduction_dims = (0,) + tuple(range(2, effect_tensor.ndim))
+            current = effect_tensor.mean(dim=reduction_dims).flatten()
             reference = prototype.detach().to(current).flatten()
             if current.numel() == reference.numel():
                 prototype_consistency = float(F.cosine_similarity(

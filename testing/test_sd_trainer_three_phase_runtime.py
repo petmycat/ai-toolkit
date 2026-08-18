@@ -230,6 +230,54 @@ class ThreePhaseRuntimeTest(unittest.TestCase):
         self.assertTrue(all(not parameter.requires_grad for parameter in trainer.text_activator.embedding.parameters()))
         self.assertTrue(all(not parameter.requires_grad for parameter in trainer.text_activator.tap_adapters.parameters()))
 
+    def test_v3_a1_prototype_is_stable_across_bucket_shapes(self):
+        from toolkit import trigger_binding_losses
+
+        trainer = self._trainer('a1')
+        trainer.device_torch = torch.device('cpu')
+        trainer.step_num = 0
+        trainer.additional_logs = {}
+        trainer._trigger_gradient_reachability_checked = True
+        trainer.three_phase_trigger_training.placeholder = '[trigger]'
+        trainer.three_phase_trigger_training.phase_runtime.objective = {
+            'pipeline': 'ideogram4_v3_activator',
+            'name': 'semantic_activator',
+            'helper_schedule': {'helpers': ['illustration']},
+            'prototype_ema_decay': 0.95,
+        }
+        trainer._trigger_binding_modules = {'losses': trigger_binding_losses}
+        trainer.sd = SimpleNamespace(
+            get_prompt_embeds=lambda prompts: _FakeEmbeds(len(prompts)),
+            get_loss_target=lambda noise, batch, timesteps: noise,
+        )
+        trainer._activator_mode = lambda mode: patch.object(trainer, '_mode', mode, create=True)
+        batch = SimpleNamespace(
+            file_items=[SimpleNamespace(caption_template='x [trigger]', raw_caption='unused')],
+        )
+
+        def run_shape(height, width):
+            def predict_noise(**kwargs):
+                if trainer._mode == 'semantic_only':
+                    return torch.ones_like(kwargs['noisy_latents'])
+                if trainer._mode == 'stock_literal':
+                    return torch.full_like(kwargs['noisy_latents'], 0.5)
+                return torch.zeros_like(kwargs['noisy_latents'])
+            trainer.predict_noise = predict_noise
+            latents = torch.zeros(1, 4, height, width)
+            return trainer._calculate_ideogram4_v3_activator_loss(
+                noisy_latents=latents,
+                noise=torch.zeros_like(latents),
+                timesteps=torch.tensor([10]),
+                batch=batch,
+                pred_kwargs={},
+                dtype=torch.float32,
+            )
+
+        self.assertTrue(torch.isfinite(run_shape(4, 5)))
+        self.assertEqual(tuple(trainer._v3_semantic_prototype.shape), (4,))
+        self.assertTrue(torch.isfinite(run_shape(3, 7)))
+        self.assertEqual(tuple(trainer._v3_semantic_prototype.shape), (4,))
+
     def test_v3_a2_objective_has_one_prediction_and_no_helper(self):
         from toolkit import trigger_binding_losses
 
