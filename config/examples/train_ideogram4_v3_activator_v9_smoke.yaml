@@ -113,7 +113,7 @@ config:
         output_root: /data/train/models/ig4_TST_v9_smoke
 
         # Fill in before running. The pipeline validates this file before A1.
-        v3_weights: "/data/train/models/ig4_r1X1dOn9mA2_v3/ig4_r1X1dOn9mA2_v3.safetensors"
+        v3_weights: "/data/train/models/ig4_r1X1dOn9mA2_v3.safetensors"
 
         literal_initialization:
           strategy: frozen_qwen_interval_overlap

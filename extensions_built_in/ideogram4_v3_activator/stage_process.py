@@ -159,6 +159,7 @@ class Ideogram4V3ActivatorStageProcess:
                     "embedding_frozen": not is_a1,
                     "te_only": not is_a1,
                     "v3_active_frozen": not is_a1,
+                    "v3_weights_path": None if is_a1 else self.pipeline.v3_weights_path,
                     "fresh_optimizer": True,
                     "best_metric": "heldout_loss" if not is_a1 else None,
                     "literal_initialization": copy.deepcopy(self.pipeline.v3_config.literal_initialization),
@@ -169,6 +170,7 @@ class Ideogram4V3ActivatorStageProcess:
                     "disturbance_weight": 0.1,
                     "diagnostics": {
                         "enabled": bool(self.pipeline.v3_config.smoke_test),
+                        "require_diffusion_only_v3": True,
                         "filename": "runtime_diagnostics.jsonl",
                         "console": True,
                         "fsync": True,

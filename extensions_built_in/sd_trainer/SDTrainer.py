@@ -1402,6 +1402,7 @@ class SDTrainer(BaseSDTrainProcess):
         if self.semantic_scaffold_enabled:
             self._maybe_run_v8_fixed_validation()
         elif self.ideogram4_v3_activator_enabled and self.runtime_phase == 'a2':
+            self._validate_frozen_v3_checkpoint_scope()
             self._v3_preflight_validation = True
             try:
                 self._maybe_run_v8_fixed_validation()
@@ -2721,6 +2722,41 @@ class SDTrainer(BaseSDTrainProcess):
         objective = self._phase_runtime_objective()
         config = objective.get('diagnostics', {})
         return config if isinstance(config, dict) else {}
+
+    def _validate_frozen_v3_checkpoint_scope(self):
+        if self.runtime_phase != 'a2':
+            return
+        config = self._v3_diagnostics_config()
+        if not config.get('require_diffusion_only_v3', True):
+            return
+        path = self._phase_runtime_objective().get('v3_weights_path')
+        if not path:
+            sources = getattr(
+                getattr(self.three_phase_trigger_training, 'phase_runtime', None),
+                'sources', {},
+            )
+            path = sources.get('diffusion_lora') if isinstance(sources, dict) else None
+        if not path or not os.path.isfile(path):
+            raise RuntimeError(f'frozen V3 LoRA checkpoint is unavailable: {path!r}')
+        state = load_file(path, device='cpu')
+        keys = tuple(str(key) for key in state)
+        te_keys = [key for key in keys if key.startswith('lora_te') or '.text_encoder.' in key]
+        diffusion_keys = [
+            key for key in keys
+            if key.startswith('lora_unet')
+            or key.startswith('lora_transformer')
+            or key.startswith('diffusion_model.')
+            or key.startswith('transformer.')
+        ]
+        if te_keys:
+            preview = ', '.join(te_keys[:3])
+            raise RuntimeError(
+                'A2 requires a diffusion-only frozen V3 LoRA, but the configured checkpoint '
+                f'contains {len(te_keys)} text-encoder LoRA tensors (for example: {preview}). '
+                'Point v3_weights to the diffusion-only V3 artifact rather than a combined TE+diffusion checkpoint.'
+            )
+        if not diffusion_keys:
+            raise RuntimeError('configured V3 checkpoint contains no recognizable diffusion LoRA tensors')
 
     def _v3_diagnostic_event(self, event, **details):
         config = self._v3_diagnostics_config()

@@ -23,7 +23,7 @@ def _load_runtime_methods():
         'hook_add_extra_train_params', '_activator_mode', '_write_trigger_binding_metrics',
         '_phase_caption_source_weights', '_prompt_tap_batch', '_check_first_trigger_gradient', '_v8_masked_delta_metrics', '_v8_prompt_delta_norms',
         '_calculate_trigger_binding_loss', '_calculate_ideogram4_v3_activator_loss',
-        '_v3_diagnostics_config', '_v3_diagnostic_event',
+        '_v3_diagnostics_config', '_validate_frozen_v3_checkpoint_scope', '_v3_diagnostic_event',
         '_v3_segmented_smoothstep_weight', '_v3_schedule_weights',
         '_v3_probe_target_mse', '_evaluate_ideogram4_v3_fixed_probe',
         '_v8_validation_config', '_maybe_run_v8_fixed_validation',
@@ -69,6 +69,7 @@ def _load_runtime_methods():
         'should_run_validation': lambda completed, config: completed in tuple(config.steps),
         'write_fixed_probe_results': lambda *args, **kwargs: None,
         'FixedDiffusionProbeCase': FixedDiffusionProbeCase,
+        'load_file': __import__('safetensors.torch', fromlist=['load_file']).load_file,
         'network_disabled': network_disabled,
     }
     exec(compile(module, str(source_path), 'exec'), namespace)
@@ -265,6 +266,41 @@ class ThreePhaseRuntimeTest(unittest.TestCase):
         self.assertTrue(all(not parameter.requires_grad for parameter in trainer.network.parameters()))
         self.assertTrue(all(not parameter.requires_grad for parameter in trainer.text_activator.embedding.parameters()))
         self.assertTrue(all(not parameter.requires_grad for parameter in trainer.text_activator.tap_adapters.parameters()))
+
+    def test_a2_rejects_combined_te_and_diffusion_v3_checkpoint(self):
+        from safetensors.torch import save_file
+
+        trainer = self._trainer('a2')
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, 'combined.safetensors')
+            save_file({
+                'lora_unet$$layers$$0.lora_down.weight': torch.ones(1, 1),
+                'lora_te$$language_model$$layers$$0.lora_down.weight': torch.ones(1, 1),
+            }, path)
+            trainer.three_phase_trigger_training.phase_runtime.objective = {
+                'pipeline': 'ideogram4_v3_activator',
+                'v3_weights_path': path,
+                'diagnostics': {'require_diffusion_only_v3': True},
+            }
+            with self.assertRaisesRegex(RuntimeError, 'diffusion-only frozen V3 LoRA'):
+                trainer._validate_frozen_v3_checkpoint_scope()
+
+    def test_a2_accepts_diffusion_only_v3_checkpoint(self):
+        from safetensors.torch import save_file
+
+        trainer = self._trainer('a2')
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, 'diffusion.safetensors')
+            save_file({
+                'lora_unet$$layers$$0.lora_down.weight': torch.ones(1, 1),
+                'lora_unet$$layers$$0.lora_up.weight': torch.ones(1, 1),
+            }, path)
+            trainer.three_phase_trigger_training.phase_runtime.objective = {
+                'pipeline': 'ideogram4_v3_activator',
+                'v3_weights_path': path,
+                'diagnostics': {'require_diffusion_only_v3': True},
+            }
+            trainer._validate_frozen_v3_checkpoint_scope()
 
     def test_v3_runtime_diagnostics_persist_ordered_events(self):
         trainer = self._trainer('a1')

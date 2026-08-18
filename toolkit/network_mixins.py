@@ -784,7 +784,15 @@ class ToolkitNetworkMixin:
         for key in to_delete:
             del load_sd[key]
 
-        print(f"Missing keys: {to_delete}")
+        if to_delete:
+            preview = to_delete[:8]
+            suffix = f" ... (+{len(to_delete) - len(preview)} more)" if len(to_delete) > len(preview) else ""
+            print(
+                f"Ignored {len(to_delete)} checkpoint key(s) not present in this network: "
+                f"{preview}{suffix}"
+            )
+        else:
+            print("Ignored 0 checkpoint keys")
         if len(to_delete) > 0 and self.is_v1 and not force_weight_mapping and not (
                 len(to_delete) == 1 and 'emb_params' in to_delete):
             print(" Attempting to load with forced keymap")
