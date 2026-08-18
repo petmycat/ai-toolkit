@@ -161,6 +161,12 @@ class Ideogram4V3ActivatorStageProcess:
                     "prototype_weight": 0.1,
                     "disturbance_max_beta": 1.0,
                     "disturbance_weight": 0.1,
+                    "diagnostics": {
+                        "enabled": bool(self.pipeline.v3_config.smoke_test),
+                        "filename": "runtime_diagnostics.jsonl",
+                        "console": True,
+                        "fsync": True,
+                    },
                 },
             },
         }

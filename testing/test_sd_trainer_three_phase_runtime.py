@@ -23,6 +23,7 @@ def _load_runtime_methods():
         'hook_add_extra_train_params', '_activator_mode', '_write_trigger_binding_metrics',
         '_phase_caption_source_weights', '_prompt_tap_batch', '_check_first_trigger_gradient', '_v8_masked_delta_metrics', '_v8_prompt_delta_norms',
         '_calculate_trigger_binding_loss', '_calculate_ideogram4_v3_activator_loss',
+        '_v3_diagnostics_config', '_v3_diagnostic_event',
         '_v3_segmented_smoothstep_weight', '_v3_schedule_weights',
         '_v3_probe_target_mse', '_evaluate_ideogram4_v3_fixed_probe',
         '_install_trigger_binding_prompt_encoder', 'encode_static_prompt',
@@ -53,6 +54,9 @@ def _load_runtime_methods():
         'importlib': importlib,
         'inspect': inspect,
         'os': os,
+        'json': __import__('json'),
+        'time': __import__('time'),
+        'print_acc': lambda *_args, **_kwargs: None,
         'MethodType': MethodType,
         'Mapping': dict,
         'torch': torch,
@@ -160,8 +164,10 @@ class ThreePhaseRuntimeTest(unittest.TestCase):
             phase_a1=phase_config,
             phase_b=phase_config,
             phase_a2=phase_config,
-            phase_runtime=SimpleNamespace(caption_sources={}),
+            phase_runtime=SimpleNamespace(caption_sources={}, objective={}),
+            run_root=None,
         )
+        trainer._v3_diagnostic_sequence = 0
         return trainer
 
     def test_end_step_hook_runs_validation_after_completed_update_increment(self):
@@ -229,6 +235,36 @@ class ThreePhaseRuntimeTest(unittest.TestCase):
         self.assertTrue(all(not parameter.requires_grad for parameter in trainer.network.parameters()))
         self.assertTrue(all(not parameter.requires_grad for parameter in trainer.text_activator.embedding.parameters()))
         self.assertTrue(all(not parameter.requires_grad for parameter in trainer.text_activator.tap_adapters.parameters()))
+
+    def test_v3_runtime_diagnostics_persist_ordered_events(self):
+        trainer = self._trainer('a1')
+        trainer.step_num = 2
+        trainer.device_torch = torch.device('cpu')
+        trainer._v3_diagnostic_sequence = 0
+        with tempfile.TemporaryDirectory() as root:
+            trainer.save_root = root
+            trainer.three_phase_trigger_training.run_root = root
+            trainer.three_phase_trigger_training.phase_runtime.objective = {
+                'pipeline': 'ideogram4_v3_activator',
+                'name': 'semantic_activator',
+                'diagnostics': {
+                    'enabled': True,
+                    'filename': 'runtime_diagnostics.jsonl',
+                    'console': False,
+                    'fsync': True,
+                },
+            }
+            trainer._v3_diagnostic_event('diffusion_forward_start', label='helper:one')
+            trainer._v3_diagnostic_event('diffusion_forward_end', label='helper:one')
+            path = os.path.join(root, 'phase_a1', 'runtime_diagnostics.jsonl')
+            with open(path, 'r', encoding='utf-8') as handle:
+                records = [__import__('json').loads(line) for line in handle if line.strip()]
+        self.assertEqual([record['sequence'] for record in records], [1, 2])
+        self.assertEqual([record['event'] for record in records], [
+            'diffusion_forward_start', 'diffusion_forward_end'
+        ])
+        self.assertEqual(records[0]['step_index'], 2)
+        self.assertEqual(records[0]['label'], 'helper:one')
 
     def test_v3_a1_detached_teacher_predictions_run_without_autograd(self):
         from toolkit import trigger_binding_losses

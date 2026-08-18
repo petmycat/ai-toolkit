@@ -4,6 +4,7 @@ import inspect
 import os
 import random
 import json
+import time
 from collections import OrderedDict
 from types import MethodType
 from typing import Union, Literal, List, Optional, Mapping
@@ -146,6 +147,7 @@ class SDTrainer(BaseSDTrainProcess):
         self._semantic_scaffold_probe_case_by_id = {}
         self._semantic_scaffold_helper_weights = {}
         self._semantic_scaffold_calibration_complete = False
+        self._v3_diagnostic_sequence = 0
 
         self.dfe: Optional[DiffusionFeatureExtractor] = None
         self.unconditional_embeds = None
@@ -2473,8 +2475,13 @@ class SDTrainer(BaseSDTrainProcess):
         pass
 
     def end_step_hook(self):
+        is_v3_activator = self._phase_runtime_objective().get('pipeline') == 'ideogram4_v3_activator'
+        if is_v3_activator:
+            self._v3_diagnostic_event('end_step_hook_start')
         super().end_step_hook()
         self._maybe_run_v8_fixed_validation()
+        if is_v3_activator:
+            self._v3_diagnostic_event('end_step_hook_end')
 
     def predict_noise(
         self,
@@ -2709,6 +2716,53 @@ class SDTrainer(BaseSDTrainProcess):
         )
         self._trigger_gradient_reachability_checked = True
 
+    def _v3_diagnostics_config(self):
+        objective = self._phase_runtime_objective()
+        config = objective.get('diagnostics', {})
+        return config if isinstance(config, dict) else {}
+
+    def _v3_diagnostic_event(self, event, **details):
+        config = self._v3_diagnostics_config()
+        if not config.get('enabled', False):
+            return
+        self._v3_diagnostic_sequence += 1
+        record = {
+            'schema': 'ai-toolkit.ideogram4-v3-runtime-diagnostic',
+            'schema_version': 1,
+            'sequence': self._v3_diagnostic_sequence,
+            'wall_time': time.time(),
+            'monotonic_time': time.monotonic(),
+            'stage': self._phase_runtime_objective().get('name'),
+            'runtime_phase': self.runtime_phase,
+            'step_index': int(self.step_num),
+            'completed_updates_before_step': int(self.step_num),
+            'event': str(event),
+            **details,
+        }
+        if torch.cuda.is_available():
+            device = self.device_torch
+            record['cuda'] = {
+                'allocated_bytes': int(torch.cuda.memory_allocated(device)),
+                'reserved_bytes': int(torch.cuda.memory_reserved(device)),
+                'max_allocated_bytes': int(torch.cuda.max_memory_allocated(device)),
+            }
+        output_root = os.path.join(
+            self.three_phase_trigger_training.run_root or self.save_root,
+            f'phase_{self.runtime_phase}',
+        )
+        os.makedirs(output_root, exist_ok=True)
+        filename = str(config.get('filename', 'runtime_diagnostics.jsonl'))
+        path = os.path.join(output_root, filename)
+        with open(path, 'a', encoding='utf-8') as handle:
+            handle.write(json.dumps(record, sort_keys=True) + '\n')
+            handle.flush()
+            if config.get('fsync', False):
+                os.fsync(handle.fileno())
+        if config.get('console', True):
+            label = details.get('label') or details.get('mode') or ''
+            suffix = f' ({label})' if label else ''
+            print_acc(f"[V3 diagnostic] step={self.step_num} {event}{suffix}")
+
     @staticmethod
     def _v3_segmented_smoothstep_weight(step, *, start, middle, end, first_end=40, second_end=80):
         step = max(0, int(step))
@@ -2754,10 +2808,45 @@ class SDTrainer(BaseSDTrainProcess):
         ]
         target = shared_loss_target(self, noise, batch, timesteps).detach()
 
-        def predict(prompt_batch, mode, *, detach=False):
+        self._v3_diagnostic_event(
+            'loss_start',
+            batch_size=len(batch.file_items),
+            latent_shape=list(noisy_latents.shape),
+            timestep_values=[int(value) for value in timesteps.detach().cpu().flatten().tolist()],
+        )
+        prediction_index = 0
+
+        def predict(prompt_batch, mode, *, detach=False, label=None):
+            nonlocal prediction_index
+            prediction_index += 1
+            diagnostic_label = label or mode
+            started = time.monotonic()
+            self._v3_diagnostic_event(
+                'prompt_encode_start',
+                prediction_index=prediction_index,
+                mode=mode,
+                label=diagnostic_label,
+                detach=detach,
+                prompt_count=len(prompt_batch),
+            )
             grad_context = torch.no_grad() if detach else contextlib.nullcontext()
             with grad_context, self._activator_mode(mode):
                 embeds = self.sd.get_prompt_embeds(prompt_batch)
+                self._v3_diagnostic_event(
+                    'prompt_encode_end',
+                    prediction_index=prediction_index,
+                    mode=mode,
+                    label=diagnostic_label,
+                    elapsed_seconds=time.monotonic() - started,
+                )
+                prediction_started = time.monotonic()
+                self._v3_diagnostic_event(
+                    'diffusion_forward_start',
+                    prediction_index=prediction_index,
+                    mode=mode,
+                    label=diagnostic_label,
+                    detach=detach,
+                )
                 prediction = self.predict_noise(
                     noisy_latents=noisy_latents,
                     timesteps=timesteps,
@@ -2767,9 +2856,16 @@ class SDTrainer(BaseSDTrainProcess):
                     is_primary_pred=not detach,
                     **pred_kwargs,
                 )
+                self._v3_diagnostic_event(
+                    'diffusion_forward_end',
+                    prediction_index=prediction_index,
+                    mode=mode,
+                    label=diagnostic_label,
+                    elapsed_seconds=time.monotonic() - prediction_started,
+                )
             return prediction.detach() if detach else prediction
 
-        semantic_prediction = predict(prompts, 'semantic_only')
+        semantic_prediction = predict(prompts, 'semantic_only', label='semantic')
         semantic_mse = loss_module.per_item_diffusion_mse(semantic_prediction, target)
         if self.runtime_phase == 'a2':
             total = semantic_mse.mean()
@@ -2780,7 +2876,7 @@ class SDTrainer(BaseSDTrainProcess):
                 'v3/a2/helper_passes': 0.0,
             }
         else:
-            bypass_prediction = predict(prompts, 'activator_bypass', detach=True)
+            bypass_prediction = predict(prompts, 'activator_bypass', detach=True, label='bypass')
             bypass_mse = loss_module.per_item_diffusion_mse(bypass_prediction, target)
             semantic_effect = semantic_prediction - bypass_prediction
             helper_schedule = dict(objective.get('helper_schedule', {}))
@@ -2791,7 +2887,12 @@ class SDTrainer(BaseSDTrainProcess):
             helper_losses = []
             for helper in helpers:
                 helper_prompts = [prompt.replace(placeholder, helper) for prompt in prompts]
-                helper_prediction = predict(helper_prompts, 'stock_literal', detach=True)
+                helper_prediction = predict(
+                    helper_prompts,
+                    'stock_literal',
+                    detach=True,
+                    label=f'helper:{helper}',
+                )
                 helper_effect = helper_prediction - bypass_prediction
                 helper_losses.append(loss_module.effect_direction_cosine(
                     semantic_effect,
@@ -2847,6 +2948,11 @@ class SDTrainer(BaseSDTrainProcess):
         # would execute a complete checkpointed Ideogram backward, retain that
         # graph, and then execute the same backward again. On the first A1 update
         # this can look like a permanent hang before the progress bar advances.
+        self._v3_diagnostic_event(
+            'loss_end',
+            prediction_count=prediction_index,
+            loss=float(total.detach().item()),
+        )
         self._trigger_binding_last_metrics = metrics
         for key, value in metrics.items():
             self.additional_logs[f'phase/{self.runtime_phase}/{key}'] = value
@@ -5376,6 +5482,8 @@ class SDTrainer(BaseSDTrainProcess):
                     loss = torch.zeros_like(loss).requires_grad_(True)
 
                 with self.timer('backward'):
+                    if self.ideogram4_v3_activator_enabled:
+                        self._v3_diagnostic_event('backward_start', loss=float(loss.detach().item()))
                     # todo we have multiplier seperated. works for now as res are not in same batch, but need to change
                     loss = loss * loss_multiplier.mean()
                     # IMPORTANT if gradient checkpointing do not leave with network when doing backward
@@ -5388,6 +5496,8 @@ class SDTrainer(BaseSDTrainProcess):
                     # loss.backward()
                     # else:
                     self.accelerator.backward(loss)
+                    if self.ideogram4_v3_activator_enabled:
+                        self._v3_diagnostic_event('backward_end')
 
         return loss.detach()
         # flush()
@@ -5526,6 +5636,8 @@ class SDTrainer(BaseSDTrainProcess):
                     self.accelerator.clip_grad_norm_(self.params, self.train_config.max_grad_norm)
             # only step if we are not accumulating
             with self.timer('optimizer_step'):
+                if self.ideogram4_v3_activator_enabled:
+                    self._v3_diagnostic_event('optimizer_step_start')
                 if getattr(self, '_trigger_binding_metrics_pending_step', None) == self.step_num:
                     self._write_trigger_binding_metrics(
                         getattr(self, '_trigger_binding_metrics_pending_loss', None)
@@ -5535,6 +5647,8 @@ class SDTrainer(BaseSDTrainProcess):
                 self.optimizer.zero_grad(set_to_none=True)
                 if self.adapter and isinstance(self.adapter, CustomAdapter):
                     self.adapter.post_weight_update()
+                if self.ideogram4_v3_activator_enabled:
+                    self._v3_diagnostic_event('optimizer_step_end')
         if self.ema is not None:
             with self.timer('ema_update'):
                 self.ema.update()
