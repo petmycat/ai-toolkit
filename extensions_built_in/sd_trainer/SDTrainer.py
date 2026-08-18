@@ -4445,9 +4445,15 @@ class SDTrainer(BaseSDTrainProcess):
             )
 
         network_was_active = None if self.network is None else bool(self.network.is_active)
+        network_previous_multiplier = None if self.network is None else self.network.multiplier
         try:
             if self.network is not None:
                 self.network.is_active = True
+                # Training leaves a per-item multiplier list sized for the last
+                # dataset batch. Fixed probes are batch size 1; reusing a length-2
+                # multiplier makes LoRA repeat_interleave(1 // 2) produce an empty
+                # batch, which later surfaces as an image-token reshape of size 0.
+                self.network.multiplier = 1.0
             with torch.no_grad():
                 prediction_a = predict_bound(
                     'activator_bypass' if self.runtime_phase == 'a1' else 'semantic_only',
@@ -4464,6 +4470,7 @@ class SDTrainer(BaseSDTrainProcess):
                 }
         finally:
             if self.network is not None:
+                self.network.multiplier = network_previous_multiplier
                 self.network.is_active = network_was_active
 
         if self.runtime_phase == 'a2':

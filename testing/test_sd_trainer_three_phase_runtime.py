@@ -475,6 +475,12 @@ class ThreePhaseRuntimeTest(unittest.TestCase):
         }
         trainer.text_activator.original_literal_text = 'old literal words'
         trainer.network.is_active = False
+        trainer.network._multiplier = [0.8, 1.2]
+        trainer.network.torch_multiplier = torch.tensor([0.8, 1.2])
+        type(trainer.network).multiplier = property(
+            lambda network: network._multiplier,
+            lambda network, value: setattr(network, '_multiplier', value),
+        )
         prepared = {
             'latent': torch.zeros(1, 2),
             'noise': torch.ones(1, 2),
@@ -501,7 +507,7 @@ class ThreePhaseRuntimeTest(unittest.TestCase):
 
         def predict_noise(**kwargs):
             label = kwargs['conditional_embeds'].label
-            calls.append((label, trainer.network.is_active))
+            calls.append((label, trainer.network.is_active, trainer.network.multiplier))
             if label[0] == 'bound' and not trainer.network.is_active:
                 return torch.zeros(1, 2)
             if label[0] == 'text' and 'old literal words' in label[2]:
@@ -520,7 +526,9 @@ class ThreePhaseRuntimeTest(unittest.TestCase):
         result = trainer._evaluate_ideogram4_v3_fixed_probe(case, 'heldout', 0)
 
         self.assertFalse(trainer.network.is_active)
+        self.assertEqual(trainer.network.multiplier, [0.8, 1.2])
         self.assertEqual(len(calls), 5)
+        self.assertTrue(all(call[2] == 1.0 for call in calls))
         self.assertEqual(calls[0][0][:2], ('bound', 'semantic_only'))
         self.assertFalse(calls[0][1])
         self.assertEqual(calls[1][0], ('text', 'stock_literal', 'render old literal words object'))
