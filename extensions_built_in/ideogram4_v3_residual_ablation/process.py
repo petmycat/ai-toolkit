@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
@@ -48,19 +49,46 @@ class Ideogram4V3ResidualAblationProcess(BaseExtensionProcess):
         self.sd = None
         self.network = None
         self.text_activator = None
+        self._run_started_at = None
+        self._calibrated_embed_cache = {}
+        self._stock_embed_cache = {}
+        self._latent_cache = {}
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        seconds = max(0, int(seconds))
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours:
+            return f"{hours}h {minutes:02d}m {seconds:02d}s"
+        if minutes:
+            return f"{minutes}m {seconds:02d}s"
+        return f"{seconds}s"
+
+    def _progress(self, message: str) -> None:
+        from toolkit.print import print_acc
+
+        elapsed = 0.0 if self._run_started_at is None else time.monotonic() - self._run_started_at
+        print_acc(f"[V3 residual ablation +{self._format_duration(elapsed)}] {message}")
 
     def run(self):
         super().run()
         import torch
 
+        self._run_started_at = time.monotonic()
+        self._progress("resolving A2 contract and artifact hashes")
         self._resolve_inputs()
         self.output_root.mkdir(parents=True, exist_ok=True)
+        self._progress("loading Ideogram4 model")
         self.sd = self._load_model()
+        self._progress("loading frozen V3 LoRA")
         self.network = self._load_lora(torch)
+        self._progress("installing calibrated A2 activator")
         self.text_activator = self._build_text_activator(torch)
         self._load_and_install_activator()
         self._freeze()
         self._disable_checkpointing()
+        self._progress("model, V3 LoRA, and activator ready")
 
         registry = build_module_registry(self.network.get_all_modules())
         registry_summary = validate_complete_partition(registry)
@@ -71,6 +99,13 @@ class Ideogram4V3ResidualAblationProcess(BaseExtensionProcess):
         probes, probe_manifest = self._build_probes()
         probe_path = self.output_root / self.ablation.get("probe_manifest_filename", "residual_ablation_probe_manifest.json")
         atomic_write_json(probe_path, probe_manifest)
+        self._progress(
+            f"prepared {len(probes)} probe cases across {len(group_to_modules)} groups; "
+            f"optimized workload per probe: {len(self.helper_phrases) + 2} references, "
+            f"1 shared center/gradient pass, at most "
+            f"{2 * int(self.ablation.get('finite_difference_top_k_groups', 12))} core side-scale passes "
+            f"plus family coverage"
+        )
 
         from toolkit.trigger_binding_artifacts import fingerprint
 
@@ -85,7 +120,8 @@ class Ideogram4V3ResidualAblationProcess(BaseExtensionProcess):
             "registry": registry,
             "helpers": self.helper_phrases,
             "candidate_scales": self._candidate_scales(),
-            "schema_version": 3,
+            "finite_difference_top_k_groups": int(self.ablation.get("finite_difference_top_k_groups", 12)),
+            "schema_version": 4,
         })
         records_path = self.output_root / self.ablation.get("records_filename", "residual_ablation_records.jsonl")
         existing = load_jsonl(records_path) if self.ablation.get("resume", True) else []
@@ -105,23 +141,52 @@ class Ideogram4V3ResidualAblationProcess(BaseExtensionProcess):
             sketch_size=int(self.ablation.get("residual_sketch_size", 256)),
         )
         self.network.is_active = True
-        for case, item in probes:
+        completed_probe_count = sum(
+            all((run_id, case.probe_case_id, group) in completed for group in group_to_modules)
+            for case, _ in probes
+        )
+        probe_durations = []
+        for case_index, (case, item) in enumerate(probes, 1):
             pending = [group for group in group_to_modules if (run_id, case.probe_case_id, group) not in completed]
             if not pending:
+                self._progress(f"probe {case_index}/{len(probes)} already complete; resuming past it")
                 continue
+            probe_started = time.monotonic()
+            self._progress(
+                f"probe {case_index}/{len(probes)} start: split={case.split}, timestep={case.timestep}, "
+                f"pending_groups={len(pending)}"
+            )
             prepared = self._prepare_case(case, item, torch)
+            embed_key = str(case.item_id)
+            if embed_key not in self._calibrated_embed_cache:
+                with torch.no_grad():
+                    self._calibrated_embed_cache[embed_key] = self._calibrated_prompt_embeds(prepared["prompt_template"])
+                self._progress(f"probe {case_index}/{len(probes)} cached calibrated text embedding")
+            else:
+                self._progress(f"probe {case_index}/{len(probes)} reused calibrated text embedding")
+            prepared["calibrated_embeds"] = self._calibrated_embed_cache[embed_key]
             helper_basis, helper_norms, helper_spectra, reference_summary = self._capture_reference_responses(
-                prepared, runtime, torch
+                prepared, runtime, torch, case_index=case_index, case_count=len(probes)
             )
             runtime.set_projection_basis(helper_basis)
             case_records = self._evaluate_case(
                 run_id, case, prepared, pending, registry, runtime,
                 helper_norms, helper_spectra, reference_summary, torch,
+                case_index=case_index, case_count=len(probes),
             )
             records.extend(case_records)
             records = annotate_viability_metrics(records)
             atomic_write_jsonl(records_path, sorted(records, key=resume_key))
             completed.update(resume_key(record) for record in case_records)
+            completed_probe_count += 1
+            duration = time.monotonic() - probe_started
+            probe_durations.append(duration)
+            remaining = len(probes) - completed_probe_count
+            eta = (sum(probe_durations) / len(probe_durations)) * remaining
+            self._progress(
+                f"probe {case_index}/{len(probes)} complete in {self._format_duration(duration)}; "
+                f"records={len(records)}/{len(probes) * len(group_to_modules)}, ETA={self._format_duration(eta)}"
+            )
 
         expected = len(probes) * len(group_to_modules)
         if len(records) != expected:
@@ -142,7 +207,7 @@ class Ideogram4V3ResidualAblationProcess(BaseExtensionProcess):
         }
         atomic_write_json(manifest_path, {
             "schema": "ai-toolkit.ideogram4-v3-residual-ablation",
-            "schema_version": 3,
+            "schema_version": 4,
             "status": "completed",
             "run_id": run_id,
             "diagnostics_only": True,
@@ -156,6 +221,16 @@ class Ideogram4V3ResidualAblationProcess(BaseExtensionProcess):
                 "stored_in": "records.helper_response_spectrum",
             },
             "candidate_scales": self._candidate_scales(),
+            "evaluation_strategy": {
+                "shared_center_pass_per_probe": True,
+                "joint_gate_gradient_pass_per_probe": True,
+                "finite_difference_selection": "top_absolute_joint_gradient_plus_family_coverage",
+                "finite_difference_top_k_groups": int(self.ablation.get("finite_difference_top_k_groups", 12)),
+                "side_scale_passes_per_selected_group": 2,
+                "calibrated_text_embeddings_cached_per_item": True,
+                "stock_text_embeddings_cached_per_prompt": True,
+                "latents_cached_per_item": True,
+            },
             "probe_case_count": len(probes),
             "group_count": len(group_to_modules),
             "module_count": len(registry),
@@ -337,7 +412,9 @@ class Ideogram4V3ResidualAblationProcess(BaseExtensionProcess):
         installer = getattr(self.sd, "install_text_activator", None) or getattr(self.sd, "set_text_activator", None)
         if not callable(installer):
             raise RuntimeError("Ideogram4 model does not expose text activator installation")
-        installer(self.text_activator, runtime_mode="full")
+        # A1/A2 deliberately have no tap adapters. semantic_only is the complete
+        # calibrated activator path for this topology: virtual embedding + TE LoRA.
+        installer(self.text_activator, runtime_mode="semantic_only")
 
     def _freeze(self):
         for module in (self.sd.model, self.sd.text_encoder, self.sd.vae, self.network, self.text_activator):
@@ -393,11 +470,17 @@ class Ideogram4V3ResidualAblationProcess(BaseExtensionProcess):
         from PIL import Image
         from torchvision import transforms
 
-        with Image.open(item["image_path"]) as image:
-            image = image.convert("RGB")
-            width, height = max(16, image.width // 16 * 16), max(16, image.height // 16 * 16)
-            tensor = transforms.ToTensor()(image.resize((width, height), Image.Resampling.BICUBIC)) * 2.0 - 1.0
-        latent = self.sd.encode_images([tensor], device=self.sd.device_torch, dtype=self.sd.torch_dtype)
+        item_id = str(case.item_id)
+        latent = self._latent_cache.get(item_id)
+        if latent is None:
+            with Image.open(item["image_path"]) as image:
+                image = image.convert("RGB")
+                width, height = max(16, image.width // 16 * 16), max(16, image.height // 16 * 16)
+                tensor = transforms.ToTensor()(image.resize((width, height), Image.Resampling.BICUBIC)) * 2.0 - 1.0
+            latent = self.sd.encode_images([tensor], device=self.sd.device_torch, dtype=self.sd.torch_dtype)
+            self._latent_cache[item_id] = latent
+        else:
+            latent = latent.to(device=self.sd.device_torch, dtype=self.sd.torch_dtype)
         generator = torch.Generator(device=latent.device).manual_seed(int(case.noise_seed))
         noise = torch.randn(latent.shape, generator=generator, device=latent.device, dtype=latent.dtype)
         schedule = max(0.0, min(1.0, float(case.timestep) / 1000.0))
@@ -418,7 +501,7 @@ class Ideogram4V3ResidualAblationProcess(BaseExtensionProcess):
             self.sd.text_encoder, batch.input_ids, batch.attention_mask,
             (batch.attention_mask.cumsum(dim=-1) - 1).clamp(min=0).long(),
             trigger_mask=batch.trigger_mask, token_indices=batch.token_indices,
-            text_activator=self.text_activator, runtime_mode="full", runtime_metadata=batch.runtime_metadata(),
+            text_activator=self.text_activator, runtime_mode="semantic_only", runtime_metadata=batch.runtime_metadata(),
         )
         valid = int(batch.attention_mask[0].sum().item())
         return AdvancedPromptEmbeds(
@@ -428,9 +511,14 @@ class Ideogram4V3ResidualAblationProcess(BaseExtensionProcess):
 
     def _predict(self, prepared, prompt, runtime_mode):
         if runtime_mode == "full":
-            embeds = self._calibrated_prompt_embeds(prompt)
+            embeds = prepared.get("calibrated_embeds")
+            if embeds is None:
+                embeds = self._calibrated_prompt_embeds(prompt)
         else:
-            embeds = self.sd.get_prompt_embeds([prompt], runtime_mode="stock_literal")
+            embeds = self._stock_embed_cache.get(prompt)
+            if embeds is None:
+                embeds = self.sd.get_prompt_embeds([prompt], runtime_mode="stock_literal")
+                self._stock_embed_cache[prompt] = embeds
         batch = SimpleNamespace(latents=prepared["latent"], file_items=[], audio_pred_slot=None)
         return self.sd.predict_noise(
             latents=prepared["noisy_latents"], timestep=prepared["timesteps"],
@@ -439,26 +527,40 @@ class Ideogram4V3ResidualAblationProcess(BaseExtensionProcess):
             bypass_guidance_embedding=False, batch=batch,
         )
 
-    def _capture_reference_responses(self, prepared, runtime, torch):
+    def _capture_reference_responses(self, prepared, runtime, torch, *, case_index, case_count):
         captured = {}
         summaries = {}
+        reference_count = len(self.helper_phrases) + 2
+        reference_index = 0
         with residual_runtime_context(self.network, runtime):
             runtime.set_gates({})
             for helper in self.helper_phrases:
+                reference_index += 1
+                reference_started = time.monotonic()
                 runtime.reset()
                 prompt = prepared["prompt_template"].replace(self.placeholder, helper)
                 with torch.no_grad():
                     prediction = self._predict(prepared, prompt, "stock_literal")
+                self._progress(
+                    f"probe {case_index}/{case_count} reference {reference_index}/{reference_count} "
+                    f"helper={helper!r} finished in {self._format_duration(time.monotonic() - reference_started)}"
+                )
                 captured[helper] = runtime.captured_group_vectors()
                 summaries[f"helper:{helper}"] = {
                     "loss": float(torch.mean((prediction.float() - prepared["target"].float()).square()).item()),
                     "groups": runtime.summary()["groups"],
                 }
             for name, phrase in (("neutral", self.neutral_phrase), ("far", self.far_phrase)):
+                reference_index += 1
+                reference_started = time.monotonic()
                 runtime.reset()
                 prompt = prepared["prompt_template"].replace(self.placeholder, phrase)
                 with torch.no_grad():
                     prediction = self._predict(prepared, prompt, "stock_literal")
+                self._progress(
+                    f"probe {case_index}/{case_count} reference {reference_index}/{reference_count} "
+                    f"{name} finished in {self._format_duration(time.monotonic() - reference_started)}"
+                )
                 summaries[name] = {
                     "phrase": phrase,
                     "loss": float(torch.mean((prediction.float() - prepared["target"].float()).square()).item()),
@@ -470,31 +572,84 @@ class Ideogram4V3ResidualAblationProcess(BaseExtensionProcess):
     def _evaluate_case(
         self, run_id, case, prepared, pending, registry, runtime,
         helper_norms, helper_spectra, references, torch,
+        *, case_index, case_count,
     ):
         by_group = {row["group_id"]: row for row in registry}
+        scales = self._candidate_scales()
+        side_scales = [scale for scale in scales if scale != 1.0]
+        gates = {
+            group: torch.tensor(1.0, device=prepared["target"].device, dtype=torch.float32, requires_grad=True)
+            for group in pending
+        }
+        self._progress(
+            f"probe {case_index}/{case_count} shared center pass + joint gradients for {len(pending)} groups"
+        )
+        center_started = time.monotonic()
+        with residual_runtime_context(self.network, runtime):
+            runtime.reset()
+            runtime.set_gates(gates)
+            prediction = self._predict(prepared, prepared["prompt_template"], "full")
+            loss = torch.mean((prediction.float() - prepared["target"].float()).square())
+            center_loss = float(loss.detach().item())
+            gradients = gate_gradients(loss, gates)
+            center_summary = runtime.summary()
+            center_vectors = runtime.captured_group_vectors()
+        self._progress(
+            f"probe {case_index}/{case_count} shared center/gradient pass finished in "
+            f"{self._format_duration(time.monotonic() - center_started)}"
+        )
+
+        finite_difference_top_k = int(self.ablation.get("finite_difference_top_k_groups", 12))
+        if finite_difference_top_k <= 0:
+            raise ValueError("finite_difference_top_k_groups must be positive")
+        ranked = sorted(
+            pending,
+            key=lambda group: abs(gradients[group]) if gradients.get(group) is not None else -1.0,
+            reverse=True,
+        )
+        selected = set(ranked[:finite_difference_top_k])
+        for kind in ("attention", "mlp", "adaln", "other"):
+            candidates = [group for group in ranked if by_group[group]["kind"] == kind]
+            if candidates:
+                selected.add(candidates[0])
+        self._progress(
+            f"probe {case_index}/{case_count} selected {len(selected)}/{len(pending)} groups for finite differences; "
+            "all groups retain exact joint dL/dg"
+        )
+
         output = []
-        for group in pending:
-            losses = {}
-            with residual_runtime_context(self.network, runtime):
-                for scale in self._candidate_scales():
-                    runtime.reset()
-                    runtime.set_gates({group: scale})
-                    with torch.no_grad():
-                        prediction = self._predict(prepared, prepared["prompt_template"], "full")
-                    losses[scale] = float(torch.mean((prediction.float() - prepared["target"].float()).square()).item())
-                runtime.reset()
-                gate = torch.tensor(1.0, device=prepared["target"].device, dtype=torch.float32, requires_grad=True)
-                runtime.set_gates({group: gate})
-                prediction = self._predict(prepared, prepared["prompt_template"], "full")
-                loss = torch.mean((prediction.float() - prepared["target"].float()).square())
-                gradient = gate_gradients(loss, {group: gate})[group]
-            metrics = finite_difference_metrics(losses)
-            metrics["dL_dg"] = gradient
-            summary = runtime.summary()
-            group_stats = summary.get("groups", {}).get(group, {})
+        group_durations = []
+        selected_completed = 0
+        for group_index, group in enumerate(pending, 1):
+            group_started = time.monotonic()
+            losses = {1.0: center_loss}
+            if group in selected:
+                with residual_runtime_context(self.network, runtime):
+                    for scale in side_scales:
+                        runtime.reset()
+                        runtime.set_gates({group: scale})
+                        with torch.no_grad():
+                            prediction = self._predict(prepared, prepared["prompt_template"], "full")
+                        losses[scale] = float(torch.mean((prediction.float() - prepared["target"].float()).square()).item())
+                metrics = finite_difference_metrics(losses)
+                metrics["fd_result"] = "prefer_" + str(metrics["best_scale"])
+                selected_completed += 1
+            else:
+                metrics = {
+                    "left_slope": None,
+                    "right_slope": None,
+                    "central_secant": None,
+                    "curvature": None,
+                    "best_scale": None,
+                    "best_loss": center_loss,
+                    "center_loss": center_loss,
+                    "fd_result": "not_selected_joint_gradient_only",
+                }
+            metrics["dL_dg"] = gradients[group]
+            group_stats = center_summary.get("groups", {}).get(group, {})
             residual_rms = group_stats.get("rms")
             helper_norm = float(helper_norms.get(group, 0.0))
-            activator_vector = runtime.captured_group_vectors().get(group)
+            activator_vector = center_vectors.get(group)
             activator_norm = float(activator_vector.norm().item()) if activator_vector is not None else 0.0
             helper_spectrum = helper_spectra.get(group, {})
             metrics.update({
@@ -503,14 +658,14 @@ class Ideogram4V3ResidualAblationProcess(BaseExtensionProcess):
                 "residual_nonfinite_count": group_stats.get("nonfinite_count"),
                 "residual_call_count": group_stats.get("call_count"),
                 "normalized_rms": residual_rms / (helper_norm / (runtime.sketch_size ** 0.5) + 1.0e-12) if residual_rms is not None else None,
-                "projection_p_j": summary.get("helper_subspace_projection", {}).get(group, {}).get("energy_fraction"),
+                "projection_p_j": center_summary.get("helper_subspace_projection", {}).get(group, {}).get("energy_fraction"),
                 "magnitude_ratio_m_j": activator_norm / (helper_norm + 1.0e-12),
                 "helper_mean_norm": helper_norm,
                 "helper_top_energy_fraction": helper_spectrum.get("top_energy_fraction"),
                 "helper_effective_rank": helper_spectrum.get("effective_rank"),
                 "helper_numerical_rank": helper_spectrum.get("numerical_rank"),
                 "helper_count": helper_spectrum.get("helper_count"),
-                "fd_result": "prefer_" + str(metrics["best_scale"]),
+                "finite_difference_selected": group in selected,
             })
             row = by_group[group]
             output.append({
@@ -522,6 +677,15 @@ class Ideogram4V3ResidualAblationProcess(BaseExtensionProcess):
                 "helper_response_spectrum": helper_spectrum,
                 "metrics": metrics,
             })
+            duration = time.monotonic() - group_started
+            if group in selected:
+                group_durations.append(duration)
+                remaining_selected = len(selected) - selected_completed
+                eta = (sum(group_durations) / len(group_durations)) * remaining_selected
+                self._progress(
+                    f"probe {case_index}/{case_count} finite difference {selected_completed}/{len(selected)} "
+                    f"{group} complete in {self._format_duration(duration)}; FD ETA={self._format_duration(eta)}"
+                )
         return output
 
     def _artifact_ref(self, path: Path) -> Dict[str, Any]:

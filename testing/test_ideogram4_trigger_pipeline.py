@@ -132,6 +132,34 @@ class Ideogram4TriggerPipelineTest(unittest.TestCase):
         self.assertTrue(torch.equal(features[0, 1, :2], torch.tensor([1.0, 1.0])))
         self.assertTrue(torch.equal(features[0, 2, :2], torch.tensor([2.0, 2.0])))
 
+    def test_semantic_only_uses_embedding_and_internal_path_without_taps(self):
+        class NoTapActivator(_FakeActivator):
+            def apply_tap(self, tap_layer, hidden_states, token_mask=None):
+                raise AssertionError(f"semantic_only unexpectedly invoked tap layer {tap_layer}")
+
+        text_encoder = _FakeTextEncoder()
+        activator = NoTapActivator()
+        token_ids = torch.tensor([[5, 99, 6]])
+        attention_mask = torch.ones_like(token_ids)
+        trigger_mask = torch.tensor([[0, 1, 0]], dtype=torch.bool)
+        token_indices = torch.tensor([[0, 0, 0]])
+        pos_2d = torch.arange(3).unsqueeze(0)
+
+        features = self.pipeline.get_qwen3_vl_features(
+            text_encoder,
+            token_ids,
+            attention_mask,
+            pos_2d,
+            trigger_mask=trigger_mask,
+            token_indices=token_indices,
+            text_activator=activator,
+            runtime_mode="semantic_only",
+        )
+
+        self.assertEqual(features.shape, (1, 3, 26))
+        self.assertIn("semantic_only", activator.runtime_modes)
+        self.assertTrue(torch.equal(features[0, 1, :2], torch.tensor([1.0, 1.0])))
+
     def test_gradient_checkpoint_recomputation_restores_branch_runtime_mode(self):
         text_encoder = _FakeTextEncoder()
         text_encoder.is_gradient_checkpointing = True
