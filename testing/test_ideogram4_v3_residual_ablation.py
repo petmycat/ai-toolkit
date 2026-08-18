@@ -46,6 +46,7 @@ from extensions_built_in.ideogram4_v3_residual_ablation.helpers import (
     classify_lora_module,
     finite_difference_metrics,
     gate_gradients,
+    helper_response_spectrum,
     orthonormal_basis,
     parse_activator_a2_contract,
     projection_metrics,
@@ -242,9 +243,16 @@ def test_helper_subspace_is_built_from_captured_runtime_responses():
     runtime.reset()
     runtime.apply(module, torch.tensor([0.0, 2.0]))
     poster = runtime.captured_group_vectors()
-    bases, mean_norms = build_helper_response_bases({"illustration": illustration, "poster": poster})
+    bases, mean_norms, spectra = build_helper_response_bases({"illustration": illustration, "poster": poster})
     assert bases[group].shape == (2, 2)
     assert mean_norms[group] == pytest.approx(1.5)
+    assert spectra[group]["top_energy_fraction"] == pytest.approx(0.8)
+    expected_effective_rank = torch.exp(
+        -(torch.tensor(0.8) * torch.log(torch.tensor(0.8)) + torch.tensor(0.2) * torch.log(torch.tensor(0.2)))
+    ).item()
+    assert spectra[group]["effective_rank"] == pytest.approx(expected_effective_rank)
+    assert spectra[group]["numerical_rank"] == 2
+    assert spectra[group]["energy_fractions"] == pytest.approx([0.8, 0.2])
 
     runtime.reset()
     runtime.set_projection_basis(bases)
@@ -255,6 +263,26 @@ def test_helper_subspace_is_built_from_captured_runtime_responses():
     basis = orthonormal_basis([torch.tensor([1.0, 0.0])])
     metrics = projection_metrics(torch.tensor([3.0, 4.0]), basis)
     assert metrics["energy_fraction"] == pytest.approx(9.0 / 25.0)
+
+
+def test_helper_response_spectrum_distinguishes_rank_one_and_diverse_banks():
+    rank_one = helper_response_spectrum([
+        torch.tensor([1.0, 0.0, 0.0]),
+        torch.tensor([2.0, 0.0, 0.0]),
+        torch.tensor([-3.0, 0.0, 0.0]),
+    ])
+    assert rank_one["top_energy_fraction"] == pytest.approx(1.0)
+    assert rank_one["effective_rank"] == pytest.approx(1.0)
+    assert rank_one["numerical_rank"] == 1
+
+    diverse = helper_response_spectrum([
+        torch.tensor([1.0, 0.0, 0.0]),
+        torch.tensor([0.0, 1.0, 0.0]),
+        torch.tensor([0.0, 0.0, 1.0]),
+    ])
+    assert diverse["top_energy_fraction"] == pytest.approx(1.0 / 3.0)
+    assert diverse["effective_rank"] == pytest.approx(3.0)
+    assert diverse["numerical_rank"] == 3
 
 
 def test_finite_differences_use_exact_candidate_scales():
@@ -278,12 +306,20 @@ def test_aggregation_and_report_include_required_viability_fields_without_68_gro
             "family": "attention",
             "block_index": 0,
             "reference_type": "calibrated_activator",
+            "helper_response_spectrum": {
+                "top_energy_fraction": 0.9,
+                "effective_rank": 1.4,
+                "numerical_rank": 2,
+            },
             "metrics": {
                 "dL_dg": gradient,
                 "residual_rms": 0.5,
                 "normalized_rms": 0.25,
                 "projection_p_j": 0.8,
                 "magnitude_ratio_m_j": 1.1,
+                "helper_top_energy_fraction": 0.9,
+                "helper_effective_rank": 1.4,
+                "helper_numerical_rank": 2,
                 "best_scale": 1.0,
                 "fd_result": "prefer_1.0",
             },
@@ -306,5 +342,8 @@ def test_aggregation_and_report_include_required_viability_fields_without_68_gro
             assert label in report
     assert "Projection `p_j`" in report
     assert "magnitude ratio `m_j`" in report
+    assert "Helper response spectrum" in report
+    assert "top-mode energy=0.900000" in report
+    assert "effective rank=1.4000" in report
     assert "candidate score" in report
     assert "不会启动 Phase C" in report

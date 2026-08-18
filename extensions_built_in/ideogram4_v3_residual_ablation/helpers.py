@@ -334,14 +334,62 @@ def pooled_residual_sketch(tensor: Any, width: int = 256):
     return torch.stack([flat[boundaries[index]:boundaries[index + 1]].mean() for index in range(width)])
 
 
+def helper_response_spectrum(
+    vectors: Sequence[Any],
+    *,
+    epsilon: float = 1.0e-12,
+) -> Dict[str, Any]:
+    import torch
+
+    flattened = [vector.detach().float().reshape(-1) for vector in vectors if vector is not None and vector.numel()]
+    if not flattened:
+        return {
+            "helper_count": 0,
+            "numerical_rank": 0,
+            "effective_rank": 0.0,
+            "top_energy_fraction": 0.0,
+            "singular_values": [],
+            "energy_fractions": [],
+        }
+    width = flattened[0].numel()
+    if any(vector.numel() != width for vector in flattened):
+        raise ValueError("helper response vectors must have matching dimensions")
+    matrix = torch.stack(flattened, dim=1)
+    singular_values = torch.linalg.svdvals(matrix)
+    energies = singular_values.square()
+    total_energy = float(energies.sum().item())
+    if total_energy <= epsilon:
+        fractions = torch.zeros_like(energies)
+        effective_rank = 0.0
+        top_fraction = 0.0
+        numerical_rank = 0
+    else:
+        fractions = energies / total_energy
+        positive = fractions > epsilon
+        entropy = -torch.sum(fractions[positive] * torch.log(fractions[positive]))
+        effective_rank = float(torch.exp(entropy).item())
+        top_fraction = float(fractions[0].item())
+        tolerance = max(matrix.shape) * torch.finfo(singular_values.dtype).eps * float(singular_values[0].item())
+        numerical_rank = int((singular_values > tolerance).sum().item())
+    return {
+        "helper_count": len(flattened),
+        "numerical_rank": numerical_rank,
+        "effective_rank": effective_rank,
+        "top_energy_fraction": top_fraction,
+        "singular_values": [float(value) for value in singular_values.tolist()],
+        "energy_fractions": [float(value) for value in fractions.tolist()],
+    }
+
+
 def build_helper_response_bases(
     captured_by_helper: Mapping[str, Mapping[str, Any]],
     *,
     epsilon: float = 1.0e-8,
-) -> Tuple[Dict[str, Any], Dict[str, float]]:
+) -> Tuple[Dict[str, Any], Dict[str, float], Dict[str, Dict[str, Any]]]:
     groups = sorted({group for captured in captured_by_helper.values() for group in captured})
     bases = {}
     mean_norms = {}
+    spectra = {}
     for group in groups:
         vectors = [captured[group] for captured in captured_by_helper.values() if group in captured]
         basis = orthonormal_basis(vectors, epsilon=epsilon)
@@ -349,7 +397,8 @@ def build_helper_response_bases(
             bases[group] = basis
         norms = [float(vector.detach().float().norm().item()) for vector in vectors]
         mean_norms[group] = statistics.fmean(norms) if norms else 0.0
-    return bases, mean_norms
+        spectra[group] = helper_response_spectrum(vectors)
+    return bases, mean_norms, spectra
 
 
 def orthonormal_basis(vectors: Sequence[Any], *, epsilon: float = 1.0e-8):
@@ -507,6 +556,9 @@ REPORT_METRIC_FIELDS = (
     "normalized_rms",
     "projection_p_j",
     "magnitude_ratio_m_j",
+    "helper_top_energy_fraction",
+    "helper_effective_rank",
+    "helper_numerical_rank",
     "mean_grad",
     "gradient_sign_consistency",
     "heldout_agreement",
@@ -530,6 +582,7 @@ def build_report(records: Sequence[Mapping[str, Any]], registry_summary: Mapping
         "- Block / family",
         "- RMS / normalized RMS",
         "- Projection `p_j` / magnitude ratio `m_j`",
+        "- Helper singular spectrum / top-mode energy / effective rank",
         "- Mean gate gradient / sign consistency / heldout agreement",
         "- Finite-difference result / candidate score",
         "",
@@ -551,5 +604,24 @@ def build_report(records: Sequence[Mapping[str, Any]], registry_summary: Mapping
     lines.extend(["", "## Prompt references", ""])
     for name, count in sorted(references.items()):
         lines.append(f"- `{name}`: {count}")
+
+    lines.extend(["", "## Helper response spectrum", ""])
+    spectrum_rows: Dict[str, List[Mapping[str, Any]]] = defaultdict(list)
+    for record in records:
+        spectrum = record.get("helper_response_spectrum")
+        if isinstance(spectrum, Mapping):
+            spectrum_rows[str(record.get("group_id"))].append(spectrum)
+    if not spectrum_rows:
+        lines.append("- No helper spectrum records were emitted.")
+    else:
+        for group, values in sorted(spectrum_rows.items()):
+            top = [float(value["top_energy_fraction"]) for value in values if value.get("top_energy_fraction") is not None]
+            ranks = [float(value["effective_rank"]) for value in values if value.get("effective_rank") is not None]
+            numerical = [float(value["numerical_rank"]) for value in values if value.get("numerical_rank") is not None]
+            lines.append(
+                f"- `{group}`: top-mode energy={statistics.fmean(top):.6f}, "
+                f"effective rank={statistics.fmean(ranks):.4f}, "
+                f"numerical rank={statistics.fmean(numerical):.2f}"
+            )
     lines.extend(["", "## Phase C", "", "未自动启动；后续训练决策必须由人工消费本报告和 manifest。", ""])
     return "\n".join(lines)

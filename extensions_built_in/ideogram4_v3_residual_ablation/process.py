@@ -85,7 +85,7 @@ class Ideogram4V3ResidualAblationProcess(BaseExtensionProcess):
             "registry": registry,
             "helpers": self.helper_phrases,
             "candidate_scales": self._candidate_scales(),
-            "schema_version": 2,
+            "schema_version": 3,
         })
         records_path = self.output_root / self.ablation.get("records_filename", "residual_ablation_records.jsonl")
         existing = load_jsonl(records_path) if self.ablation.get("resume", True) else []
@@ -110,10 +110,13 @@ class Ideogram4V3ResidualAblationProcess(BaseExtensionProcess):
             if not pending:
                 continue
             prepared = self._prepare_case(case, item, torch)
-            helper_basis, helper_norms, reference_summary = self._capture_reference_responses(prepared, runtime, torch)
+            helper_basis, helper_norms, helper_spectra, reference_summary = self._capture_reference_responses(
+                prepared, runtime, torch
+            )
             runtime.set_projection_basis(helper_basis)
             case_records = self._evaluate_case(
-                run_id, case, prepared, pending, registry, runtime, helper_norms, reference_summary, torch
+                run_id, case, prepared, pending, registry, runtime,
+                helper_norms, helper_spectra, reference_summary, torch,
             )
             records.extend(case_records)
             records = annotate_viability_metrics(records)
@@ -139,13 +142,19 @@ class Ideogram4V3ResidualAblationProcess(BaseExtensionProcess):
         }
         atomic_write_json(manifest_path, {
             "schema": "ai-toolkit.ideogram4-v3-residual-ablation",
-            "schema_version": 2,
+            "schema_version": 3,
             "status": "completed",
             "run_id": run_id,
             "diagnostics_only": True,
             "phase_c_started": False,
             "calibrated_activator_installed": True,
             "helper_basis_source": "actual_v3_lora_residual_responses",
+            "helper_spectrum": {
+                "matrix": "per_probe_per_group_helper_residual_sketch_columns",
+                "top_energy_fraction": "sigma_1^2 / sum_i sigma_i^2",
+                "effective_rank": "exp(-sum_i p_i log p_i)",
+                "stored_in": "records.helper_response_spectrum",
+            },
             "candidate_scales": self._candidate_scales(),
             "probe_case_count": len(probes),
             "group_count": len(group_to_modules),
@@ -446,10 +455,13 @@ class Ideogram4V3ResidualAblationProcess(BaseExtensionProcess):
                     "loss": float(torch.mean((prediction.float() - prepared["target"].float()).square()).item()),
                     "groups": runtime.summary()["groups"],
                 }
-        bases, mean_norms = build_helper_response_bases(captured)
-        return bases, mean_norms, summaries
+        bases, mean_norms, spectra = build_helper_response_bases(captured)
+        return bases, mean_norms, spectra, summaries
 
-    def _evaluate_case(self, run_id, case, prepared, pending, registry, runtime, helper_norms, references, torch):
+    def _evaluate_case(
+        self, run_id, case, prepared, pending, registry, runtime,
+        helper_norms, helper_spectra, references, torch,
+    ):
         by_group = {row["group_id"]: row for row in registry}
         output = []
         for group in pending:
@@ -475,6 +487,7 @@ class Ideogram4V3ResidualAblationProcess(BaseExtensionProcess):
             helper_norm = float(helper_norms.get(group, 0.0))
             activator_vector = runtime.captured_group_vectors().get(group)
             activator_norm = float(activator_vector.norm().item()) if activator_vector is not None else 0.0
+            helper_spectrum = helper_spectra.get(group, {})
             metrics.update({
                 "residual_rms": residual_rms,
                 "residual_max_abs": group_stats.get("max_abs"),
@@ -484,6 +497,10 @@ class Ideogram4V3ResidualAblationProcess(BaseExtensionProcess):
                 "projection_p_j": summary.get("helper_subspace_projection", {}).get(group, {}).get("energy_fraction"),
                 "magnitude_ratio_m_j": activator_norm / (helper_norm + 1.0e-12),
                 "helper_mean_norm": helper_norm,
+                "helper_top_energy_fraction": helper_spectrum.get("top_energy_fraction"),
+                "helper_effective_rank": helper_spectrum.get("effective_rank"),
+                "helper_numerical_rank": helper_spectrum.get("numerical_rank"),
+                "helper_count": helper_spectrum.get("helper_count"),
                 "fd_result": "prefer_" + str(metrics["best_scale"]),
             })
             row = by_group[group]
@@ -492,7 +509,9 @@ class Ideogram4V3ResidualAblationProcess(BaseExtensionProcess):
                 "item_id": case.item_id, "timestep": case.timestep, "noise_seed": case.noise_seed,
                 "group_id": group, "block_index": row["block_index"], "family": row["kind"], "kind": row["kind"],
                 "reference_type": "calibrated_activator", "candidate_losses": {str(scale): value for scale, value in losses.items()},
-                "reference_summary": references, "metrics": metrics,
+                "reference_summary": references,
+                "helper_response_spectrum": helper_spectrum,
+                "metrics": metrics,
             })
         return output
 
