@@ -167,6 +167,13 @@ class Ideogram4V3ActivatorPipelineTest(unittest.TestCase):
                 {"direct_v3_reconstruction"},
             )
             self.assertEqual(a2["network"]["pretrained_lora_path"], process.v3_weights_path)
+            self.assertFalse(a2["network"]["transformer_only"])
+            self.assertTrue(a2["train"]["train_unet"])
+            self.assertFalse(a1["train"]["train_unet"])
+            self.assertFalse(a2["three_phase_trigger_training"]["phase_a2"]["train"]["diffusion_lora"])
+            self.assertTrue(
+                a2["three_phase_trigger_training"]["phase_runtime"]["objective"]["v3_active_frozen"]
+            )
             self.assertEqual(a2["save"]["save_steps"], [19, 39, 59, 79])
             validation = a2["three_phase_trigger_training"]["validation"]
             self.assertEqual(validation["steps"], [0, 20, 40, 60, 80])

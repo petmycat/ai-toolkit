@@ -191,14 +191,23 @@ class Ideogram4V3ActivatorStageProcess:
             "steps": self.stage.steps,
             "optimizer": self.stage.optimizer,
             "optimizer_params": copy.deepcopy(self.stage.optimizer_params),
-            "train_unet": False,
+            # LoRASpecialNetwork uses train_unet to decide whether to instantiate
+            # diffusion LoRA modules at all. A2 must set this creation gate even
+            # though SDTrainer later freezes and removes V3 from the optimizer.
+            "train_unet": self.stage.name == "te_calibration",
             "train_text_encoder": False,
             "cache_text_embeddings": False,
             "unload_text_encoder": False,
             "disable_sampling": True,
         })
         if self.stage.name == "te_calibration":
-            child["network"] = copy.deepcopy(self.pipeline.raw_process_config.get("v3_network", {"type": "lora", "linear": 32}))
+            child["network"] = copy.deepcopy(self.pipeline.raw_process_config.get(
+                "v3_network",
+                {"type": "lora", "linear": 32, "linear_alpha": 32},
+            ))
+            # Ideogram4 V3 snapshots may include linears outside transformer.layers;
+            # module topology must match the producer exactly before loading.
+            child["network"]["transformer_only"] = False
             child["network"]["pretrained_lora_path"] = self.pipeline.v3_weights_path
         child["save"] = copy.deepcopy(child.get("save", {}))
         child["save"].update({

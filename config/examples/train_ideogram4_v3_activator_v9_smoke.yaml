@@ -67,7 +67,7 @@ config:
         type: lora
         linear: 32
         linear_alpha: 16
-        transformer_only: true
+        transformer_only: false
 
       three_phase_trigger_training:
         trigger:
