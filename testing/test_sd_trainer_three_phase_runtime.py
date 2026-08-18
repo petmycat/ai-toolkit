@@ -230,6 +230,52 @@ class ThreePhaseRuntimeTest(unittest.TestCase):
         self.assertTrue(all(not parameter.requires_grad for parameter in trainer.text_activator.embedding.parameters()))
         self.assertTrue(all(not parameter.requires_grad for parameter in trainer.text_activator.tap_adapters.parameters()))
 
+    def test_v3_a1_detached_teacher_predictions_run_without_autograd(self):
+        from toolkit import trigger_binding_losses
+
+        trainer = self._trainer('a1')
+        trainer.device_torch = torch.device('cpu')
+        trainer.step_num = 0
+        trainer.additional_logs = {}
+        trainer._trigger_gradient_reachability_checked = True
+        trainer.three_phase_trigger_training.placeholder = '[trigger]'
+        trainer.three_phase_trigger_training.phase_runtime.objective = {
+            'pipeline': 'ideogram4_v3_activator',
+            'name': 'semantic_activator',
+            'helper_schedule': {'helpers': ['one', 'two']},
+        }
+        trainer._trigger_binding_modules = {'losses': trigger_binding_losses}
+        trainer._check_first_trigger_gradient = lambda *_args, **_kwargs: self.fail(
+            'V3 objective must not run an extra retained-graph reachability backward'
+        )
+        trainer.sd = SimpleNamespace(
+            get_prompt_embeds=lambda prompts: _FakeEmbeds(len(prompts)),
+            get_loss_target=lambda noise, batch, timesteps: noise,
+        )
+        trainer._activator_mode = lambda mode: patch.object(trainer, '_mode', mode, create=True)
+        grad_states = []
+
+        def predict_noise(**kwargs):
+            grad_states.append((trainer._mode, torch.is_grad_enabled()))
+            scale = 1.0 if trainer._mode == 'semantic_only' else 0.5
+            return kwargs['noisy_latents'] * scale
+
+        trainer.predict_noise = predict_noise
+        latents = torch.ones(1, 4, 2, 3, requires_grad=True)
+        batch = SimpleNamespace(
+            file_items=[SimpleNamespace(caption_template='x [trigger]', raw_caption='unused')],
+        )
+        trainer._calculate_ideogram4_v3_activator_loss(
+            noisy_latents=latents,
+            noise=torch.zeros_like(latents),
+            timesteps=torch.tensor([10]),
+            batch=batch,
+            pred_kwargs={},
+            dtype=torch.float32,
+        )
+        self.assertEqual(grad_states[0], ('semantic_only', True))
+        self.assertTrue(all(not enabled for _mode, enabled in grad_states[1:]))
+
     def test_v3_a1_prototype_is_stable_across_bucket_shapes(self):
         from toolkit import trigger_binding_losses
 

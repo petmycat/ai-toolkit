@@ -2755,7 +2755,8 @@ class SDTrainer(BaseSDTrainProcess):
         target = shared_loss_target(self, noise, batch, timesteps).detach()
 
         def predict(prompt_batch, mode, *, detach=False):
-            with self._activator_mode(mode):
+            grad_context = torch.no_grad() if detach else contextlib.nullcontext()
+            with grad_context, self._activator_mode(mode):
                 embeds = self.sd.get_prompt_embeds(prompt_batch)
                 prediction = self.predict_noise(
                     noisy_latents=noisy_latents,
@@ -2841,8 +2842,11 @@ class SDTrainer(BaseSDTrainProcess):
                 'v3/a1/disturbance_beta': float(disturbance_beta.detach().mean().item()),
                 'v3/a1/disturbance_loss': float(disturbance.detach().item()),
             }
-        if total.requires_grad:
-            self._check_first_trigger_gradient(total, semantic_prediction, semantic_prediction.detach())
+        # The normal backward immediately below is the authoritative real-graph
+        # reachability check for this objective. Running torch.autograd.grad here
+        # would execute a complete checkpointed Ideogram backward, retain that
+        # graph, and then execute the same backward again. On the first A1 update
+        # this can look like a permanent hang before the progress bar advances.
         self._trigger_binding_last_metrics = metrics
         for key, value in metrics.items():
             self.additional_logs[f'phase/{self.runtime_phase}/{key}'] = value

@@ -39,7 +39,7 @@ config:
 
       train:
         dtype: bf16
-        batch_size: 1
+        batch_size: 2
         gradient_accumulation: 1
         gradient_checkpointing: true
         cache_text_embeddings: false
