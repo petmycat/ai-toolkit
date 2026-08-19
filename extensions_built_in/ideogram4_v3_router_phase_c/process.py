@@ -6,6 +6,7 @@ import json
 import os
 import random
 import shutil
+import time
 from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
@@ -70,21 +71,36 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
         self._stock_embed_cache = {}
         self._latent_cache = {}
 
+    def _phase_c_progress(self, message: str) -> None:
+        from toolkit.print import print_acc
+
+        elapsed = 0.0 if self._run_started_at is None else time.monotonic() - self._run_started_at
+        print_acc(f"[Phase C +{self._format_duration(elapsed)}] {message}")
+
     def run(self):
         BaseExtensionProcess.run(self)
         import torch
+        from tqdm.auto import tqdm
 
+        self._run_started_at = time.monotonic()
+        self._phase_c_progress(f"starting run {self.run_label!r}; output={self.output_root}")
+        self._phase_c_progress("resolving A2, residual-ablation, registry, and split contracts")
         self._resolve_inputs()
         self._resolve_phase_c_inputs()
         self.output_root.mkdir(parents=True, exist_ok=True)
+        self._phase_c_progress("loading Ideogram4 model")
         self.sd = self._load_model()
+        self._phase_c_progress("loading frozen V3 LoRA")
         self.network = self._load_lora(torch)
+        self._phase_c_progress("installing frozen A2 activator")
         self.text_activator = self._build_text_activator(torch)
         self._load_and_install_activator()
         self._freeze()
         self._enable_checkpointing()
         self.network.is_active = True
+        self._phase_c_progress("model, V3 LoRA, activator, and checkpointing ready")
 
+        self._phase_c_progress("building and validating active residual registry")
         actual_registry = build_module_registry(self.network.get_all_modules())
         validate_registry_contract(actual_registry, self.recorded_registry)
         active_groups = detect_active_groups(actual_registry)
@@ -96,12 +112,14 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
         registry_fingerprint = active_registry_fingerprint(active_registry)
         group_count = int(active_payload["group_count"])
 
+        self._phase_c_progress(
+            f"active registry ready: {group_count} groups across {len(active_registry)} LoRA modules"
+        )
         self._seed_everything(torch)
         router = self._build_canonical_router(group_count).to(self.sd.device_torch, dtype=torch.float32)
-        optimizer = torch.optim.AdamW(
-            router.parameters(),
-            lr=self.phase_c.learning_rate,
-            weight_decay=self.phase_c.weight_decay,
+        optimizer = self._build_optimizer(router)
+        self._phase_c_progress(
+            f"router and optimizer ready: optimizer={self.phase_c.optimizer}, steps={self.phase_c.steps}"
         )
         paths = self._artifact_paths()
         source_manifest = self._source_manifest(active_payload, registry_fingerprint)
@@ -118,11 +136,20 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
             )
         self._assert_router_only_trainable(router)
         self._sanitize_resume_artifacts(paths, start_step)
+        if start_step:
+            self._phase_c_progress(f"resumed compatible checkpoint at step {start_step}/{self.phase_c.steps}")
+        else:
+            self._phase_c_progress("starting from fresh zero-initialized router")
 
         train_items, validation_items = self._load_items()
         self._validation_item_count = len(validation_items)
+        self._phase_c_progress(
+            f"precomputing {len(train_items)} train and {len(validation_items)} validation items"
+        )
         self._precompute_items(train_items + validation_items, torch)
+        self._phase_c_progress("running real-model residual-gate preflight invariants")
         self._assert_runtime_invariants(router, train_items[0], registry_fingerprint, start_step, torch)
+        self._phase_c_progress("preflight invariants passed; entering router training")
         source_manifest["run_fingerprint"] = run_fingerprint
         atomic_write_json(paths["source_manifest"], source_manifest)
         router_config["run_fingerprint"] = run_fingerprint
@@ -131,7 +158,16 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
         sampler = DeterministicStratifiedTimestepSampler(
             self.phase_c.seed, self.phase_c.timestep_bins
         )
-        for step in range(start_step + 1, self.phase_c.steps + 1):
+        progress = tqdm(
+            range(start_step + 1, self.phase_c.steps + 1),
+            total=self.phase_c.steps,
+            initial=start_step,
+            desc="Phase C router training",
+            unit="step",
+            dynamic_ncols=True,
+            leave=True,
+        )
+        for step in progress:
             timestep, bin_index = sampler.sample(step)
             item = train_items[(step - 1) % len(train_items)]
             prepared = self._prepare_training_case(item, timestep, self.phase_c.seed + step, torch)
@@ -189,10 +225,20 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
                 "gate_max": float(gates.detach().max().item()),
                 "gate_mean": float(gates.detach().mean().item()),
             })
+            progress.set_postfix(
+                loss=f"{float(loss.detach().item()):.4g}",
+                recon=f"{float(reconstruction.detach().item()):.4g}",
+                abs_q=f"{float(q_values.detach().abs().mean().item()):.3g}",
+                timestep=timestep,
+                refresh=False,
+            )
             validation_due = step % self.phase_c.validation.every == 0 or step == self.phase_c.steps
             if validation_due:
+                progress.write(f"[Phase C] validating checkpoint candidate at step {step}")
                 self._validate(router, validation_items, step, registry_fingerprint, paths, torch)
+                progress.write(f"[Phase C] validation completed at step {step}")
             if validation_due or step % self.phase_c.checkpoint_every == 0:
+                progress.write(f"[Phase C] saving checkpoint at step {step}")
                 self._save_checkpoint(
                     router,
                     optimizer,
@@ -202,8 +248,15 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
                     router_config,
                     torch,
                 )
+                progress.write(f"[Phase C] checkpoint saved at step {step}")
+        progress.close()
 
+        self._phase_c_progress("training loop finished; selecting best checkpoint and finalizing artifacts")
         self._finalize(router, registry_fingerprint, router_config, paths, torch)
+        self._phase_c_progress(
+            f"COMPLETED {self.phase_c.steps}/{self.phase_c.steps} steps; "
+            f"best/final artifacts and completion manifest written to {self.output_root}"
+        )
 
     def _resolve_phase_c_inputs(self) -> None:
         self.residual_manifest_path = require_file_hash(
@@ -248,6 +301,26 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
         signature = inspect.signature(ResidualGateRouter)
         supported = {key: value for key, value in values.items() if key in signature.parameters}
         return ResidualGateRouter(**supported)
+
+    def _build_optimizer(self, router):
+        from toolkit.optimizer import get_optimizer
+
+        optimizer_params = dict(self.phase_c.optimizer_params)
+        optimizer_params["weight_decay"] = self.phase_c.weight_decay
+        try:
+            optimizer = get_optimizer(
+                router.parameters(),
+                self.phase_c.optimizer,
+                learning_rate=self.phase_c.learning_rate,
+                optimizer_params=optimizer_params,
+            )
+        except (ImportError, ModuleNotFoundError) as error:
+            raise RuntimeError(
+                f"Phase C optimizer {self.phase_c.optimizer!r} requires an unavailable dependency: {error}"
+            ) from error
+        if optimizer is None or not hasattr(optimizer, "step") or not hasattr(optimizer, "state_dict"):
+            raise RuntimeError(f"Phase C optimizer factory returned an invalid optimizer for {self.phase_c.optimizer!r}")
+        return optimizer
 
     def _seed_everything(self, torch) -> None:
         random.seed(self.phase_c.seed)
@@ -395,7 +468,9 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
         return train, validation
 
     def _precompute_items(self, items, torch) -> None:
-        for item in items:
+        from tqdm.auto import tqdm
+
+        for item in tqdm(items, desc="Phase C precompute", unit="item", dynamic_ncols=True, leave=True):
             item_id = item["dataset_relative_item_id"]
             case = SimpleNamespace(item_id=item_id, timestep=0, noise_seed=self.phase_c.seed)
             prepared = self._prepare_case(case, item, torch)
@@ -656,7 +731,9 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
             "schema_version": 1,
             "status": "completed",
             "steps": self.phase_c.steps,
-            "fresh_adamw": True,
+            "optimizer": self.phase_c.optimizer,
+            "optimizer_params": dict(self.phase_c.optimizer_params),
+            "fresh_optimizer": True,
             "router_only": True,
             "validation_term": "validation",
             "artifacts": {

@@ -197,7 +197,8 @@ def router_config_payload(config: Any, active_registry: Mapping[str, Any]) -> Di
         "active_registry": dict(active_registry),
         "training": {
             "steps": int(config.steps),
-            "optimizer": "AdamW",
+            "optimizer": config.optimizer,
+            "optimizer_params": dict(config.optimizer_params),
             "fresh_optimizer": True,
             "learning_rate": float(config.learning_rate),
             "weight_decay": float(config.weight_decay),

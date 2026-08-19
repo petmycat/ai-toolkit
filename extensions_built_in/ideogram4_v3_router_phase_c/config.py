@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass, field, fields
 from pathlib import PurePath
@@ -47,6 +48,8 @@ class PhaseCRouterConfig:
     steps: int = 400
     seed: int = 42
     learning_rate: float = 1.0e-3
+    optimizer: str = "adamw"
+    optimizer_params: Mapping[str, Any] = field(default_factory=dict)
     weight_decay: float = 1.0e-4
     lambda_gate: float = 1.0e-3
     timestep_bins: int = 10
@@ -97,6 +100,8 @@ def load_config(raw: Mapping[str, Any]) -> PhaseCRouterConfig:
         steps=int(raw.get("steps", 400)),
         seed=int(raw.get("seed", 42)),
         learning_rate=float(raw.get("learning_rate", 1.0e-3)),
+        optimizer=str(raw.get("optimizer", "adamw")).strip().lower(),
+        optimizer_params=dict(raw.get("optimizer_params", {})),
         weight_decay=float(raw.get("weight_decay", 1.0e-4)),
         lambda_gate=float(raw.get("lambda_gate", 1.0e-3)),
         timestep_bins=int(raw.get("timestep_bins", 10)),
@@ -166,6 +171,44 @@ def validate_config(config: PhaseCRouterConfig) -> None:
         raise ValueError("Phase C numeric fields must be finite: " + ", ".join(non_finite))
     if config.learning_rate <= 0.0:
         raise ValueError("learning_rate must be positive")
+    supported_optimizers = {
+        "adam",
+        "adamw",
+        "adam8",
+        "adamw8",
+        "adam8bit",
+        "adamw8bit",
+        "ademamix8bit",
+        "lion",
+        "lion8bit",
+        "adagrad",
+        "adafactor",
+        "prodigy",
+        "prodigy8bit",
+        "dadaptation",
+        "dadaptationadam",
+        "dadaptationlion",
+        "automagic",
+        "automagic2",
+        "automagic3",
+        "automagicexperiment",
+    }
+    if config.optimizer not in supported_optimizers:
+        raise ValueError(f"unsupported Phase C optimizer: {config.optimizer}")
+    if not isinstance(config.optimizer_params, Mapping):
+        raise ValueError("optimizer_params must be a mapping")
+    forbidden_optimizer_params = sorted(
+        set(config.optimizer_params) & {"lr", "learning_rate", "params", "weight_decay"}
+    )
+    if forbidden_optimizer_params:
+        raise ValueError(
+            "optimizer_params must not override learning rate or params: "
+            + ", ".join(forbidden_optimizer_params)
+        )
+    try:
+        json.dumps(dict(config.optimizer_params), sort_keys=True, allow_nan=False)
+    except (TypeError, ValueError) as error:
+        raise ValueError("optimizer_params must be finite JSON-compatible values") from error
     if config.weight_decay < 0.0:
         raise ValueError("weight_decay must be non-negative")
     if config.lambda_gate < 0.0 or not config.lambda_gate < 1.0:

@@ -55,6 +55,8 @@ def test_phase_c_defaults_match_confirmed_contract():
     assert config.hidden_dim == 64
     assert config.router_rank == 16
     assert config.q_max == 0.5
+    assert config.optimizer == "adamw"
+    assert config.optimizer_params == {}
     assert config.weight_decay == pytest.approx(1.0e-4)
     assert config.lambda_gate == pytest.approx(1.0e-3)
     assert config.temporal_smoothness.enabled
@@ -82,6 +84,22 @@ def test_config_allows_reasonable_overrides_but_rejects_invalid_ranges():
 
 
 def test_config_rejects_unknown_nonfinite_odd_and_unsafe_artifact_values():
+    raw = _config()
+    raw.update({"optimizer": "adamw8bit", "optimizer_params": {"betas": [0.9, 0.99]}})
+    config = load_config(raw)
+    assert config.optimizer == "adamw8bit"
+    assert config.optimizer_params == {"betas": [0.9, 0.99]}
+
+    raw = _config()
+    raw["optimizer"] = "made_up_optimizer"
+    with pytest.raises(ValueError, match="unsupported"):
+        load_config(raw)
+
+    raw = _config()
+    raw["optimizer_params"] = {"lr": 0.1}
+    with pytest.raises(ValueError, match="must not override"):
+        load_config(raw)
+
     raw = _config()
     raw["learning_rate"] = float("nan")
     with pytest.raises(ValueError, match="finite"):
@@ -164,6 +182,30 @@ def test_validation_grid_and_best_selection_use_validation_name_only():
         {"step": 75, "split": "heldout", "grid": "canonical", "loss": 0.0},
     ]
     assert select_best_validation(records) == pytest.approx((50, 0.1))
+
+
+def test_phase_c_process_exposes_timestamped_progress_output(monkeypatch):
+    class FakeBaseExtensionProcess:
+        pass
+
+    jobs_module = types.ModuleType("jobs")
+    process_module = types.ModuleType("jobs.process")
+    process_module.BaseExtensionProcess = FakeBaseExtensionProcess
+    jobs_module.process = process_module
+    monkeypatch.setitem(sys.modules, "jobs", jobs_module)
+    monkeypatch.setitem(sys.modules, "jobs.process", process_module)
+    sys.modules.pop("extensions_built_in.ideogram4_v3_router_phase_c.process", None)
+    process_class = importlib.import_module(
+        "extensions_built_in.ideogram4_v3_router_phase_c.process"
+    ).Ideogram4V3RouterPhaseCProcess
+    messages = []
+    print_module = types.ModuleType("toolkit.print")
+    print_module.print_acc = messages.append
+    monkeypatch.setitem(sys.modules, "toolkit.print", print_module)
+    instance = object.__new__(process_class)
+    instance._run_started_at = None
+    instance._phase_c_progress("training ready")
+    assert messages == ["[Phase C +0s] training ready"]
 
 
 def test_extension_registers_disposable_process_without_sdtrainer_semantics(monkeypatch):
