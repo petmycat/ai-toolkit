@@ -69,6 +69,7 @@ def test_phase_c_defaults_match_confirmed_contract():
     assert config.lambda_universal == pytest.approx(1.0e-3)
     assert config.lambda_contextual == pytest.approx(2.0e-3)
     assert config.temporal_smoothness.universal_only
+    assert config.validation.mode_batch_size == 1
     assert config.validation.evaluate_context_shuffle
 
 
@@ -102,6 +103,13 @@ def test_config_allows_reasonable_overrides_but_rejects_invalid_ranges():
     assert load_config(raw).gradient_checkpointing.every_n_blocks == 2
     raw["gradient_checkpointing"]["every_n_blocks"] = 0
     with pytest.raises(ValueError, match="every_n_blocks"):
+        load_config(raw)
+
+    raw = _config()
+    raw["validation"] = {"mode_batch_size": 2}
+    assert load_config(raw).validation.mode_batch_size == 2
+    raw["validation"]["mode_batch_size"] = 4
+    with pytest.raises(ValueError, match="mode_batch_size"):
         load_config(raw)
 
 
@@ -270,22 +278,21 @@ def test_checkpoint_stride_two_preserves_gate_gradients_across_all_blocks(monkey
 
     with residual_gate_tensor_context(gates):
         residual_gates = transformer_module.current_residual_gates()
-        for layer_index, layer in enumerate(model.layers):
-            checkpoint_layer = (
-                model.gradient_checkpointing
-                and torch.is_grad_enabled()
-                and layer_index % model.gradient_checkpointing_every_n_blocks == 0
-            )
-            if checkpoint_layer:
-                def checkpointed_layer(hidden_states, gate_tensor, current_layer=layer):
-                    with residual_gate_tensor_context(gate_tensor):
-                        return current_layer(hidden_states, None, None, None, None, None)
+        segment_size = model.gradient_checkpointing_every_n_blocks
+        for segment_start in range(0, len(model.layers), segment_size):
+            segment_layers = tuple(model.layers[segment_start : segment_start + segment_size])
 
-                hidden = transformer_module.checkpoint(
-                    checkpointed_layer, hidden, residual_gates, use_reentrant=False
-                )
-            else:
-                hidden = layer(hidden, None, None, None, None, None)
+            def checkpointed_segment(hidden_states, gate_tensor, current_layers=segment_layers):
+                with residual_gate_tensor_context(gate_tensor):
+                    for current_layer in current_layers:
+                        hidden_states = current_layer(
+                            hidden_states, None, None, None, None, None
+                        )
+                return hidden_states
+
+            hidden = transformer_module.checkpoint(
+                checkpointed_segment, hidden, residual_gates, use_reentrant=False
+            )
     hidden.sum().backward()
     assert len(calls) == 2
     assert gates.grad.item() == pytest.approx(10.0)
@@ -313,10 +320,16 @@ def test_batched_validation_modes_preserve_mode_and_gate_order(monkeypatch):
 
     instance = object.__new__(process_class)
     instance.network = types.SimpleNamespace(_residual_gate_runtime=None)
+    instance.phase_c = types.SimpleNamespace(
+        validation=types.SimpleNamespace(mode_batch_size=2)
+    )
+    batch_sizes = []
 
     def fake_predict(prepared, prompt, runtime_mode):
-        assert prepared["latent"].shape[0] == 3
-        assert len(prepared["calibrated_embeds"].text_embeds) == 3
+        batch_size = prepared["latent"].shape[0]
+        batch_sizes.append(batch_size)
+        assert batch_size <= 2
+        assert len(prepared["calibrated_embeds"].text_embeds) == batch_size
         return current_residual_gates()[:, :1].clone()
 
     instance._predict = fake_predict
@@ -340,9 +353,25 @@ def test_batched_validation_modes_preserve_mode_and_gate_order(monkeypatch):
         torch,
     )
     assert list(predictions) == ["universal_only", "full_router", "context_shuffled"]
+    assert batch_sizes == [2, 1]
     assert predictions["universal_only"].item() == pytest.approx(1.1)
     assert predictions["full_router"].item() == pytest.approx(1.2)
     assert predictions["context_shuffled"].item() == pytest.approx(1.3)
+
+
+def test_memory_preflight_ranks_combined_spatial_and_text_sequence_length(monkeypatch):
+    process_class = _phase_c_process_class(monkeypatch)
+    instance = object.__new__(process_class)
+    instance._latent_cache = {
+        "wide": torch.zeros(1, 4, 20, 30),
+        "verbose": torch.zeros(1, 4, 20, 20),
+    }
+    instance._calibrated_embed_cache = {
+        "wide": AdvancedPromptEmbeds(text_embeds=[torch.zeros(100, 4)]),
+        "verbose": AdvancedPromptEmbeds(text_embeds=[torch.zeros(350, 4)]),
+    }
+    assert instance._memory_preflight_score({"dataset_relative_item_id": "wide"}) == 700
+    assert instance._memory_preflight_score({"dataset_relative_item_id": "verbose"}) == 750
 
 
 def test_normal_v3_validation_cache_reuses_and_finally_verifies(monkeypatch):

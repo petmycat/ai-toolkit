@@ -522,35 +522,25 @@ class Ideogram4Transformer2DModel(nn.Module):
             flash_meta = None
 
         residual_gates = current_residual_gates()
-        for layer_index, layer in enumerate(self.layers):
-            checkpoint_layer = (
-                self.gradient_checkpointing
-                and torch.is_grad_enabled()
-                and layer_index % self.gradient_checkpointing_every_n_blocks == 0
-            )
-            if checkpoint_layer and residual_gates is not None:
-                def checkpointed_layer(hidden_states, gate_tensor, current_layer=layer):
-                    with residual_gate_tensor_context(gate_tensor):
-                        return current_layer(hidden_states, attn_mask, cos, sin, adaln_input, flash_meta)
+        use_checkpointing = self.gradient_checkpointing and torch.is_grad_enabled()
+        if use_checkpointing:
+            segment_size = self.gradient_checkpointing_every_n_blocks
+            for segment_start in range(0, len(self.layers), segment_size):
+                segment_layers = tuple(self.layers[segment_start : segment_start + segment_size])
 
-                h = checkpoint(
-                    checkpointed_layer,
-                    h,
-                    residual_gates,
-                    use_reentrant=False,
-                )
-            elif checkpoint_layer:
-                h = checkpoint(
-                    layer,
-                    h,
-                    attn_mask,
-                    cos,
-                    sin,
-                    adaln_input,
-                    flash_meta,
-                    use_reentrant=False,
-                )
-            else:
+                def checkpointed_segment(hidden_states, gate_tensor=None, current_layers=segment_layers):
+                    context = residual_gate_tensor_context(gate_tensor)
+                    with context:
+                        for current_layer in current_layers:
+                            hidden_states = current_layer(
+                                hidden_states, attn_mask, cos, sin, adaln_input, flash_meta
+                            )
+                    return hidden_states
+
+                checkpoint_args = (h, residual_gates) if residual_gates is not None else (h,)
+                h = checkpoint(checkpointed_segment, *checkpoint_args, use_reentrant=False)
+        else:
+            for layer in self.layers:
                 h = layer(h, attn_mask, cos, sin, adaln_input, flash_meta)
 
         out = self.final_layer(h, c=adaln_input)

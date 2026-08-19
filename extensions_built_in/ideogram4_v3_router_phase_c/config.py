@@ -31,6 +31,7 @@ class StyleStrengthConfig:
 @dataclass(frozen=True)
 class ValidationConfig:
     every: int = 25
+    mode_batch_size: int = 1
     seeds: Tuple[int, ...] = (42, 314159, 271828)
     canonical_timesteps: Tuple[int, ...] = (100, 500, 900)
     dense_timesteps: Tuple[int, ...] = tuple(range(0, 1001, 50))
@@ -178,6 +179,7 @@ def load_config(raw: Mapping[str, Any]) -> PhaseCRouterConfig:
         validation_item_limit=int(raw["validation_item_limit"]) if raw.get("validation_item_limit") is not None else None,
         validation=ValidationConfig(
             every=int(validation_raw.get("every", 25)),
+            mode_batch_size=int(validation_raw.get("mode_batch_size", 1)),
             seeds=_tuple_of_ints(validation_raw.get("seeds", (42, 314159, 271828)), "validation.seeds"),
             canonical_timesteps=_tuple_of_ints(validation_raw.get("canonical_timesteps", (100, 500, 900)), "validation.canonical_timesteps"),
             dense_timesteps=_tuple_of_ints(validation_raw.get("dense_timesteps", tuple(range(0, 1001, 50))), "validation.dense_timesteps"),
@@ -240,6 +242,8 @@ def validate_config(config: PhaseCRouterConfig) -> None:
         raise ValueError("steps/checkpoint_every are invalid")
     if config.validation.every <= 0 or config.validation.every > config.steps:
         raise ValueError("validation.every must lie in [1, steps]")
+    if not 1 <= config.validation.mode_batch_size <= 3:
+        raise ValueError("validation.mode_batch_size must lie in [1,3]")
     required_validation_modes = {
         "evaluate_universal_only": config.validation.evaluate_universal_only,
         "evaluate_full_router": config.validation.evaluate_full_router,

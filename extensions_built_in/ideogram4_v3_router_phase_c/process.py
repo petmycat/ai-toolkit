@@ -177,7 +177,11 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
         self._precompute_items(train_items + validation_items, torch)
         self._phase_c_progress("running real-model residual-gate preflight invariants")
         self._assert_runtime_invariants(router, train_items, registry_fingerprint, start_step, torch)
-        self._phase_c_progress("preflight invariants passed; entering router training")
+        self._release_cuda_cache(torch)
+        self._phase_c_progress("running maximum-latent training backward memory preflight")
+        self._assert_training_memory_preflight(router, train_items, registry_fingerprint, torch)
+        self._release_cuda_cache(torch)
+        self._phase_c_progress("preflight invariants and maximum-latent backward passed; entering router training")
         source_manifest["run_fingerprint"] = run_fingerprint
         atomic_write_json(paths["source_manifest"], source_manifest)
         atomic_write_json(paths["group_registry"], active_payload)
@@ -484,6 +488,14 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
         if {int(record.get("step", -1)) for record in temporal_records} != completed_validation_steps:
             raise RuntimeError("Phase C resume temporal-profile prefix is incomplete")
 
+    @staticmethod
+    def _release_cuda_cache(torch) -> None:
+        import gc
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def _assert_runtime_invariants(self, router, items, registry_fingerprint, start_step, torch) -> None:
         item = items[0]
         normalized = torch.tensor([0.5], device=self.sd.device_torch, dtype=torch.float32)
@@ -542,6 +554,113 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
                 raise RuntimeError(f"identity residual gates do not match ordinary V3; max_abs_difference={difference}")
         if not bool(torch.isfinite(identity_prediction).all()):
             raise RuntimeError("Phase C preflight prediction is non-finite")
+        del prepared, identity_prediction, zero_prediction, disabled_prediction
+
+    def _memory_preflight_score(self, item) -> int:
+        item_id = item["dataset_relative_item_id"]
+        latent = self._latent_cache[item_id]
+        spatial_tokens = 1
+        for dimension in latent.shape[-2:]:
+            spatial_tokens *= int(dimension)
+        text_tokens = int(self._calibrated_embed_cache[item_id].text_embeds[0].shape[0])
+        return spatial_tokens + text_tokens
+
+    def _assert_training_memory_preflight(self, router, items, registry_fingerprint, torch) -> None:
+        count = self.phase_c.same_timestep_content_batch
+        ranked_items = sorted(
+            items,
+            key=self._memory_preflight_score,
+            reverse=True,
+        )
+        selected_items = ranked_items[:count]
+        if len(selected_items) != count:
+            raise RuntimeError("maximum-latent preflight could not assemble a full content batch")
+
+        parameter_snapshot = {
+            name: parameter.detach().cpu().clone()
+            for name, parameter in router.named_parameters()
+        }
+        torch_rng_state = torch.get_rng_state()
+        cuda_rng_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        python_rng_state = random.getstate()
+        was_training = router.training
+        timestep = 500
+        normalized = torch.tensor(
+            [timestep / 1000.0], device=self.sd.device_torch, dtype=torch.float32
+        )
+        activator_inputs = []
+        router.train()
+        router.zero_grad(set_to_none=True)
+        try:
+            for item in selected_items:
+                item_id = item["dataset_relative_item_id"]
+                prepared = self._prepare_training_case(
+                    item, timestep, self.phase_c.seed, torch
+                )
+                projected = self._projected_activator_cache[item_id].to(
+                    self.sd.device_torch, dtype=torch.float32
+                )
+                activator_code = router.encode_activator(projected)
+                _, contextual_q, q_values = router.components(normalized, activator_code)
+                runtime = ResidualGateRuntime(
+                    1.0 + q_values, registry_fingerprint=registry_fingerprint
+                )
+                with residual_gate_runtime_context(self.network, runtime):
+                    prediction = self._predict(
+                        prepared, prepared["prompt_template"], "full"
+                    )
+                reconstruction = torch.mean(
+                    (prediction.float() - prepared["target"].float()).square()
+                )
+                contextual_penalty = contextual_q.float().square().mean()
+                preflight_loss = (
+                    reconstruction
+                    + self.phase_c.lambda_contextual * contextual_penalty
+                ) / float(count)
+                if not bool(torch.isfinite(preflight_loss).all()):
+                    raise RuntimeError("maximum-latent preflight produced a non-finite loss")
+                preflight_loss.backward()
+                activator_inputs.append(projected.detach())
+                del prepared, prediction, reconstruction, contextual_penalty, preflight_loss
+
+            batch_codes = router.encode_activator(torch.cat(activator_inputs, dim=0))
+            _, contextual_batch, _ = router.components(normalized, batch_codes)
+            contextual_mean_regularization = (
+                self.phase_c.lambda_contextual
+                * self.phase_c.contextual_mean_multiplier
+                * contextual_batch.mean(dim=0).square().mean()
+            )
+            universal_penalty = router.universal_penalty()
+            smoothness = (
+                router.universal_temporal_smoothness()
+                if self.phase_c.temporal_smoothness.enabled
+                else universal_penalty.new_zeros(())
+            )
+            regularization = (
+                self.phase_c.lambda_universal * universal_penalty
+                + self.phase_c.temporal_smoothness.weight * smoothness
+            )
+            (contextual_mean_regularization + regularization).backward()
+            self._assert_router_only_gradients(router, torch)
+        finally:
+            router.zero_grad(set_to_none=True)
+            torch.set_rng_state(torch_rng_state)
+            if torch.cuda.is_available() and cuda_rng_states is not None:
+                torch.cuda.set_rng_state_all(cuda_rng_states)
+            random.setstate(python_rng_state)
+            router.train(was_training)
+
+        changed = [
+            name
+            for name, parameter in router.named_parameters()
+            if not torch.equal(parameter.detach().cpu(), parameter_snapshot[name])
+        ]
+        if changed:
+            raise RuntimeError(
+                f"maximum-latent preflight modified router parameters: {changed[:10]}"
+            )
+        if any(parameter.grad is not None for parameter in router.parameters()):
+            raise RuntimeError("maximum-latent preflight left router gradients allocated")
 
     def _assert_finite_training_values(self, step: int, **values) -> None:
         for name, value in values.items():
@@ -785,22 +904,33 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
         mode_names = tuple(q_by_mode)
         if not mode_names:
             return {}
-        mode_count = len(mode_names)
-        batched = dict(prepared)
-        for key in ("latent", "noise", "noisy_latents", "timesteps", "target"):
-            batched[key] = prepared[key].repeat((mode_count,) + (1,) * (prepared[key].ndim - 1))
+        mode_batch_size = min(self.phase_c.validation.mode_batch_size, len(mode_names))
+        outputs = {}
         embeds = prepared["calibrated_embeds"]
         concat = getattr(embeds.__class__, "concat_prompt_embeds", None)
         if not callable(concat):
             raise TypeError("Phase C validation prompt embeddings do not support batching")
-        batched["calibrated_embeds"] = concat([embeds for _ in mode_names])
-        gates = torch.cat([1.0 + q_by_mode[mode] for mode in mode_names], dim=0)
-        runtime = ResidualGateRuntime(gates, registry_fingerprint=registry_fingerprint)
-        with residual_gate_runtime_context(self.network, runtime):
-            predictions = self._predict(batched, batched["prompt_template"], "full")
-        if predictions.shape[0] != mode_count:
-            raise RuntimeError("batched Phase C validation returned an unexpected batch size")
-        return {mode: predictions[index : index + 1] for index, mode in enumerate(mode_names)}
+        for offset in range(0, len(mode_names), mode_batch_size):
+            chunk_names = mode_names[offset : offset + mode_batch_size]
+            chunk_size = len(chunk_names)
+            batched = dict(prepared)
+            for key in ("latent", "noise", "noisy_latents", "timesteps", "target"):
+                batched[key] = prepared[key].repeat(
+                    (chunk_size,) + (1,) * (prepared[key].ndim - 1)
+                )
+            batched["calibrated_embeds"] = concat([embeds for _ in chunk_names])
+            gates = torch.cat([1.0 + q_by_mode[mode] for mode in chunk_names], dim=0)
+            runtime = ResidualGateRuntime(gates, registry_fingerprint=registry_fingerprint)
+            with residual_gate_runtime_context(self.network, runtime):
+                predictions = self._predict(batched, batched["prompt_template"], "full")
+            if predictions.shape[0] != chunk_size:
+                raise RuntimeError("batched Phase C validation returned an unexpected batch size")
+            outputs.update({
+                mode: predictions[index : index + 1]
+                for index, mode in enumerate(chunk_names)
+            })
+            del batched, gates, runtime, predictions
+        return outputs
 
     def _normal_v3_validation_loss(
         self, router, prepared, item_id, timestep, noise_seed, registry_fingerprint, torch, *, verify
@@ -823,6 +953,7 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
         return cached_loss
 
     def _validate(self, router, items, step, registry_fingerprint, paths, torch) -> None:
+        self._release_cuda_cache(torch)
         router.eval()
         item_ids = [item["dataset_relative_item_id"] for item in items]
         modes = ["normal_v3", "universal_only", "full_router"]
@@ -974,6 +1105,7 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
                     }
             append_jsonl(paths["temporal_profiles"], temporal_record)
         router.train()
+        self._release_cuda_cache(torch)
 
     def _artifact_paths(self) -> Dict[str, Path]:
         artifacts = self.phase_c.artifacts
