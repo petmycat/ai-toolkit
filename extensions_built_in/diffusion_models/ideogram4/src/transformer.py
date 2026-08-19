@@ -16,6 +16,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
+from toolkit.residual_gating import current_residual_gates, residual_gate_tensor_context
+
 try:
     from flash_attn import flash_attn_varlen_func
 
@@ -515,8 +517,20 @@ class Ideogram4Transformer2DModel(nn.Module):
             ).unsqueeze(1)
             flash_meta = None
 
+        residual_gates = current_residual_gates()
         for layer in self.layers:
-            if self.gradient_checkpointing and torch.is_grad_enabled():
+            if self.gradient_checkpointing and torch.is_grad_enabled() and residual_gates is not None:
+                def checkpointed_layer(hidden_states, gate_tensor, current_layer=layer):
+                    with residual_gate_tensor_context(gate_tensor):
+                        return current_layer(hidden_states, attn_mask, cos, sin, adaln_input, flash_meta)
+
+                h = checkpoint(
+                    checkpointed_layer,
+                    h,
+                    residual_gates,
+                    use_reentrant=False,
+                )
+            elif self.gradient_checkpointing and torch.is_grad_enabled():
                 h = checkpoint(
                     layer,
                     h,

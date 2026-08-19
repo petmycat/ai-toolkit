@@ -15,6 +15,7 @@ from toolkit.lorm import extract_conv, extract_linear, count_parameters
 from toolkit.metadata import add_model_hash_to_meta
 from toolkit.paths import KEYMAPS_ROOT
 from toolkit.saving import get_lora_keymap_from_model_keymap
+from toolkit.residual_gating import apply_group_gate, bind_active_registry, current_residual_gates
 from optimum.quanto import QBytesTensor
 
 if TYPE_CHECKING:
@@ -326,6 +327,17 @@ class ToolkitModuleMixin:
             if callable(apply_residual):
                 scaled_lora_output = apply_residual(self, scaled_lora_output)
 
+        residual_gates = current_residual_gates()
+        if residual_gates is None:
+            gate_runtime = getattr(network, "_residual_gate_runtime", None)
+            residual_gates = getattr(gate_runtime, "gates", None)
+        if residual_gates is not None:
+            group_index = getattr(self, "_residual_gate_group_index", None)
+            if group_index is None:
+                raise RuntimeError(f"LoRA module has no pre-bound residual group index: {getattr(self, 'lora_name', '?')}")
+            if int(group_index) >= 0:
+                scaled_lora_output = apply_group_gate(scaled_lora_output, residual_gates, int(group_index))
+
         if self.__class__.__name__ == "DoRAModule":
             # ref https://github.com/huggingface/peft/blob/1e6d1d73a0850223b0916052fd8d2382a90eae5a/src/peft/tuners/lora/layer.py#L417
             # x = dropout(x)
@@ -524,6 +536,7 @@ class ToolkitNetworkMixin:
         self.module_losses: List[torch.Tensor] = []
         self.lorm_train_mode: Literal['local', None] = None
         self._residual_ablation_runtime = None
+        self._residual_gate_runtime = None
         self.can_merge_in = not is_lorm
         # will prevent optimizer from loading as it will have double states
         self.did_change_weights = False
@@ -884,6 +897,9 @@ class ToolkitNetworkMixin:
         if hasattr(self, 'text_encoder_loras'):
             loras += self.text_encoder_loras
         return loras
+
+    def bind_residual_gate_registry(self: Network, registry) -> Dict[str, int]:
+        return bind_active_registry(self.get_all_modules(), registry)
 
     def _update_checkpointing(self: Network):
         for module in self.get_all_modules():

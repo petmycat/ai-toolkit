@@ -14,8 +14,14 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 
-GROUP_KINDS = ("attention", "mlp", "adaln", "other")
-_BLOCK_RE = re.compile(r"(?:^|[.$_])layers(?:[.$_])(\d+)(?:[.$_]|$)")
+from toolkit.residual_gating import (
+    GROUP_KINDS,
+    build_module_registry,
+    classify_lora_module,
+    module_display_name,
+    registry_maps,
+    validate_complete_partition,
+)
 
 
 def sha256_file(path: os.PathLike | str) -> str:
@@ -141,75 +147,6 @@ def parse_activator_a2_contract(contract: Mapping[str, Any]) -> Dict[str, Any]:
     if missing:
         raise RuntimeError(f"A2 activator contract lacks required fields: {missing}")
     return required
-
-
-def module_display_name(module: Any) -> str:
-    name = str(getattr(module, "lora_name", ""))
-    return name.replace("$$", ".").replace("diffusion_model.", "transformer.")
-
-
-def classify_lora_module(name: str) -> Tuple[Optional[int], str]:
-    normalized = name.replace("$$", ".").lower()
-    match = _BLOCK_RE.search(normalized)
-    block_index = int(match.group(1)) if match else None
-    if ".attention." in normalized or ".attn." in normalized:
-        kind = "attention"
-    elif ".feed_forward." in normalized or ".mlp." in normalized or any(
-        token in normalized for token in (".w1", ".w2", ".w3")
-    ):
-        kind = "mlp"
-    elif "adaln" in normalized or "ada_ln" in normalized:
-        kind = "adaln"
-    else:
-        kind = "other"
-    return block_index, kind
-
-
-def build_module_registry(modules: Sequence[Any]) -> List[Dict[str, Any]]:
-    registry = []
-    seen = set()
-    for index, module in enumerate(modules):
-        name = module_display_name(module)
-        if not name or name in seen:
-            raise ValueError(f"LoRA registry requires unique non-empty names: {name!r}")
-        seen.add(name)
-        block_index, kind = classify_lora_module(name)
-        group_id = f"block:{block_index}:{kind}" if block_index is not None else f"global:{kind}"
-        down = getattr(getattr(module, "lora_down", None), "weight", None)
-        up = getattr(getattr(module, "lora_up", None), "weight", None)
-        registry.append({
-            "module_index": index,
-            "module_name": name,
-            "block_index": block_index,
-            "kind": kind,
-            "group_id": group_id,
-            "rank": int(getattr(module, "lora_dim", down.shape[0] if down is not None else 0)),
-            "down_shape": list(down.shape) if down is not None else None,
-            "up_shape": list(up.shape) if up is not None else None,
-        })
-    if not registry:
-        raise ValueError("LoRA registry is empty")
-    return registry
-
-
-def validate_complete_partition(registry: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
-    names = [str(row["module_name"]) for row in registry]
-    if len(names) != len(set(names)):
-        raise ValueError("LoRA registry contains duplicate module names")
-    invalid = [row for row in registry if row.get("kind") not in GROUP_KINDS or not row.get("group_id")]
-    if invalid:
-        raise ValueError("LoRA registry partition is incomplete")
-    counts = {kind: sum(row["kind"] == kind for row in registry) for kind in GROUP_KINDS}
-    groups = sorted({str(row["group_id"]) for row in registry})
-    return {"module_count": len(registry), "group_count": len(groups), "kind_counts": counts, "groups": groups}
-
-
-def registry_maps(registry: Sequence[Mapping[str, Any]]) -> Tuple[Dict[str, str], Dict[str, List[str]]]:
-    module_to_group = {str(row["module_name"]): str(row["group_id"]) for row in registry}
-    group_to_modules: Dict[str, List[str]] = defaultdict(list)
-    for module_name, group_id in module_to_group.items():
-        group_to_modules[group_id].append(module_name)
-    return module_to_group, {key: sorted(value) for key, value in group_to_modules.items()}
 
 
 @dataclass
