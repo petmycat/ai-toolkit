@@ -215,6 +215,28 @@ def normalize_canonical_timestep(timestep: torch.Tensor) -> torch.Tensor:
     return value
 
 
+def aggregate_activator_occurrences(
+    projected_states: torch.Tensor,
+    *,
+    occurrence_count: int,
+    token_count: int,
+    mode: str = "additive",
+) -> torch.Tensor:
+    if occurrence_count <= 0 or token_count <= 0:
+        raise ValueError("activator occurrence_count and token_count must be positive")
+    if mode != "additive":
+        raise ValueError("only additive activator occurrence aggregation is supported")
+    if projected_states.ndim != 2:
+        raise ValueError("projected activator states must have shape [occurrences*tokens,D]")
+    expected = occurrence_count * token_count
+    if projected_states.shape[0] != expected:
+        raise ValueError(
+            f"expected {expected} projected activator positions, got {projected_states.shape[0]}"
+        )
+    occurrences = projected_states.reshape(occurrence_count, token_count, projected_states.shape[-1])
+    return occurrences.sum(dim=0, keepdim=True)
+
+
 def effective_gates(q: torch.Tensor, style_strength: Any) -> torch.Tensor:
     if q.ndim != 2:
         raise ValueError("q must have shape [B,G]")

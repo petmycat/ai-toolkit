@@ -51,6 +51,8 @@ def test_phase_c_defaults_match_confirmed_contract():
     assert config.steps == 500
     assert config.conditioning_source == "projected_private_activator_states"
     assert config.activator_token_count == 4
+    assert config.activator_occurrence_count == 3
+    assert config.activator_occurrence_mode == "additive"
     assert config.activator_token_dim == 4
     assert config.temporal_anchor_count == 16
     assert config.contextual_rank == 4
@@ -76,6 +78,14 @@ def test_config_allows_reasonable_overrides_but_rejects_invalid_ranges():
     raw = _config()
     raw["q_max"] = 0.75
     with pytest.raises(ValueError, match="q_max"):
+        load_config(raw)
+    raw = _config()
+    raw["activator_occurrence_count"] = 0
+    with pytest.raises(ValueError, match="occurrence_count"):
+        load_config(raw)
+    raw = _config()
+    raw["activator_occurrence_mode"] = "mean"
+    with pytest.raises(ValueError, match="additive"):
         load_config(raw)
     raw = _config()
     raw["activator_token_dim"] = 16

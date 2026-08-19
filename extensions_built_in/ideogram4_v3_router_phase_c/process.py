@@ -21,6 +21,7 @@ from extensions_built_in.ideogram4_v3_residual_ablation.helpers import (
 from toolkit.residual_gating import (
     ResidualGateRouter,
     ResidualGateRuntime,
+    aggregate_activator_occurrences,
     active_registry_fingerprint,
     bind_active_registry,
     build_module_registry,
@@ -419,7 +420,7 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
                     f"output root contains legacy or incompatible Phase C artifact: {path.name}; "
                     "use a fresh Phase C V2 output_root"
                 )
-            if key == "router_config" and int(payload.get("contract_revision", 0)) != 3:
+            if key == "router_config" and int(payload.get("contract_revision", 0)) != 4:
                 raise RuntimeError("output root predates the audited Phase C V2 contract revision; use a fresh output_root")
             recorded_fingerprint = payload.get("run_fingerprint")
             if start_step > 0 and not recorded_fingerprint:
@@ -646,17 +647,27 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
     def _extract_projected_activator_states(self, embeds, torch):
         features = embeds.text_embeds[0]
         mask = embeds.trigger_masks[0].to(dtype=torch.bool)
-        if mask.shape[0] > features.shape[0]:
-            raise RuntimeError("private activator mask is longer than cached Qwen conditioning")
+        if mask.shape[0] != features.shape[0]:
+            raise RuntimeError("private activator mask length does not match cached Qwen conditioning")
         positions = torch.nonzero(mask, as_tuple=False).reshape(-1)
-        if positions.numel() != self.phase_c.activator_token_count:
+        token_count = self.phase_c.activator_token_count
+        occurrence_count = self.phase_c.activator_occurrence_count
+        expected_positions = token_count * occurrence_count
+        if positions.numel() != expected_positions:
             raise RuntimeError(
-                f"Phase C V2 requires exactly one private activator occurrence with "
-                f"{self.phase_c.activator_token_count} positions; found {positions.numel()}"
+                f"Phase C V2 requires {occurrence_count} activator occurrences with "
+                f"{token_count} virtual-token positions each; expected {expected_positions}, "
+                f"found {positions.numel()}"
             )
         transformer = self.sd.model
         selected = features[positions].to(self.sd.device_torch, dtype=self.sd.torch_dtype)
-        states = transformer.llm_cond_proj(transformer.llm_cond_norm(selected)).unsqueeze(0).float()
+        projected = transformer.llm_cond_proj(transformer.llm_cond_norm(selected)).float()
+        states = aggregate_activator_occurrences(
+            projected,
+            occurrence_count=occurrence_count,
+            token_count=token_count,
+            mode=self.phase_c.activator_occurrence_mode,
+        )
         if not bool(torch.isfinite(states).all()):
             raise RuntimeError("projected private activator states are non-finite")
         return states
@@ -990,7 +1001,7 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
         checkpoint_config = load_json(latest / self.phase_c.artifacts.router_config_filename)
         if checkpoint_config.get("schema") != "ai-toolkit.ideogram4-v3-phase-c-v2-router-config" or int(checkpoint_config.get("schema_version", 0)) != 2:
             raise RuntimeError("checkpoint router_config is not a Phase C V2 artifact")
-        if int(checkpoint_config.get("contract_revision", 0)) != 3:
+        if int(checkpoint_config.get("contract_revision", 0)) != 4:
             raise RuntimeError("checkpoint predates the audited Phase C V2 contract revision; start from a fresh output_root")
         if checkpoint_config.get("run_fingerprint") != run_fingerprint:
             raise RuntimeError("checkpoint router_config fingerprint mismatch")
@@ -1014,7 +1025,7 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
         return {
             "schema": "ai-toolkit.ideogram4-v3-phase-c-v2-source",
             "schema_version": 2,
-            "contract_revision": 3,
+            "contract_revision": 4,
             "status": "resolved",
             "inputs": {
                 **self.input_refs,
@@ -1026,7 +1037,9 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
             "active_registry": active_registry,
             "frozen": ["Ideogram4", "Qwen", "trigger embeddings", "A1/A2 TE adapter", "V3 diffusion LoRA"],
             "trainable": ["Phase C V2 activator projector and local temporal router"],
-            "trigger_token_count": self.phase_c.activator_token_count,
+            "trigger_token_count_per_occurrence": self.phase_c.activator_token_count,
+            "activator_occurrence_count": self.phase_c.activator_occurrence_count,
+            "activator_occurrence_mode": self.phase_c.activator_occurrence_mode,
             "activator_mask_schema": "a1-a2-trigger-mask-v1",
         }
 

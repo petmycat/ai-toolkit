@@ -106,6 +106,26 @@ class DeterministicStratifiedTimestepSampler:
         return rng.randint(lower, upper), bin_index
 
 
+def aggregate_projected_activator_occurrences(
+    projected: Any,
+    *,
+    occurrence_count: int,
+    token_count: int,
+    mode: str = "additive",
+):
+    if occurrence_count <= 0 or token_count <= 0:
+        raise ValueError("activator occurrence_count and token_count must be positive")
+    if mode != "additive":
+        raise ValueError("only additive activator occurrence aggregation is supported")
+    if projected.ndim != 2 or projected.shape[0] != occurrence_count * token_count:
+        raise ValueError(
+            f"projected activator states must have shape "
+            f"[{occurrence_count * token_count},D]"
+        )
+    occurrences = projected.reshape(occurrence_count, token_count, projected.shape[-1])
+    return occurrences.sum(dim=0, keepdim=True)
+
+
 def detect_active_groups(registry: Sequence[Mapping[str, Any]], epsilon: float = 0.0) -> Tuple[str, ...]:
     active = set()
     for row in registry:
@@ -188,7 +208,7 @@ def router_config_payload(config: Any, active_registry: Mapping[str, Any], condi
     return {
         "schema": "ai-toolkit.ideogram4-v3-phase-c-v2-router-config",
         "schema_version": 2,
-        "contract_revision": 3,
+        "contract_revision": 4,
         "canonical_api": "toolkit.residual_gating.ResidualGateRouter",
         "runtime_api": "toolkit.residual_gating.ResidualGateRuntime",
         "conditioning_source": config.conditioning_source,
@@ -196,6 +216,9 @@ def router_config_payload(config: Any, active_registry: Mapping[str, Any], condi
         "conditioning_normalization": "shared_layer_norm",
         "activator_mask_schema": "a1-a2-trigger-mask-v1",
         "activator_token_count": int(config.activator_token_count),
+        "activator_occurrence_count": int(config.activator_occurrence_count),
+        "activator_occurrence_mode": config.activator_occurrence_mode,
+        "activator_pre_router_aggregation": "sum_by_virtual_token_index",
         "activator_token_dim": int(config.activator_token_dim),
         "activator_code_dim": int(config.activator_token_count * config.activator_token_dim),
         "temporal_anchor_count": anchor_count,

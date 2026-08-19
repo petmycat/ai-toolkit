@@ -7,6 +7,7 @@ from torch.utils.checkpoint import checkpoint
 from toolkit.residual_gating import (
     ResidualGateRouter,
     active_registry_fingerprint,
+    aggregate_activator_occurrences,
     bind_active_registry,
     build_module_registry,
     current_residual_gates,
@@ -47,6 +48,27 @@ def test_router_contract_and_zero_initialized_q():
     assert torch.equal(router.universal_anchors, torch.zeros_like(router.universal_anchors))
     assert torch.equal(router.context_out, torch.zeros_like(router.context_out))
     assert router.context_in.abs().sum() > 0
+
+
+def test_additive_multi_occurrence_aggregation_preserves_virtual_token_slots():
+    projected = torch.arange(3 * 4 * 2, dtype=torch.float32).reshape(12, 2)
+    aggregated = aggregate_activator_occurrences(
+        projected, occurrence_count=3, token_count=4, mode="additive"
+    )
+    expected = projected.reshape(3, 4, 2).sum(dim=0, keepdim=True)
+    assert aggregated.shape == (1, 4, 2)
+    assert torch.equal(aggregated, expected)
+
+
+def test_occurrence_aggregation_rejects_wrong_position_count_and_mode():
+    with pytest.raises(ValueError, match="expected 12"):
+        aggregate_activator_occurrences(
+            torch.zeros(8, 2), occurrence_count=3, token_count=4, mode="additive"
+        )
+    with pytest.raises(ValueError, match="only additive"):
+        aggregate_activator_occurrences(
+            torch.zeros(12, 2), occurrence_count=3, token_count=4, mode="mean"
+        )
 
 
 def test_effective_gate_anchors_are_exact_and_lower_branch_ignores_q():

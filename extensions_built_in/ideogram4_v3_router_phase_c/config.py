@@ -63,6 +63,8 @@ class PhaseCRouterConfig:
     output_root: str
     conditioning_source: str = "projected_private_activator_states"
     activator_token_count: int = 4
+    activator_occurrence_count: int = 3
+    activator_occurrence_mode: str = "additive"
     activator_token_dim: int = 4
     temporal_anchor_count: int = 16
     temporal_interpolation: str = "linear"
@@ -129,6 +131,8 @@ def load_config(raw: Mapping[str, Any]) -> PhaseCRouterConfig:
         **required,
         conditioning_source=str(raw.get("conditioning_source", "projected_private_activator_states")),
         activator_token_count=int(raw.get("activator_token_count", 4)),
+        activator_occurrence_count=int(raw.get("activator_occurrence_count", 3)),
+        activator_occurrence_mode=str(raw.get("activator_occurrence_mode", "additive")),
         activator_token_dim=int(raw.get("activator_token_dim", 4)),
         temporal_anchor_count=int(raw.get("temporal_anchor_count", 16)),
         temporal_interpolation=str(raw.get("temporal_interpolation", "linear")),
@@ -184,7 +188,11 @@ def validate_config(config: PhaseCRouterConfig) -> None:
     if config.conditioning_source != "projected_private_activator_states":
         raise ValueError("Phase C V2 requires projected_private_activator_states")
     if config.activator_token_count != 4:
-        raise ValueError("current A1/A2 contract requires exactly four activator tokens")
+        raise ValueError("current A1/A2 contract requires exactly four virtual tokens per activator occurrence")
+    if config.activator_occurrence_count <= 0:
+        raise ValueError("activator_occurrence_count must be positive")
+    if config.activator_occurrence_mode != "additive":
+        raise ValueError("current A1/A2 contract requires additive activator occurrence aggregation")
     if not 1 <= config.activator_token_dim <= 8 or config.activator_token_count * config.activator_token_dim > 32:
         raise ValueError("activator code must be positive and no larger than 32 dimensions")
     if config.temporal_anchor_count < 2 or config.temporal_interpolation != "linear":
