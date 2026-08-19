@@ -28,23 +28,25 @@ class FakeLoRA:
 
 
 def test_router_contract_and_zero_initialized_q():
-    router = ResidualGateRouter(group_count=3)
+    router = ResidualGateRouter(
+        group_count=3,
+        conditioning_dim=8,
+        activator_token_count=4,
+        activator_token_dim=2,
+        temporal_anchor_count=4,
+        contextual_rank=2,
+    )
     tau = torch.tensor([0.0, 0.25, 1.0])
-    features = timestep_fourier_features(tau)
-    q = router(tau)
+    states = torch.randn(3, 4, 8)
+    code = router.encode_activator(states)
+    q = router(tau, code)
 
-    assert features.shape == (3, 32)
-    assert not torch.equal(features[0], features[-1])
+    assert code.shape == (3, 8)
     assert q.shape == (3, 3)
     assert torch.equal(q, torch.zeros_like(q))
-    assert router.net[0].in_features == 32
-    assert router.net[0].out_features == 64
-    assert router.net[2].in_features == 64
-    assert router.net[2].out_features == 16
-    assert router.net[4].in_features == 16
-    assert router.net[4].out_features == 3
-    assert torch.equal(router.net[4].weight, torch.zeros_like(router.net[4].weight))
-    assert torch.equal(router.net[4].bias, torch.zeros_like(router.net[4].bias))
+    assert torch.equal(router.universal_anchors, torch.zeros_like(router.universal_anchors))
+    assert torch.equal(router.context_out, torch.zeros_like(router.context_out))
+    assert router.context_in.abs().sum() > 0
 
 
 def test_effective_gate_anchors_are_exact_and_lower_branch_ignores_q():
@@ -61,22 +63,66 @@ def test_effective_gate_anchors_are_exact_and_lower_branch_ignores_q():
 
 
 def test_initial_style_one_is_identity_and_only_router_receives_gradient():
-    router = ResidualGateRouter(group_count=2)
+    router = ResidualGateRouter(group_count=2, conditioning_dim=8)
     frozen_lora = torch.nn.Linear(2, 2, bias=False)
     frozen_lora.requires_grad_(False)
     residual = frozen_lora(torch.tensor([[1.0, 2.0]])).detach()
 
-    q = router(torch.tensor([0.4]))
+    code = router.encode_activator(torch.randn(1, 4, 8))
+    q = router(torch.tensor([0.4]), code)
     gates = effective_gates(q, 1.0)
     assert torch.equal(gates, torch.ones_like(gates))
     loss = (residual * gates[:, :1]).square().sum()
     loss.backward()
 
     assert all(parameter.grad is None for parameter in frozen_lora.parameters())
-    assert router.net[4].weight.grad is not None
-    assert router.net[4].weight.grad.abs().sum() > 0
-    assert router.net[4].bias.grad is not None
-    assert router.net[4].bias.grad.abs().sum() > 0
+    assert router.universal_anchors.grad is not None
+    assert router.universal_anchors.grad.abs().sum() > 0
+    assert router.context_out.grad is not None
+    assert router.context_out.grad.abs().sum() > 0
+
+
+def test_bound_and_applied_contextual_increment_match_full_field_math():
+    router = ResidualGateRouter(group_count=2, conditioning_dim=8, temporal_anchor_count=2)
+    with torch.no_grad():
+        router.universal_anchors.fill_(0.2)
+        router.context_out.fill_(0.1)
+    code = router.encode_activator(torch.randn(1, 4, 8))
+    universal_raw, contextual_raw, full = router.components(torch.tensor([0.5]), code)
+    universal_applied = router.bound(universal_raw)
+    contextual_increment = full - universal_applied
+    assert torch.allclose(full, router.bound(universal_raw + contextual_raw))
+    assert torch.allclose(universal_applied + contextual_increment, full)
+    assert not torch.allclose(contextual_increment, router.bound(contextual_raw))
+
+
+def test_temporal_smoothness_is_anchor_spacing_normalized():
+    coarse = ResidualGateRouter(group_count=1, conditioning_dim=8, temporal_anchor_count=2)
+    fine = ResidualGateRouter(group_count=1, conditioning_dim=8, temporal_anchor_count=5)
+    with torch.no_grad():
+        coarse.universal_anchors[:, 0] = torch.linspace(0.0, 1.0, 2)
+        fine.universal_anchors[:, 0] = torch.linspace(0.0, 1.0, 5)
+    assert coarse.universal_temporal_smoothness().item() == pytest.approx(1.0)
+    assert fine.universal_temporal_smoothness().item() == pytest.approx(1.0)
+
+
+def test_local_temporal_gradient_touches_only_neighboring_anchors():
+    router = ResidualGateRouter(
+        group_count=2,
+        conditioning_dim=8,
+        temporal_anchor_count=4,
+        contextual_rank=2,
+    )
+    code = router.encode_activator(torch.randn(1, 4, 8))
+    router(torch.tensor([0.5]), code).sum().backward()
+    universal_grad = router.universal_anchors.grad.abs().sum(dim=1)
+    contextual_grad = router.context_out.grad.abs().sum(dim=(1, 2))
+    assert universal_grad.tolist()[0] == 0.0
+    assert universal_grad.tolist()[3] == 0.0
+    assert universal_grad[1] > 0 and universal_grad[2] > 0
+    assert contextual_grad.tolist()[0] == 0.0
+    assert contextual_grad.tolist()[3] == 0.0
+    assert contextual_grad[1] > 0 and contextual_grad[2] > 0
 
 
 def test_canonical_timestep_contract_rejects_noncanonical_inputs():

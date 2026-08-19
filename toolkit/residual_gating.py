@@ -235,6 +235,7 @@ def effective_gates(q: torch.Tensor, style_strength: Any) -> torch.Tensor:
 
 
 def timestep_fourier_features(timestep: torch.Tensor, feature_dim: int = 32) -> torch.Tensor:
+    """Legacy diagnostic helper; Phase C V2 does not use global Fourier features."""
     if feature_dim <= 0 or feature_dim % 2:
         raise ValueError("timestep Fourier feature_dim must be a positive even integer")
     tau = normalize_canonical_timestep(timestep)
@@ -244,42 +245,119 @@ def timestep_fourier_features(timestep: torch.Tensor, feature_dim: int = 32) -> 
 
 
 class ResidualGateRouter(nn.Module):
+    """Phase C V2 activator-conditioned, locally parameterized temporal field."""
+
+    schema_version = 2
+
     def __init__(
         self,
         group_count: int,
-        timestep_embed_dim: int = 32,
-        hidden_dim: int = 64,
-        router_rank: int = 16,
+        conditioning_dim: int = 4608,
+        activator_token_count: int = 4,
+        activator_token_dim: int = 4,
+        temporal_anchor_count: int = 16,
+        contextual_rank: int = 4,
         q_max: float = 0.5,
     ) -> None:
         super().__init__()
-        if group_count <= 0:
-            raise ValueError("group_count must be positive")
-        if timestep_embed_dim <= 0 or timestep_embed_dim % 2:
-            raise ValueError("timestep_embed_dim must be a positive even integer")
-        if hidden_dim <= 0 or router_rank <= 0:
-            raise ValueError("router hidden_dim and router_rank must be positive")
+        if group_count <= 0 or conditioning_dim <= 0:
+            raise ValueError("group_count and conditioning_dim must be positive")
+        if activator_token_count <= 0 or activator_token_dim <= 0:
+            raise ValueError("activator token dimensions must be positive")
+        if temporal_anchor_count < 2 or contextual_rank <= 0:
+            raise ValueError("at least two temporal anchors and positive contextual_rank are required")
         if not 0.0 < q_max <= 0.5:
             raise ValueError("q_max must be in (0,0.5]")
         self.group_count = int(group_count)
-        self.timestep_embed_dim = int(timestep_embed_dim)
-        self.hidden_dim = int(hidden_dim)
-        self.router_rank = int(router_rank)
+        self.conditioning_dim = int(conditioning_dim)
+        self.activator_token_count = int(activator_token_count)
+        self.activator_token_dim = int(activator_token_dim)
+        self.activator_code_dim = self.activator_token_count * self.activator_token_dim
+        self.temporal_anchor_count = int(temporal_anchor_count)
+        self.contextual_rank = int(contextual_rank)
         self.q_max = float(q_max)
-        self.net = nn.Sequential(
-            nn.Linear(self.timestep_embed_dim, self.hidden_dim),
-            nn.SiLU(),
-            nn.Linear(self.hidden_dim, self.router_rank),
-            nn.SiLU(),
-            nn.Linear(self.router_rank, self.group_count),
-        )
-        final_projection = self.net[-1]
-        nn.init.zeros_(final_projection.weight)
-        nn.init.zeros_(final_projection.bias)
 
-    def forward(self, canonical_tau: torch.Tensor) -> torch.Tensor:
-        raw = self.net(timestep_fourier_features(canonical_tau, self.timestep_embed_dim))
-        return self.q_max * torch.tanh(raw)
+        self.activator_norm = nn.LayerNorm(self.conditioning_dim)
+        self.activator_projection = nn.Linear(self.conditioning_dim, self.activator_token_dim)
+        self.universal_anchors = nn.Parameter(
+            torch.zeros(self.temporal_anchor_count, self.group_count, dtype=torch.float32)
+        )
+        self.context_in = nn.Parameter(
+            torch.empty(self.temporal_anchor_count, self.contextual_rank, self.activator_code_dim)
+        )
+        self.context_out = nn.Parameter(
+            torch.zeros(self.temporal_anchor_count, self.group_count, self.contextual_rank)
+        )
+        nn.init.normal_(self.context_in, mean=0.0, std=0.02)
+
+    def encode_activator(self, projected_activator_states: torch.Tensor) -> torch.Tensor:
+        expected = (self.activator_token_count, self.conditioning_dim)
+        if projected_activator_states.ndim != 3 or tuple(projected_activator_states.shape[1:]) != expected:
+            raise ValueError(
+                "projected activator states must have shape "
+                f"[B,{self.activator_token_count},{self.conditioning_dim}]"
+            )
+        normalized = self.activator_norm(projected_activator_states.float())
+        compressed = torch.nn.functional.silu(self.activator_projection(normalized))
+        return compressed.reshape(compressed.shape[0], self.activator_code_dim)
+
+    def _anchor_indices(self, canonical_tau: torch.Tensor):
+        tau = normalize_canonical_timestep(canonical_tau).reshape(-1)
+        position = tau * float(self.temporal_anchor_count - 1)
+        left = torch.floor(position).long().clamp(0, self.temporal_anchor_count - 1)
+        right = (left + 1).clamp(max=self.temporal_anchor_count - 1)
+        alpha = (position - left.to(position.dtype)).unsqueeze(-1)
+        return left, right, alpha
+
+    def anchor_components(self, activator_code: torch.Tensor):
+        if activator_code.ndim != 2 or activator_code.shape[1] != self.activator_code_dim:
+            raise ValueError(f"activator_code must have shape [B,{self.activator_code_dim}]")
+        hidden = torch.nn.functional.silu(
+            torch.einsum("krc,bc->bkr", self.context_in, activator_code.float())
+        )
+        contextual = torch.einsum("kgr,bkr->bkg", self.context_out, hidden)
+        universal = self.universal_anchors.unsqueeze(0).expand(activator_code.shape[0], -1, -1)
+        return universal, contextual
+
+    def bound(self, raw: torch.Tensor) -> torch.Tensor:
+        if not isinstance(raw, torch.Tensor) or raw.ndim != 2 or raw.shape[1] != self.group_count:
+            raise ValueError(f"raw routing values must have shape [B,{self.group_count}]")
+        return self.q_max * torch.tanh(raw.float() / self.q_max)
+
+    def components(self, canonical_tau: torch.Tensor, activator_code: torch.Tensor):
+        universal_anchors, contextual_anchors = self.anchor_components(activator_code)
+        left, right, alpha = self._anchor_indices(canonical_tau)
+        if left.shape[0] == 1 and activator_code.shape[0] != 1:
+            left = left.expand(activator_code.shape[0])
+            right = right.expand(activator_code.shape[0])
+            alpha = alpha.expand(activator_code.shape[0], 1)
+        if left.shape[0] != activator_code.shape[0]:
+            raise ValueError("timestep batch must be one or match activator_code batch")
+        rows = torch.arange(activator_code.shape[0], device=activator_code.device)
+        universal_raw = (1.0 - alpha) * universal_anchors[rows, left] + alpha * universal_anchors[rows, right]
+        contextual_raw = (1.0 - alpha) * contextual_anchors[rows, left] + alpha * contextual_anchors[rows, right]
+        total_raw = universal_raw + contextual_raw
+        return universal_raw, contextual_raw, self.bound(total_raw)
+
+    def forward(self, canonical_tau: torch.Tensor, activator_code: torch.Tensor) -> torch.Tensor:
+        return self.components(canonical_tau, activator_code)[2]
+
+    def universal(self, canonical_tau: torch.Tensor, batch_size: int = 1) -> torch.Tensor:
+        tau = normalize_canonical_timestep(canonical_tau)
+        code = torch.zeros(batch_size, self.activator_code_dim, device=tau.device, dtype=torch.float32)
+        left, right, alpha = self._anchor_indices(tau)
+        if left.shape[0] == 1 and batch_size != 1:
+            left, right, alpha = left.expand(batch_size), right.expand(batch_size), alpha.expand(batch_size, 1)
+        raw = (1.0 - alpha) * self.universal_anchors[left] + alpha * self.universal_anchors[right]
+        return self.bound(raw)
+
+    def universal_penalty(self) -> torch.Tensor:
+        return self.universal_anchors.float().square().mean()
+
+    def universal_temporal_smoothness(self) -> torch.Tensor:
+        spacing = 1.0 / float(self.temporal_anchor_count - 1)
+        derivative = (self.universal_anchors[1:] - self.universal_anchors[:-1]).float() / spacing
+        return derivative.square().mean()
 
 
 @dataclass(frozen=True)

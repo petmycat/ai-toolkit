@@ -48,28 +48,28 @@ def _registry(norm=1.0):
 
 def test_phase_c_defaults_match_confirmed_contract():
     config = load_config(_config())
-    assert config.steps == 400
+    assert config.steps == 500
+    assert config.conditioning_source == "projected_private_activator_states"
+    assert config.activator_token_count == 4
+    assert config.activator_token_dim == 4
+    assert config.temporal_anchor_count == 16
+    assert config.contextual_rank == 4
+    assert config.same_timestep_content_batch == 4
     assert config.timestep_sampling == "stratified_uniform"
-    assert config.timestep_bins == 10
-    assert config.timestep_embed_dim == 32
-    assert config.hidden_dim == 64
-    assert config.router_rank == 16
+    assert config.timestep_bins == 16
     assert config.q_max == 0.5
-    assert config.optimizer == "adamw"
-    assert config.optimizer_params == {}
-    assert config.weight_decay == pytest.approx(1.0e-4)
-    assert config.lambda_gate == pytest.approx(1.0e-3)
-    assert config.temporal_smoothness.enabled
-    assert config.temporal_smoothness.weight == pytest.approx(1.0e-4)
-    assert config.temporal_smoothness.delta == pytest.approx(0.02)
-    assert config.validation.every == 25
+    assert config.optimizer == "adamw8bit"
+    assert config.lambda_universal == pytest.approx(1.0e-3)
+    assert config.lambda_contextual == pytest.approx(2.0e-3)
+    assert config.temporal_smoothness.universal_only
+    assert config.validation.evaluate_context_shuffle
 
 
 def test_config_allows_reasonable_overrides_but_rejects_invalid_ranges():
     raw = _config()
-    raw.update({"lambda_gate": 2.0e-3, "validation": {"every": 20}, "temporal_smoothness": {"weight": 2.0e-4, "delta": 0.03}})
+    raw.update({"lambda_contextual": 3.0e-3, "validation": {"every": 20}, "temporal_smoothness": {"weight": 2.0e-4}})
     config = load_config(raw)
-    assert config.lambda_gate == pytest.approx(2.0e-3)
+    assert config.lambda_contextual == pytest.approx(3.0e-3)
     assert config.validation.every == 20
     assert config.temporal_smoothness.weight == pytest.approx(2.0e-4)
 
@@ -78,8 +78,8 @@ def test_config_allows_reasonable_overrides_but_rejects_invalid_ranges():
     with pytest.raises(ValueError, match="q_max"):
         load_config(raw)
     raw = _config()
-    raw["router_rank"] = 128
-    with pytest.raises(ValueError, match="router_rank"):
+    raw["activator_token_dim"] = 16
+    with pytest.raises(ValueError, match="32 dimensions"):
         load_config(raw)
 
 
@@ -106,13 +106,8 @@ def test_config_rejects_unknown_nonfinite_odd_and_unsafe_artifact_values():
         load_config(raw)
 
     raw = _config()
-    raw["timestep_embed_dim"] = 31
-    with pytest.raises(ValueError, match="even"):
-        load_config(raw)
-
-    raw = _config()
-    raw["timestep_bins"] = 6
-    with pytest.raises(ValueError, match="divide 1000"):
+    raw["timestep_bins"] = 1
+    with pytest.raises(ValueError, match=r"\[2,100\]"):
         load_config(raw)
 
     raw = _config()
@@ -121,8 +116,23 @@ def test_config_rejects_unknown_nonfinite_odd_and_unsafe_artifact_values():
         load_config(raw)
 
     raw = _config()
+    raw["validation_item_limit"] = 1
+    with pytest.raises(ValueError, match="context-shuffled"):
+        load_config(raw)
+
+    raw = _config()
+    raw["resume"] = "false"
+    with pytest.raises(ValueError, match="YAML boolean"):
+        load_config(raw)
+
+    raw = _config()
+    raw["validation"] = {"log_temporal_svd": False}
+    with pytest.raises(ValueError, match="scientific validation contract"):
+        load_config(raw)
+
+    raw = _config()
     raw["typo_learning_rate"] = 1.0
-    with pytest.raises(ValueError, match="unknown phase_c_router"):
+    with pytest.raises(ValueError, match="unknown phase_c_v2"):
         load_config(raw)
 
     raw = _config()
@@ -144,8 +154,13 @@ def test_stratified_sampler_is_deterministic_and_cycles_all_bins():
     second = DeterministicStratifiedTimestepSampler(42, 10)
     samples = [first.sample(step) for step in range(1, 21)]
     assert samples == [second.sample(step) for step in range(1, 21)]
-    assert [bin_index for _, bin_index in samples[:10]] == list(range(10))
-    assert all(bin_index * 100 <= timestep <= (1000 if bin_index == 9 else (bin_index + 1) * 100 - 1) for timestep, bin_index in samples)
+    assert sorted(bin_index for _, bin_index in samples[:10]) == list(range(10))
+    assert sorted(bin_index for _, bin_index in samples[10:]) == list(range(10))
+    assert [bin_index for _, bin_index in samples[:10]] != [bin_index for _, bin_index in samples[10:]]
+    for timestep, bin_index in samples:
+        lower = (bin_index * 1001) // 10
+        upper = ((bin_index + 1) * 1001) // 10 - 1
+        assert lower <= timestep <= upper
 
 
 def test_active_groups_come_from_actual_v3_norms_and_registry_contract():
@@ -173,7 +188,9 @@ def test_gate_contract_is_fixed_style_one_plus_q_and_regularizes_q():
 
 def test_validation_grid_and_best_selection_use_validation_name_only():
     grid = validation_grid([100, 500], [0, 1000], [7, 8])
-    assert len(grid) == 8
+    assert len(grid) == 6
+    assert sum(record["grid"] == "canonical" for record in grid) == 4
+    assert sum(record["grid"] == "dense" for record in grid) == 2
     records = [
         {"step": 25, "split": "validation", "grid": "canonical", "loss": 0.4},
         {"step": 25, "split": "validation", "grid": "canonical", "loss": 0.2},
@@ -206,6 +223,24 @@ def test_phase_c_process_exposes_timestamped_progress_output(monkeypatch):
     instance._run_started_at = None
     instance._phase_c_progress("training ready")
     assert messages == ["[Phase C +0s] training ready"]
+
+
+def test_fresh_run_cleanup_removes_stale_checkpoints_and_metrics(tmp_path):
+    from extensions_built_in.ideogram4_v3_router_phase_c.process import Ideogram4V3RouterPhaseCProcess
+
+    instance = object.__new__(Ideogram4V3RouterPhaseCProcess)
+    instance.output_root = tmp_path
+    instance.phase_c = load_config({**_config(), "output_root": str(tmp_path)})
+    checkpoint = tmp_path / instance.phase_c.artifacts.checkpoints_dir / "step_000025"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "stale.txt").write_text("stale", encoding="utf-8")
+    paths = instance._artifact_paths()
+    rewrite_jsonl(paths["training_metrics"], [{"step": 25}])
+
+    instance._sanitize_resume_artifacts(paths, 0)
+
+    assert not (tmp_path / instance.phase_c.artifacts.checkpoints_dir).exists()
+    assert load_jsonl(paths["training_metrics"]) == []
 
 
 def test_extension_registers_disposable_process_without_sdtrainer_semantics(monkeypatch):

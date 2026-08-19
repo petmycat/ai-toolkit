@@ -84,22 +84,25 @@ def load_json(path: os.PathLike | str) -> Dict[str, Any]:
 
 
 class DeterministicStratifiedTimestepSampler:
-    def __init__(self, seed: int, bins: int = 10, maximum: int = 1000):
-        if bins <= 1 or maximum <= 0 or maximum % bins:
-            raise ValueError("timestep maximum must be positive and divisible by bins")
+    def __init__(self, seed: int, bins: int = 16, maximum: int = 1000):
+        if bins <= 1 or maximum <= 0 or bins > maximum:
+            raise ValueError("timestep maximum must be positive and bins must lie in [2, maximum]")
         self.seed = int(seed)
         self.bins = int(bins)
         self.maximum = int(maximum)
-        self.bin_width = maximum // bins
 
     def sample(self, step: int) -> Tuple[int, int]:
         if step <= 0:
             raise ValueError("step must be positive")
-        bin_index = (step - 1) % self.bins
         cycle = (step - 1) // self.bins
-        rng = random.Random((self.seed << 32) ^ (cycle * self.bins + bin_index))
-        lower = bin_index * self.bin_width
-        upper = self.maximum if bin_index == self.bins - 1 else (bin_index + 1) * self.bin_width - 1
+        cycle_offset = (step - 1) % self.bins
+        permutation = list(range(self.bins))
+        random.Random((self.seed << 32) ^ cycle).shuffle(permutation)
+        bin_index = permutation[cycle_offset]
+        population = self.maximum + 1
+        lower = (bin_index * population) // self.bins
+        upper = ((bin_index + 1) * population) // self.bins - 1
+        rng = random.Random((self.seed << 32) ^ (cycle * self.bins + bin_index) ^ 0x9E3779B97F4A7C15)
         return rng.randint(lower, upper), bin_index
 
 
@@ -152,11 +155,15 @@ def temporal_smoothness(router: Any, normalized_timestep: Any, delta: float):
 
 
 def validation_grid(canonical: Sequence[int], dense: Sequence[int], seeds: Sequence[int]) -> List[Dict[str, Any]]:
-    records = []
-    for grid_name, timesteps in (("canonical", canonical), ("dense", dense)):
-        for seed in seeds:
-            for timestep in timesteps:
-                records.append({"grid": grid_name, "seed": int(seed), "timestep": int(timestep)})
+    records = [
+        {"grid": "canonical", "seed": int(seed), "timestep": int(timestep)}
+        for seed in seeds
+        for timestep in canonical
+    ]
+    records.extend(
+        {"grid": "dense", "seed": None, "timestep": int(timestep)}
+        for timestep in dense
+    )
     return records
 
 
@@ -165,7 +172,9 @@ def select_best_validation(records: Iterable[Mapping[str, Any]]) -> Tuple[int, f
     for record in records:
         if record.get("split") != "validation" or record.get("grid") != "canonical":
             continue
-        loss = record.get("loss")
+        loss = record.get("full_router_loss")
+        if not isinstance(loss, (int, float)):
+            loss = record.get("loss")
         if isinstance(loss, (int, float)) and math.isfinite(float(loss)):
             by_step.setdefault(int(record["step"]), []).append(float(loss))
     if not by_step:
@@ -174,41 +183,53 @@ def select_best_validation(records: Iterable[Mapping[str, Any]]) -> Tuple[int, f
     return step, sum(losses) / len(losses)
 
 
-def router_config_payload(config: Any, active_registry: Mapping[str, Any]) -> Dict[str, Any]:
+def router_config_payload(config: Any, active_registry: Mapping[str, Any], conditioning_dim: int) -> Dict[str, Any]:
+    anchor_count = int(config.temporal_anchor_count)
     return {
-        "schema": "ai-toolkit.ideogram4-v3-phase-c-router-config",
-        "schema_version": 1,
+        "schema": "ai-toolkit.ideogram4-v3-phase-c-v2-router-config",
+        "schema_version": 2,
+        "contract_revision": 3,
         "canonical_api": "toolkit.residual_gating.ResidualGateRouter",
         "runtime_api": "toolkit.residual_gating.ResidualGateRuntime",
-        "timestep_feature_encoding": "sin_cos_pi_integer_v2",
-        "style_strength": {
-            "range": [0.0, 1.0],
-            "default": 0.5,
-            "step": 0.01,
-            "equation_lower": "g = 2*s for 0 <= s <= 0.5",
-            "equation_upper": "g = 1 + (2*s - 1)*q(t) for 0.5 < s <= 1",
-            "anchors": {"0.0": "V3 diffusion residual off", "0.5": "exact ordinary V3", "1.0": "full Phase C orchestration"},
-        },
-        "training_gate_equation": "g = 1 + q(t)",
-        "timestep_embed_dim": int(config.timestep_embed_dim),
-        "hidden_dim": int(config.hidden_dim),
-        "router_rank": int(config.router_rank),
+        "conditioning_source": config.conditioning_source,
+        "conditioning_dim": int(conditioning_dim),
+        "conditioning_normalization": "shared_layer_norm",
+        "activator_mask_schema": "a1-a2-trigger-mask-v1",
+        "activator_token_count": int(config.activator_token_count),
+        "activator_token_dim": int(config.activator_token_dim),
+        "activator_code_dim": int(config.activator_token_count * config.activator_token_dim),
+        "temporal_anchor_count": anchor_count,
+        "anchor_locations": [index / float(anchor_count - 1) for index in range(anchor_count)],
+        "temporal_interpolation": config.temporal_interpolation,
+        "contextual_rank": int(config.contextual_rank),
         "q_max": float(config.q_max),
+        "style_strength": {
+            "range": [0.0, 1.0], "default": 0.5, "step": 0.01,
+            "equation_lower": "g = 2*s for 0 <= s <= 0.5",
+            "equation_upper": "g = 1 + (2*s - 1)*q(t,z_A) for 0.5 < s <= 1",
+            "anchors": {"0.0": "V3 diffusion residual off", "0.5": "exact ordinary V3", "1.0": "full Phase C V2 orchestration"},
+        },
+        "training_gate_equation": "g = 1 + q(t,z_A)",
         "active_registry": dict(active_registry),
         "training": {
-            "steps": int(config.steps),
+            "steps": int(config.steps), "seed": int(config.seed),
+            "checkpoint_every": int(config.checkpoint_every), "resume": bool(config.resume),
             "optimizer": config.optimizer,
-            "optimizer_params": dict(config.optimizer_params),
-            "fresh_optimizer": True,
-            "learning_rate": float(config.learning_rate),
-            "weight_decay": float(config.weight_decay),
-            "lambda_gate": float(config.lambda_gate),
+            "optimizer_params": dict(config.optimizer_params), "fresh_optimizer": True,
+            "learning_rate": float(config.learning_rate), "weight_decay": float(config.weight_decay),
+            "lambda_universal": float(config.lambda_universal),
+            "lambda_contextual": float(config.lambda_contextual),
+            "contextual_mean_multiplier": float(config.contextual_mean_multiplier),
+            "same_timestep_content_batch": int(config.same_timestep_content_batch),
+            "distinct_items_per_update": bool(config.distinct_items_per_update),
             "timestep_sampling": config.timestep_sampling,
+            "timestep_bins": int(config.timestep_bins),
             "train_item_limit": config.train_item_limit,
             "validation_item_limit": config.validation_item_limit,
-            "timestep_bins": int(config.timestep_bins),
             "temporal_smoothness": asdict(config.temporal_smoothness),
         },
+        "validation": asdict(config.validation),
+        "artifacts": asdict(config.artifacts),
     }
 
 

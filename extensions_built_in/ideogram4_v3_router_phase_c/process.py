@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import inspect
 import json
 import os
 import random
@@ -26,6 +25,7 @@ from toolkit.residual_gating import (
     bind_active_registry,
     build_module_registry,
     filter_active_registry,
+    effective_gates,
     residual_gate_runtime_context,
     serialize_active_registry,
 )
@@ -37,7 +37,6 @@ from .helpers import (
     artifact_ref,
     atomic_write_json,
     detect_active_groups,
-    gate_regularization,
     load_json,
     load_jsonl,
     rewrite_jsonl,
@@ -52,7 +51,10 @@ from .helpers import (
 class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
     def __init__(self, process_id: int, job, config: OrderedDict):
         BaseExtensionProcess.__init__(self, process_id, job, config)
-        self.phase_c = load_config(self.get_conf("phase_c_router", required=True))
+        legacy_config = self.get_conf("phase_c_router", None)
+        if legacy_config is not None:
+            raise ValueError("legacy phase_c_router configuration is not supported; use phase_c_v2")
+        self.phase_c = load_config(self.get_conf("phase_c_v2", required=True))
         self.device = self.get_conf("device", getattr(job, "device", "cuda"))
         self.output_root = Path(self.phase_c.output_root).resolve()
         self.ablation = {
@@ -68,6 +70,8 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
         self.text_activator = None
         self._run_started_at = None
         self._calibrated_embed_cache = {}
+        self._projected_activator_cache = {}
+        self._projected_activator_fingerprints = {}
         self._stock_embed_cache = {}
         self._latent_cache = {}
 
@@ -109,6 +113,7 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
             raise RuntimeError("active registry filtering disagrees with Phase C active-group detection")
         bind_active_registry(self.network.get_all_modules(), active_registry)
         active_payload = serialize_active_registry(active_registry)
+        self._active_registry_payload = active_payload
         registry_fingerprint = active_registry_fingerprint(active_registry)
         group_count = int(active_payload["group_count"])
 
@@ -116,14 +121,24 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
             f"active registry ready: {group_count} groups across {len(active_registry)} LoRA modules"
         )
         self._seed_everything(torch)
-        router = self._build_canonical_router(group_count).to(self.sd.device_torch, dtype=torch.float32)
+        conditioning_dim = int(self.sd.model.config.emb_dim)
+        router = self._build_canonical_router(group_count, conditioning_dim).to(
+            self.sd.device_torch, dtype=torch.float32
+        )
         optimizer = self._build_optimizer(router)
         self._phase_c_progress(
             f"router and optimizer ready: optimizer={self.phase_c.optimizer}, steps={self.phase_c.steps}"
         )
         paths = self._artifact_paths()
+        train_items, validation_items = self._load_items()
+        self._validation_item_count = len(validation_items)
+        self._validation_item_ids = tuple(item["dataset_relative_item_id"] for item in validation_items)
         source_manifest = self._source_manifest(active_payload, registry_fingerprint)
-        router_config = router_config_payload(self.phase_c, active_payload)
+        router_config = router_config_payload(self.phase_c, active_payload, conditioning_dim)
+        router_config["data_selection"] = {
+            "train_item_ids": [item["dataset_relative_item_id"] for item in train_items],
+            "validation_item_ids": list(self._validation_item_ids),
+        }
         run_fingerprint = self._run_fingerprint(source_manifest, router_config)
         start_step = (
             self._resume(router, optimizer, registry_fingerprint, run_fingerprint, torch)
@@ -135,23 +150,24 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
                 f"Phase C checkpoint step {start_step} exceeds configured steps {self.phase_c.steps}"
             )
         self._assert_router_only_trainable(router)
+        self._assert_output_root_schema(paths, start_step, run_fingerprint)
         self._sanitize_resume_artifacts(paths, start_step)
         if start_step:
+            self._validate_resume_prefix(paths, start_step)
             self._phase_c_progress(f"resumed compatible checkpoint at step {start_step}/{self.phase_c.steps}")
         else:
             self._phase_c_progress("starting from fresh zero-initialized router")
 
-        train_items, validation_items = self._load_items()
-        self._validation_item_count = len(validation_items)
         self._phase_c_progress(
             f"precomputing {len(train_items)} train and {len(validation_items)} validation items"
         )
         self._precompute_items(train_items + validation_items, torch)
         self._phase_c_progress("running real-model residual-gate preflight invariants")
-        self._assert_runtime_invariants(router, train_items[0], registry_fingerprint, start_step, torch)
+        self._assert_runtime_invariants(router, train_items, registry_fingerprint, start_step, torch)
         self._phase_c_progress("preflight invariants passed; entering router training")
         source_manifest["run_fingerprint"] = run_fingerprint
         atomic_write_json(paths["source_manifest"], source_manifest)
+        atomic_write_json(paths["group_registry"], active_payload)
         router_config["run_fingerprint"] = run_fingerprint
         atomic_write_json(paths["router_config"], router_config)
 
@@ -169,66 +185,118 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
         )
         for step in progress:
             timestep, bin_index = sampler.sample(step)
-            item = train_items[(step - 1) % len(train_items)]
-            prepared = self._prepare_training_case(item, timestep, self.phase_c.seed + step, torch)
+            selected_items = self._select_same_timestep_items(train_items, step)
             normalized = torch.tensor([timestep / 1000.0], device=self.sd.device_torch, dtype=torch.float32)
-            q_values = router(normalized)
-            gates = 1.0 + q_values
-            runtime = ResidualGateRuntime(gates, registry_fingerprint=registry_fingerprint)
             optimizer.zero_grad(set_to_none=True)
-            with residual_gate_runtime_context(self.network, runtime):
-                prediction = self._predict(prepared, prepared["prompt_template"], "full")
-            reconstruction = torch.mean((prediction.float() - prepared["target"].float()).square())
-            gate_penalty = gate_regularization(q_values)
-            smoothness = reconstruction.new_zeros(())
-            if self.phase_c.temporal_smoothness.enabled:
-                smoothness = temporal_smoothness(
-                    router, normalized, self.phase_c.temporal_smoothness.delta
+            reconstructions = []
+            contextual_penalties = []
+            q_rows = []
+            universal_rows = []
+            contextual_rows = []
+            activator_inputs = []
+            item_ids = []
+            for content_index, item in enumerate(selected_items):
+                noise_seed = self.phase_c.seed + step
+                prepared = self._prepare_training_case(item, timestep, noise_seed, torch)
+                projected = self._projected_activator_cache[item["dataset_relative_item_id"]].to(
+                    self.sd.device_torch, dtype=torch.float32
                 )
-            loss = (
-                reconstruction
-                + self.phase_c.lambda_gate * gate_penalty
+                activator_code = router.encode_activator(projected)
+                universal_q, contextual_q, q_values = router.components(normalized, activator_code)
+                gates = 1.0 + q_values
+                runtime = ResidualGateRuntime(gates, registry_fingerprint=registry_fingerprint)
+                with residual_gate_runtime_context(self.network, runtime):
+                    prediction = self._predict(prepared, prepared["prompt_template"], "full")
+                reconstruction = torch.mean((prediction.float() - prepared["target"].float()).square())
+                contextual_penalty = contextual_q.float().square().mean()
+                micro_loss = (
+                    reconstruction
+                    + self.phase_c.lambda_contextual * contextual_penalty
+                ) / float(len(selected_items))
+                self._assert_finite_training_values(
+                    step,
+                    reconstruction=reconstruction,
+                    contextual_penalty=contextual_penalty,
+                    q_values=q_values,
+                    gates=gates,
+                )
+                micro_loss.backward()
+                reconstructions.append(reconstruction.detach())
+                contextual_penalties.append(contextual_penalty.detach())
+                q_rows.append(q_values.detach())
+                universal_rows.append(universal_q.detach())
+                contextual_rows.append(contextual_q.detach())
+                activator_inputs.append(projected.detach())
+                item_ids.append(item["dataset_relative_item_id"])
+            batch_codes = router.encode_activator(torch.cat(activator_inputs, dim=0))
+            _, contextual_batch, _ = router.components(normalized, batch_codes)
+            contextual_mean_penalty = contextual_batch.mean(dim=0).square().mean()
+            contextual_mean_regularization = (
+                self.phase_c.lambda_contextual
+                * self.phase_c.contextual_mean_multiplier
+                * contextual_mean_penalty
+            )
+            self._assert_finite_training_values(
+                step,
+                contextual_mean_penalty=contextual_mean_penalty,
+                contextual_mean_regularization=contextual_mean_regularization,
+            )
+            contextual_mean_regularization.backward()
+            universal_penalty = router.universal_penalty()
+            smoothness = router.universal_temporal_smoothness() if self.phase_c.temporal_smoothness.enabled else universal_penalty.new_zeros(())
+            regularization = (
+                self.phase_c.lambda_universal * universal_penalty
                 + self.phase_c.temporal_smoothness.weight * smoothness
             )
             self._assert_finite_training_values(
                 step,
-                loss=loss,
-                reconstruction=reconstruction,
-                gate_penalty=gate_penalty,
-                temporal_smoothness=smoothness,
-                q_values=q_values,
-                gates=gates,
+                universal_penalty=universal_penalty,
+                temporal_universal_smoothness=smoothness,
+                regularization=regularization,
             )
-            loss.backward()
+            regularization.backward()
             self._assert_router_only_gradients(router, torch)
             optimizer.step()
+            self._assert_finite_optimizer(optimizer, step, torch)
             self._assert_finite_router(router, step, torch)
+            reconstruction = torch.stack(reconstructions).mean()
+            contextual_penalty = torch.stack(contextual_penalties).mean()
+            q_values = torch.cat(q_rows, dim=0)
+            universal_q = torch.cat(universal_rows, dim=0)
+            contextual_q = torch.cat(contextual_rows, dim=0)
+            loss = (
+                reconstruction
+                + self.phase_c.lambda_contextual * contextual_penalty
+                + contextual_mean_regularization.detach()
+                + regularization.detach()
+            )
             append_jsonl(paths["training_metrics"], {
-                "schema": "ai-toolkit.ideogram4-v3-phase-c-training-metric",
-                "schema_version": 1,
+                "schema": "ai-toolkit.ideogram4-v3-phase-c-v2-training-metric",
+                "schema_version": 2,
                 "step": step,
                 "split": "train",
-                "item_id": item["dataset_relative_item_id"],
+                "item_ids": item_ids,
+                "same_timestep_content_batch": len(item_ids),
+                "distinct_item_count": len(set(item_ids)),
                 "timestep": timestep,
                 "timestep_bin": bin_index,
-                "noise_seed": self.phase_c.seed + step,
-                "loss": float(loss.detach().item()),
-                "reconstruction_loss": float(reconstruction.detach().item()),
-                "gate_penalty": float(gate_penalty.detach().item()),
-                "temporal_smoothness": float(smoothness.detach().item()),
-                "mean_q": float(q_values.detach().mean().item()),
-                "mean_abs_q": float(q_values.detach().abs().mean().item()),
-                "max_abs_q": float(q_values.detach().abs().max().item()),
-                "std_q": float(q_values.detach().float().std(unbiased=False).item()),
-                "saturation_fraction": float((q_values.detach().abs() >= self.phase_c.q_max * 0.99).float().mean().item()),
-                "gate_min": float(gates.detach().min().item()),
-                "gate_max": float(gates.detach().max().item()),
-                "gate_mean": float(gates.detach().mean().item()),
+                "loss": float(loss.item()),
+                "reconstruction_loss": float(reconstruction.item()),
+                "universal_penalty": float(universal_penalty.detach().item()),
+                "contextual_penalty": float(contextual_penalty.item()),
+                "contextual_batch_mean_penalty": float(contextual_mean_penalty.detach().item()),
+                "temporal_universal_smoothness": float(smoothness.detach().item()),
+                "mean_abs_q_universal": float(universal_q.abs().mean().item()),
+                "mean_abs_q_contextual": float(contextual_q.abs().mean().item()),
+                "mean_abs_q_total": float(q_values.abs().mean().item()),
+                "max_abs_q": float(q_values.abs().max().item()),
+                "saturation_fraction": float((q_values.abs() >= self.phase_c.q_max * 0.99).float().mean().item()),
             })
             progress.set_postfix(
-                loss=f"{float(loss.detach().item()):.4g}",
-                recon=f"{float(reconstruction.detach().item()):.4g}",
-                abs_q=f"{float(q_values.detach().abs().mean().item()):.3g}",
+                loss=f"{float(loss.item()):.4g}",
+                recon=f"{float(reconstruction.item()):.4g}",
+                abs_q=f"{float(q_values.abs().mean().item()):.3g}",
+                contents=len(item_ids),
                 timestep=timestep,
                 refresh=False,
             )
@@ -290,17 +358,16 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
         if not self.dataset_root.is_dir():
             raise NotADirectoryError(self.dataset_root)
 
-    def _build_canonical_router(self, group_count: int):
-        values = {
-            "group_count": group_count,
-            "timestep_embed_dim": self.phase_c.timestep_embed_dim,
-            "hidden_dim": self.phase_c.hidden_dim,
-            "router_rank": self.phase_c.router_rank,
-            "q_max": self.phase_c.q_max,
-        }
-        signature = inspect.signature(ResidualGateRouter)
-        supported = {key: value for key, value in values.items() if key in signature.parameters}
-        return ResidualGateRouter(**supported)
+    def _build_canonical_router(self, group_count: int, conditioning_dim: int):
+        return ResidualGateRouter(
+            group_count=group_count,
+            conditioning_dim=conditioning_dim,
+            activator_token_count=self.phase_c.activator_token_count,
+            activator_token_dim=self.phase_c.activator_token_dim,
+            temporal_anchor_count=self.phase_c.temporal_anchor_count,
+            contextual_rank=self.phase_c.contextual_rank,
+            q_max=self.phase_c.q_max,
+        )
 
     def _build_optimizer(self, router):
         from toolkit.optimizer import get_optimizer
@@ -337,8 +404,42 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
+    def _assert_output_root_schema(self, paths, start_step: int, run_fingerprint: str) -> None:
+        expected = {
+            "source_manifest": "ai-toolkit.ideogram4-v3-phase-c-v2-source",
+            "router_config": "ai-toolkit.ideogram4-v3-phase-c-v2-router-config",
+        }
+        for key, schema in expected.items():
+            path = paths[key]
+            if not path.is_file():
+                continue
+            payload = load_json(path)
+            if payload.get("schema") != schema or int(payload.get("schema_version", 0)) != 2:
+                raise RuntimeError(
+                    f"output root contains legacy or incompatible Phase C artifact: {path.name}; "
+                    "use a fresh Phase C V2 output_root"
+                )
+            if key == "router_config" and int(payload.get("contract_revision", 0)) != 3:
+                raise RuntimeError("output root predates the audited Phase C V2 contract revision; use a fresh output_root")
+            recorded_fingerprint = payload.get("run_fingerprint")
+            if start_step > 0 and not recorded_fingerprint:
+                raise RuntimeError(f"resumed Phase C V2 artifact lacks run_fingerprint: {path.name}")
+            if start_step > 0 and recorded_fingerprint != run_fingerprint:
+                raise RuntimeError(f"resumed Phase C V2 artifact run_fingerprint mismatch: {path.name}")
+        if start_step == 0:
+            for key in ("training_metrics", "validation_metrics", "temporal_profiles", "contextual_profiles"):
+                records = load_jsonl(paths[key])
+                if records and any("phase-c-v2" not in str(record.get("schema", "")) for record in records):
+                    raise RuntimeError(
+                        f"output root contains legacy Phase C records in {paths[key].name}; "
+                        "use a fresh Phase C V2 output_root"
+                    )
+
     def _sanitize_resume_artifacts(self, paths, start_step: int) -> None:
-        for key in ("training_metrics", "validation_metrics", "gate_profiles"):
+        checkpoint_root = self.output_root / self.phase_c.artifacts.checkpoints_dir
+        if start_step == 0 and checkpoint_root.is_dir():
+            shutil.rmtree(checkpoint_root)
+        for key in ("training_metrics", "validation_metrics", "temporal_profiles", "contextual_profiles"):
             records = load_jsonl(paths[key])
             kept = [record for record in records if int(record.get("step", -1)) <= int(start_step)]
             if len(kept) != len(records) or (start_step == 0 and records):
@@ -353,16 +454,55 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
             if directory.is_dir():
                 shutil.rmtree(directory)
 
-    def _assert_runtime_invariants(self, router, item, registry_fingerprint, start_step, torch) -> None:
+    def _validate_resume_prefix(self, paths, start_step: int) -> None:
+        training_records = load_jsonl(paths["training_metrics"])
+        steps = [int(record.get("step", -1)) for record in training_records]
+        if steps != list(range(1, start_step + 1)):
+            raise RuntimeError("Phase C resume training-metric prefix is incomplete or unordered")
+        completed_validation_steps = {
+            step for step in range(1, start_step + 1)
+            if step % self.phase_c.validation.every == 0 or step == self.phase_c.steps
+        }
+        validation_records = load_jsonl(paths["validation_metrics"])
+        actual_validation_steps = {int(record.get("step", -1)) for record in validation_records}
+        if actual_validation_steps != completed_validation_steps:
+            raise RuntimeError("Phase C resume validation prefix is incomplete")
+        temporal_records = load_jsonl(paths["temporal_profiles"])
+        if {int(record.get("step", -1)) for record in temporal_records} != completed_validation_steps:
+            raise RuntimeError("Phase C resume temporal-profile prefix is incomplete")
+
+    def _assert_runtime_invariants(self, router, items, registry_fingerprint, start_step, torch) -> None:
+        item = items[0]
         normalized = torch.tensor([0.5], device=self.sd.device_torch, dtype=torch.float32)
+        projected = self._projected_activator_cache[item["dataset_relative_item_id"]].to(
+            self.sd.device_torch, dtype=torch.float32
+        )
         with torch.no_grad():
-            q_values = router(normalized)
+            activator_code = router.encode_activator(projected)
+            repeated_code = router.encode_activator(projected.clone())
+            q_values = router(normalized, activator_code)
+        if not torch.allclose(activator_code, repeated_code, rtol=0.0, atol=1.0e-7):
+            raise RuntimeError("Phase C V2 activator encoding is not deterministic")
+        fingerprints = [self._projected_activator_fingerprints[item["dataset_relative_item_id"]] for item in items]
+        if len(fingerprints) != len(set(fingerprints)):
+            raise RuntimeError("different captions produced bit-identical projected activator states")
+        if len(items) > 1:
+            other_projected = self._projected_activator_cache[items[1]["dataset_relative_item_id"]].to(
+                self.sd.device_torch, dtype=torch.float32
+            )
+            with torch.no_grad():
+                other_code = router.encode_activator(other_projected)
+            if torch.equal(activator_code, other_code):
+                raise RuntimeError("different captions produced bit-identical activator bottleneck codes")
+        midpoint_gates = effective_gates(q_values, 0.5)
+        if not torch.equal(midpoint_gates, torch.ones_like(midpoint_gates)):
+            raise RuntimeError("Phase C V2 style_strength midpoint does not produce exact V3 gates")
         if q_values.shape != (1, router.group_count):
-            raise RuntimeError(f"Phase C router produced invalid shape {tuple(q_values.shape)}")
+            raise RuntimeError(f"Phase C V2 router produced invalid shape {tuple(q_values.shape)}")
         if not bool(torch.isfinite(q_values).all()) or bool((q_values.abs() > self.phase_c.q_max + 1.0e-6).any()):
-            raise RuntimeError("Phase C router output is non-finite or outside q_max")
+            raise RuntimeError("Phase C V2 router output is non-finite or outside q_max")
         if start_step == 0 and not torch.equal(q_values, torch.zeros_like(q_values)):
-            raise RuntimeError("fresh Phase C router must initialize to exact q=0 identity")
+            raise RuntimeError("fresh Phase C V2 router must initialize to exact q=0 identity")
 
         prepared = self._prepare_training_case(item, 500, self.phase_c.seed, torch)
         identity_runtime = ResidualGateRuntime(torch.ones_like(q_values), registry_fingerprint=registry_fingerprint)
@@ -399,6 +539,15 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
         invalid = [name for name, parameter in router.named_parameters() if not bool(torch.isfinite(parameter).all())]
         if invalid:
             raise RuntimeError(f"Phase C step {step} produced non-finite router parameters: {invalid}")
+
+    def _assert_finite_optimizer(self, optimizer, step: int, torch) -> None:
+        invalid = []
+        for parameter_index, state in enumerate(optimizer.state.values()):
+            for name, value in state.items():
+                if isinstance(value, torch.Tensor) and not bool(torch.isfinite(value).all()):
+                    invalid.append(f"state[{parameter_index}].{name}")
+        if invalid:
+            raise RuntimeError(f"Phase C step {step} produced non-finite optimizer state: {invalid[:10]}")
 
     def _assert_router_only_trainable(self, router) -> None:
         offenders = []
@@ -465,6 +614,10 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
         validation = [{**item, "split": "validation"} for item in items if item["split"] == "heldout"]
         if not train or not validation:
             raise RuntimeError("Phase C requires non-empty train and validation splits")
+        if len(train) < self.phase_c.same_timestep_content_batch:
+            raise RuntimeError("Phase C training split is smaller than same_timestep_content_batch")
+        if self.phase_c.validation.evaluate_context_shuffle and len(validation) < 2:
+            raise RuntimeError("Phase C context-shuffled validation requires at least two heldout items")
         return train, validation
 
     def _precompute_items(self, items, torch) -> None:
@@ -475,7 +628,13 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
             case = SimpleNamespace(item_id=item_id, timestep=0, noise_seed=self.phase_c.seed)
             prepared = self._prepare_case(case, item, torch)
             with torch.no_grad():
-                self._calibrated_embed_cache[item_id] = self._calibrated_prompt_embeds(prepared["prompt_template"]).to("cpu")
+                embeds = self._calibrated_prompt_embeds(prepared["prompt_template"])
+                self._calibrated_embed_cache[item_id] = embeds.to("cpu")
+                projected = self._extract_projected_activator_states(embeds, torch).to("cpu")
+                self._projected_activator_cache[item_id] = projected
+                self._projected_activator_fingerprints[item_id] = hashlib.sha256(
+                    projected.contiguous().numpy().tobytes()
+                ).hexdigest()
             self._latent_cache[item_id] = self._latent_cache[item_id].to("cpu")
         from toolkit.basic import flush
 
@@ -483,6 +642,39 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
         self.text_activator.to("cpu")
         self.sd.vae.to("cpu")
         flush()
+
+    def _extract_projected_activator_states(self, embeds, torch):
+        features = embeds.text_embeds[0]
+        mask = embeds.trigger_masks[0].to(dtype=torch.bool)
+        if mask.shape[0] > features.shape[0]:
+            raise RuntimeError("private activator mask is longer than cached Qwen conditioning")
+        positions = torch.nonzero(mask, as_tuple=False).reshape(-1)
+        if positions.numel() != self.phase_c.activator_token_count:
+            raise RuntimeError(
+                f"Phase C V2 requires exactly one private activator occurrence with "
+                f"{self.phase_c.activator_token_count} positions; found {positions.numel()}"
+            )
+        transformer = self.sd.model
+        selected = features[positions].to(self.sd.device_torch, dtype=self.sd.torch_dtype)
+        states = transformer.llm_cond_proj(transformer.llm_cond_norm(selected)).unsqueeze(0).float()
+        if not bool(torch.isfinite(states).all()):
+            raise RuntimeError("projected private activator states are non-finite")
+        return states
+
+    def _select_same_timestep_items(self, train_items, step):
+        count = self.phase_c.same_timestep_content_batch
+        if len(train_items) < count:
+            raise RuntimeError("training split cannot provide distinct same-timestep contents")
+        batch_index = int(step) - 1
+        batches_per_cycle = (len(train_items) + count - 1) // count
+        cycle = batch_index // batches_per_cycle
+        offset = (batch_index % batches_per_cycle) * count
+        permutation = list(range(len(train_items)))
+        random.Random((self.phase_c.seed << 32) ^ cycle ^ 0xD1B54A32D192ED03).shuffle(permutation)
+        indices = [permutation[(offset + index) % len(permutation)] for index in range(count)]
+        if len(set(indices)) != count:
+            raise RuntimeError("same-timestep round-robin selected duplicate dataset items")
+        return [train_items[index] for index in indices]
 
     def _prepare_training_case(self, item, timestep, noise_seed, torch):
         case = SimpleNamespace(
@@ -494,58 +686,207 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
         prepared["calibrated_embeds"] = self._calibrated_embed_cache[case.item_id]
         return prepared
 
+    def _validation_q(self, router, item_id, timestep, mode, shuffled_item_id=None):
+        import torch
+
+        normalized = torch.tensor([timestep / 1000.0], device=self.sd.device_torch, dtype=torch.float32)
+        projected_id = shuffled_item_id if mode == "context_shuffled" else item_id
+        projected = self._projected_activator_cache[projected_id].to(self.sd.device_torch, dtype=torch.float32)
+        code = router.encode_activator(projected)
+        universal_raw, contextual_raw, total = router.components(normalized, code)
+        universal_applied = router.bound(universal_raw)
+        if mode == "normal_v3":
+            return torch.zeros_like(total), universal_raw, contextual_raw
+        if mode == "universal_only":
+            return universal_applied, universal_raw, torch.zeros_like(contextual_raw)
+        return total, universal_raw, contextual_raw
+
+    def _family_statistics(self, vector, torch):
+        groups = self._active_registry_payload["groups"]
+        statistics = {}
+        families = sorted({str(group["group_id"]).rsplit(":", 1)[-1] for group in groups})
+        for family in families:
+            indices = [
+                int(group["group_index"])
+                for group in groups
+                if str(group["group_id"]).endswith(f":{family}")
+            ]
+            if not indices:
+                continue
+            values = vector[..., indices].float().reshape(-1)
+            statistics[family] = {
+                "mean": float(values.mean().item()),
+                "mean_abs": float(values.abs().mean().item()),
+                "std": float(values.std(unbiased=False).item()),
+                "max_abs": float(values.abs().max().item()),
+            }
+        return statistics
+
+    @staticmethod
+    def _svd_summary(matrix, torch):
+        values = torch.linalg.svdvals(matrix.float())
+        energy = values.square()
+        total = energy.sum()
+        total_value = float(total.item())
+        if total_value == 0.0:
+            return {
+                "status": "zero_field",
+                "numerical_rank": 0,
+                "top_singular_energy_fraction": 0.0,
+                "effective_rank": 0.0,
+                "total_energy": float(total.item()),
+            }
+        probability = energy / total
+        entropy = -(probability * probability.clamp_min(1.0e-20).log()).sum()
+        return {
+            "status": "valid",
+            "numerical_rank": int(torch.linalg.matrix_rank(matrix.float()).item()),
+            "top_singular_energy_fraction": float(probability[0].item()),
+            "effective_rank": float(torch.exp(entropy).item()),
+            "total_energy": float(total.item()),
+        }
+
+    @staticmethod
+    def _safe_cosine(left, right, torch):
+        left_norm = float(left.float().norm().item())
+        right_norm = float(right.float().norm().item())
+        if min(left_norm, right_norm) <= 1.0e-12:
+            return None
+        return float(torch.nn.functional.cosine_similarity(left.float(), right.float(), dim=0).item())
+
     def _validate(self, router, items, step, registry_fingerprint, paths, torch) -> None:
         router.eval()
-        profiles = {}
+        item_ids = [item["dataset_relative_item_id"] for item in items]
+        modes = ["normal_v3", "universal_only", "full_router"]
+        if self.phase_c.validation.evaluate_context_shuffle and len(items) > 1:
+            modes.append("context_shuffled")
         with torch.no_grad():
             for spec in validation_grid(
                 self.phase_c.validation.canonical_timesteps,
                 self.phase_c.validation.dense_timesteps,
                 self.phase_c.validation.seeds,
             ):
-                normalized = torch.tensor([spec["timestep"] / 1000.0], device=self.sd.device_torch)
-                q_values = router(normalized)
-                gates = 1.0 + q_values
-                profiles[(spec["grid"], spec["timestep"])] = gates.detach().float().cpu()[0].tolist()
-                if spec["grid"] != "canonical":
-                    continue
-                runtime = ResidualGateRuntime(gates, registry_fingerprint=registry_fingerprint)
-                for item in items:
+                for item_index, item in enumerate(items):
+                    item_id = item_ids[item_index]
+                    shuffled_id = item_ids[(item_index + 1) % len(item_ids)]
+                    full_q, universal_raw, contextual_raw = self._validation_q(
+                        router, item_id, spec["timestep"], "full_router"
+                    )
+                    universal_applied = router.bound(universal_raw)
+                    contextual_applied = full_q - universal_applied
+                    if spec["grid"] == "dense" or spec["seed"] == self.phase_c.validation.seeds[0]:
+                        append_jsonl(paths["contextual_profiles"], {
+                            "schema": "ai-toolkit.ideogram4-v3-phase-c-v2-contextual-profile",
+                            "schema_version": 2,
+                            "step": step,
+                            "grid": spec["grid"],
+                            "item_id": item_id,
+                            "timestep": spec["timestep"],
+                            "raw_universal_norm": float(universal_raw.norm().item()),
+                            "raw_contextual_norm": float(contextual_raw.norm().item()),
+                            "applied_universal_norm": float(universal_applied.norm().item()),
+                            "applied_contextual_increment_norm": float(contextual_applied.norm().item()),
+                            "applied_total_norm": float(full_q.norm().item()),
+                            "family_statistics": {
+                                "applied_universal": self._family_statistics(universal_applied, torch),
+                                "applied_contextual_increment": self._family_statistics(contextual_applied, torch),
+                                "applied_total": self._family_statistics(full_q, torch),
+                            },
+                            "q_total": full_q.cpu()[0].tolist(),
+                        })
+                    if spec["grid"] != "canonical":
+                        continue
                     prepared = self._prepare_training_case(item, spec["timestep"], spec["seed"], torch)
-                    with residual_gate_runtime_context(self.network, runtime):
-                        prediction = self._predict(prepared, prepared["prompt_template"], "full")
-                    identity_runtime = ResidualGateRuntime(torch.ones_like(gates), registry_fingerprint=registry_fingerprint)
-                    with residual_gate_runtime_context(self.network, identity_runtime):
-                        baseline_prediction = self._predict(prepared, prepared["prompt_template"], "full")
-                    loss = torch.mean((prediction.float() - prepared["target"].float()).square())
-                    baseline_loss = torch.mean((baseline_prediction.float() - prepared["target"].float()).square())
-                    normalized_gain = 1.0 - loss / baseline_loss.clamp_min(1.0e-12)
+                    losses = {}
+                    for mode in modes:
+                        q_values, _, _ = self._validation_q(
+                            router, item_id, spec["timestep"], mode, shuffled_item_id=shuffled_id
+                        )
+                        runtime = ResidualGateRuntime(1.0 + q_values, registry_fingerprint=registry_fingerprint)
+                        with residual_gate_runtime_context(self.network, runtime):
+                            prediction = self._predict(prepared, prepared["prompt_template"], "full")
+                        losses[mode] = torch.mean((prediction.float() - prepared["target"].float()).square())
+                    baseline = losses["normal_v3"].clamp_min(1.0e-12)
+                    full_loss = losses["full_router"]
+                    shuffled_loss = losses.get("context_shuffled")
                     append_jsonl(paths["validation_metrics"], {
-                        "schema": "ai-toolkit.ideogram4-v3-phase-c-validation-metric",
-                        "schema_version": 1,
+                        "schema": "ai-toolkit.ideogram4-v3-phase-c-v2-validation-metric",
+                        "schema_version": 2,
                         "step": step,
                         "split": "validation",
                         "grid": spec["grid"],
-                        "item_id": item["dataset_relative_item_id"],
+                        "item_id": item_id,
                         "timestep": spec["timestep"],
                         "noise_seed": spec["seed"],
-                        "loss": float(loss.item()),
-                        "normal_v3_loss": float(baseline_loss.item()),
-                        "normalized_improvement_vs_v3": float(normalized_gain.item()),
-                        "positive_improvement": bool(loss.item() < baseline_loss.item()),
+                        "normal_v3_loss": float(losses["normal_v3"].item()),
+                        "universal_only_loss": float(losses["universal_only"].item()),
+                        "full_router_loss": float(full_loss.item()),
+                        "context_shuffled_loss": float(shuffled_loss.item()) if shuffled_loss is not None else None,
+                        "loss": float(full_loss.item()),
+                        "normalized_improvement_vs_v3": float((1.0 - full_loss / baseline).item()),
+                        "contextual_incremental_gain": float((losses["universal_only"] - full_loss).item()),
+                        "contextual_specificity_gain": float((shuffled_loss - full_loss).item()) if shuffled_loss is not None else None,
                     })
-            for (grid, timestep), gates in sorted(profiles.items()):
-                append_jsonl(paths["gate_profiles"], {
-                    "schema": "ai-toolkit.ideogram4-v3-phase-c-gate-profile",
-                    "schema_version": 1,
-                    "step": step,
-                    "split": "validation",
-                    "grid": grid,
-                    "timestep": timestep,
-                    "style_strength": 1.0,
-                    "q": [float(value - 1.0) for value in gates],
-                    "gates": gates,
+
+            dense = torch.tensor(self.phase_c.validation.dense_timesteps, device=self.sd.device_torch, dtype=torch.float32) / 1000.0
+            universal_matrix = torch.stack([router.universal(value.reshape(1))[0] for value in dense])
+            temporal_record = {
+                "schema": "ai-toolkit.ideogram4-v3-phase-c-v2-temporal-profile",
+                "schema_version": 2,
+                "step": step,
+                "universal_anchor_raw": self._svd_summary(router.universal_anchors, torch),
+                "universal_applied_dense": self._svd_summary(universal_matrix, torch),
+                "prompts": [],
+                "cross_content": {},
+            }
+            fields_by_item = {}
+            for item_id in item_ids:
+                projected = self._projected_activator_cache[item_id].to(self.sd.device_torch, dtype=torch.float32)
+                code = router.encode_activator(projected)
+                field = torch.cat([router(value.reshape(1), code) for value in dense], dim=0)
+                centered_field = field - field.mean(dim=0, keepdim=True)
+                fields_by_item[item_id] = field
+                canonical = [router(torch.tensor([value / 1000.0], device=self.sd.device_torch), code)[0] for value in self.phase_c.validation.canonical_timesteps]
+                cosines = {}
+                for left in range(len(canonical)):
+                    for right in range(left + 1, len(canonical)):
+                        key = f"{self.phase_c.validation.canonical_timesteps[left]}_{self.phase_c.validation.canonical_timesteps[right]}"
+                        cosines[key] = self._safe_cosine(canonical[left], canonical[right], torch)
+                temporal_record["prompts"].append({
+                    "item_id": item_id,
+                    "uncentered": self._svd_summary(field, torch),
+                    "centered": self._svd_summary(centered_field, torch),
+                    "canonical_cosines": cosines,
                 })
+            if len(item_ids) > 1:
+                for timestep in self.phase_c.validation.canonical_timesteps:
+                    normalized_timestep = torch.tensor(
+                        [timestep / 1000.0], device=self.sd.device_torch, dtype=torch.float32
+                    )
+                    canonical_fields = {}
+                    for item_id in item_ids:
+                        projected = self._projected_activator_cache[item_id].to(
+                            self.sd.device_torch, dtype=torch.float32
+                        )
+                        code = router.encode_activator(projected)
+                        canonical_fields[item_id] = router(normalized_timestep, code)[0]
+                    pairwise = []
+                    for left in range(len(item_ids)):
+                        for right in range(left + 1, len(item_ids)):
+                            cosine = self._safe_cosine(
+                                canonical_fields[item_ids[left]],
+                                canonical_fields[item_ids[right]],
+                                torch,
+                            )
+                            if cosine is not None:
+                                pairwise.append(cosine)
+                    temporal_record["cross_content"][str(timestep)] = {
+                        "valid_pair_count": len(pairwise),
+                        "degenerate_pair_count": len(item_ids) * (len(item_ids) - 1) // 2 - len(pairwise),
+                        "mean_cosine": float(sum(pairwise) / len(pairwise)) if pairwise else None,
+                        "std_cosine": float(torch.tensor(pairwise).std(unbiased=False).item()) if pairwise else None,
+                    }
+            append_jsonl(paths["temporal_profiles"], temporal_record)
         router.train()
 
     def _artifact_paths(self) -> Dict[str, Path]:
@@ -553,7 +894,9 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
         return {
             "training_metrics": self.output_root / artifacts.training_metrics,
             "validation_metrics": self.output_root / artifacts.validation_metrics,
-            "gate_profiles": self.output_root / artifacts.gate_profiles,
+            "temporal_profiles": self.output_root / artifacts.temporal_profiles,
+            "contextual_profiles": self.output_root / artifacts.contextual_profiles,
+            "group_registry": self.output_root / artifacts.group_registry,
             "source_manifest": self.output_root / artifacts.source_manifest,
             "handoff_manifest": self.output_root / artifacts.handoff_manifest,
             "completion_manifest": self.output_root / artifacts.completion_manifest,
@@ -577,17 +920,20 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
             shutil.rmtree(temporary_dir)
         temporary_dir.mkdir()
         try:
+            router_config = dict(router_config)
+            router_config["run_fingerprint"] = run_fingerprint
             router_path = temporary_dir / self.phase_c.artifacts.router_filename
             save_file({key: value.detach().cpu() for key, value in router.state_dict().items()}, str(router_path))
             torch.save({
-                "schema": "ai-toolkit.ideogram4-v3-phase-c-checkpoint",
-                "schema_version": 1,
+                "schema": "ai-toolkit.ideogram4-v3-phase-c-v2-checkpoint",
+                "schema_version": 2,
                 "step": int(step),
                 "registry_fingerprint": fingerprint,
                 "run_fingerprint": run_fingerprint,
                 "optimizer": optimizer.state_dict(),
-                "torch_rng_state": torch.get_rng_state(),
-                "python_rng_state": random.getstate(),
+            "torch_rng_state": torch.get_rng_state(),
+            "cuda_rng_states": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            "python_rng_state": random.getstate(),
             }, temporary_dir / "training_state.pt")
             atomic_write_json(temporary_dir / self.phase_c.artifacts.router_config_filename, router_config)
             if destination.exists():
@@ -603,6 +949,7 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
         if not root.is_dir():
             return 0
         candidates = []
+        partial = []
         for path in root.glob("step_*"):
             if not path.is_dir():
                 continue
@@ -615,34 +962,59 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
                 path / self.phase_c.artifacts.router_filename,
                 path / self.phase_c.artifacts.router_config_filename,
             )
-            if all(candidate.is_file() for candidate in required):
+            present = [candidate.is_file() for candidate in required]
+            if all(present):
                 candidates.append((step, path))
+            elif any(present):
+                partial.append((step, path, [candidate.name for candidate, exists in zip(required, present) if not exists]))
+        if partial:
+            highest_partial = max(partial, key=lambda item: item[0])
+            highest_complete = max((step for step, _ in candidates), default=-1)
+            if highest_partial[0] >= highest_complete:
+                raise RuntimeError(
+                    f"highest Phase C checkpoint is partial at step {highest_partial[0]}; "
+                    f"missing={highest_partial[2]}"
+                )
         if not candidates:
             return 0
         checkpoint_root = root.resolve()
-        _, latest_path = max(candidates, key=lambda item: item[0])
+        directory_step, latest_path = max(candidates, key=lambda item: item[0])
         latest = latest_path.resolve()
         if checkpoint_root not in latest.parents or latest.parent != checkpoint_root:
             raise RuntimeError("unsafe Phase C resume checkpoint path")
         state = torch.load(latest / "training_state.pt", map_location="cpu", weights_only=False)
+        if state.get("schema") != "ai-toolkit.ideogram4-v3-phase-c-v2-checkpoint" or int(state.get("schema_version", 0)) != 2:
+            raise RuntimeError("legacy Phase C V1 checkpoint cannot be resumed by Phase C V2")
+        if int(state.get("step", -1)) != directory_step:
+            raise RuntimeError("checkpoint state step does not match its directory name")
+        checkpoint_config = load_json(latest / self.phase_c.artifacts.router_config_filename)
+        if checkpoint_config.get("schema") != "ai-toolkit.ideogram4-v3-phase-c-v2-router-config" or int(checkpoint_config.get("schema_version", 0)) != 2:
+            raise RuntimeError("checkpoint router_config is not a Phase C V2 artifact")
+        if int(checkpoint_config.get("contract_revision", 0)) != 3:
+            raise RuntimeError("checkpoint predates the audited Phase C V2 contract revision; start from a fresh output_root")
+        if checkpoint_config.get("run_fingerprint") != run_fingerprint:
+            raise RuntimeError("checkpoint router_config fingerprint mismatch")
         if state.get("registry_fingerprint") != fingerprint:
             raise RuntimeError("checkpoint active registry fingerprint mismatch")
         if state.get("run_fingerprint") != run_fingerprint:
             raise RuntimeError("checkpoint Phase C source/config fingerprint mismatch")
-        if int(state.get("step", -1)) < 0:
-            raise RuntimeError("checkpoint Phase C step is invalid")
         from safetensors.torch import load_file
 
+        if "optimizer" not in state or "torch_rng_state" not in state or "python_rng_state" not in state:
+            raise RuntimeError("Phase C V2 checkpoint is missing optimizer or RNG state")
         router.load_state_dict(load_file(str(latest / self.phase_c.artifacts.router_filename), device="cpu"), strict=True)
         optimizer.load_state_dict(state["optimizer"])
         torch.set_rng_state(state["torch_rng_state"])
+        if torch.cuda.is_available() and state.get("cuda_rng_states") is not None:
+            torch.cuda.set_rng_state_all(state["cuda_rng_states"])
         random.setstate(state["python_rng_state"])
         return int(state["step"])
 
     def _source_manifest(self, active_registry, fingerprint):
         return {
-            "schema": "ai-toolkit.ideogram4-v3-phase-c-source",
-            "schema_version": 1,
+            "schema": "ai-toolkit.ideogram4-v3-phase-c-v2-source",
+            "schema_version": 2,
+            "contract_revision": 3,
             "status": "resolved",
             "inputs": {
                 **self.input_refs,
@@ -652,12 +1024,47 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
             },
             "active_registry_fingerprint": fingerprint,
             "active_registry": active_registry,
-            "frozen": ["Ideogram4", "V3", "A2 best-heldout activator"],
-            "trainable": ["ResidualGateRouter"],
+            "frozen": ["Ideogram4", "Qwen", "trigger embeddings", "A1/A2 TE adapter", "V3 diffusion LoRA"],
+            "trainable": ["Phase C V2 activator projector and local temporal router"],
+            "trigger_token_count": self.phase_c.activator_token_count,
+            "activator_mask_schema": "a1-a2-trigger-mask-v1",
         }
 
     def _read_validation_records(self, path: Path):
         return load_jsonl(path)
+
+    def _validate_training_records(self, training_records) -> None:
+        steps = [int(record.get("step", -1)) for record in training_records]
+        expected = list(range(1, self.phase_c.steps + 1))
+        if steps != expected:
+            raise RuntimeError("Phase C training metrics are not a complete ordered 1..steps sequence")
+        if any(record.get("schema") != "ai-toolkit.ideogram4-v3-phase-c-v2-training-metric" for record in training_records):
+            raise RuntimeError("Phase C training metrics contain an incompatible schema")
+
+    def _validate_profile_records(self, temporal_records, contextual_records) -> None:
+        validation_steps = {
+            step for step in range(1, self.phase_c.steps + 1)
+            if step % self.phase_c.validation.every == 0 or step == self.phase_c.steps
+        }
+        temporal_steps = [int(record.get("step", -1)) for record in temporal_records]
+        if len(temporal_steps) != len(set(temporal_steps)) or set(temporal_steps) != validation_steps:
+            raise RuntimeError("Phase C temporal profiles are incomplete or duplicated")
+        expected = {
+            (step, item_id, grid, int(timestep))
+            for step in validation_steps
+            for item_id in self._validation_item_ids
+            for grid, timesteps in (
+                ("canonical", self.phase_c.validation.canonical_timesteps),
+                ("dense", self.phase_c.validation.dense_timesteps),
+            )
+            for timestep in timesteps
+        }
+        actual = {
+            (int(record.get("step", -1)), str(record.get("item_id")), str(record.get("grid")), int(record.get("timestep", -1)))
+            for record in contextual_records
+        }
+        if len(actual) != len(contextual_records) or actual != expected:
+            raise RuntimeError("Phase C contextual profiles are incomplete or duplicated")
 
     def _validate_completion_records(self, validation_records, validation_item_count: int) -> None:
         expected_per_step = (
@@ -685,6 +1092,20 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
             raise RuntimeError(
                 f"Phase C canonical validation steps are incomplete: expected={sorted(validation_steps)}, actual={sorted(counts)}"
             )
+        expected_keys = {
+            (step, str(item_id), int(timestep), int(seed))
+            for step in validation_steps
+            for item_id in self._validation_item_ids
+            for timestep in self.phase_c.validation.canonical_timesteps
+            for seed in self.phase_c.validation.seeds
+        }
+        actual_keys = set(keys)
+        if actual_keys != expected_keys:
+            missing = sorted(expected_keys - actual_keys)[:5]
+            extra = sorted(actual_keys - expected_keys)[:5]
+            raise RuntimeError(
+                f"Phase C canonical validation probe identities are incomplete; missing={missing}, extra={extra}"
+            )
         invalid = {step: count for step, count in counts.items() if count != expected_per_step}
         if invalid:
             raise RuntimeError(
@@ -692,27 +1113,42 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
             )
 
     def _copy_router_artifacts(self, source: Path, destination: Path) -> None:
-        destination.mkdir(parents=True, exist_ok=True)
-        for filename in (self.phase_c.artifacts.router_filename, self.phase_c.artifacts.router_config_filename):
-            temporary = destination / (filename + ".tmp")
-            shutil.copyfile(source / filename, temporary)
-            os.replace(temporary, destination / filename)
+        temporary_dir = destination.parent / f".{destination.name}.tmp"
+        if temporary_dir.exists():
+            shutil.rmtree(temporary_dir)
+        temporary_dir.mkdir(parents=True)
+        try:
+            for filename in (self.phase_c.artifacts.router_filename, self.phase_c.artifacts.router_config_filename):
+                shutil.copyfile(source / filename, temporary_dir / filename)
+            if destination.exists():
+                shutil.rmtree(destination)
+            os.replace(temporary_dir, destination)
+        except BaseException:
+            if temporary_dir.exists():
+                shutil.rmtree(temporary_dir)
+            raise
 
     def _finalize(self, router, fingerprint, router_config, paths, torch) -> None:
         final_checkpoint = self._safe_checkpoint_dir(self.phase_c.steps)
         final_dir = self.output_root / self.phase_c.artifacts.final_dir
         self._copy_router_artifacts(final_checkpoint, final_dir)
+        training_records = load_jsonl(paths["training_metrics"])
         validation_records = self._read_validation_records(paths["validation_metrics"])
+        temporal_records = load_jsonl(paths["temporal_profiles"])
+        contextual_records = load_jsonl(paths["contextual_profiles"])
+        self._validate_training_records(training_records)
         self._validate_completion_records(validation_records, self._validation_item_count)
+        self._validate_profile_records(temporal_records, contextual_records)
         best_step, best_loss = select_best_validation(validation_records)
         best_checkpoint = self._safe_checkpoint_dir(best_step)
         best_dir = self.output_root / self.phase_c.artifacts.best_dir
         self._copy_router_artifacts(best_checkpoint, best_dir)
         handoff = {
-            "schema": "ai-toolkit.ideogram4-v3-phase-c-handoff",
-            "schema_version": 1,
+            "schema": "ai-toolkit.ideogram4-v3-phase-c-v2-handoff",
+            "schema_version": 2,
             "status": "completed",
             "active_registry_fingerprint": fingerprint,
+            "run_fingerprint": router_config.get("run_fingerprint"),
             "best": {
                 "step": best_step,
                 "canonical_validation_loss": best_loss,
@@ -727,20 +1163,24 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
         }
         atomic_write_json(paths["handoff_manifest"], handoff)
         atomic_write_json(paths["completion_manifest"], {
-            "schema": "ai-toolkit.ideogram4-v3-phase-c-completion",
-            "schema_version": 1,
+            "schema": "ai-toolkit.ideogram4-v3-phase-c-v2-completion",
+            "schema_version": 2,
             "status": "completed",
             "steps": self.phase_c.steps,
             "optimizer": self.phase_c.optimizer,
             "optimizer_params": dict(self.phase_c.optimizer_params),
             "fresh_optimizer": True,
             "router_only": True,
-            "validation_term": "validation",
+            "run_fingerprint": router_config.get("run_fingerprint"),
+            "active_registry_fingerprint": fingerprint,
+            "validation_term": "full_router canonical validation loss",
             "artifacts": {
                 "source": artifact_ref(paths["source_manifest"], self.output_root),
                 "handoff": artifact_ref(paths["handoff_manifest"], self.output_root),
                 "training_metrics": artifact_ref(paths["training_metrics"], self.output_root),
                 "validation_metrics": artifact_ref(paths["validation_metrics"], self.output_root),
-                "gate_profiles": artifact_ref(paths["gate_profiles"], self.output_root),
+                "temporal_profiles": artifact_ref(paths["temporal_profiles"], self.output_root),
+                "contextual_profiles": artifact_ref(paths["contextual_profiles"], self.output_root),
+                "group_registry": artifact_ref(paths["group_registry"], self.output_root),
             },
         })
