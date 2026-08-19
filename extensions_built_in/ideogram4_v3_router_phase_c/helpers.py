@@ -245,6 +245,7 @@ def router_config_payload(config: Any, active_registry: Mapping[str, Any], condi
             "contextual_mean_multiplier": float(config.contextual_mean_multiplier),
             "same_timestep_content_batch": int(config.same_timestep_content_batch),
             "distinct_items_per_update": bool(config.distinct_items_per_update),
+            "gradient_checkpointing": asdict(config.gradient_checkpointing),
             "timestep_sampling": config.timestep_sampling,
             "timestep_bins": int(config.timestep_bins),
             "train_item_limit": config.train_item_limit,

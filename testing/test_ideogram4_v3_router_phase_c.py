@@ -1,11 +1,14 @@
 import importlib
+import importlib.util
 import sys
 import types
+from pathlib import Path
 
 import pytest
 import torch
 
 from extensions_built_in.ideogram4_v3_router_phase_c.config import load_config
+from toolkit.advanced_prompt_embeds import AdvancedPromptEmbeds
 from extensions_built_in.ideogram4_v3_router_phase_c.helpers import (
     DeterministicStratifiedTimestepSampler,
     detect_active_groups,
@@ -57,6 +60,8 @@ def test_phase_c_defaults_match_confirmed_contract():
     assert config.temporal_anchor_count == 16
     assert config.contextual_rank == 4
     assert config.same_timestep_content_batch == 4
+    assert config.gradient_checkpointing.enabled
+    assert config.gradient_checkpointing.every_n_blocks == 1
     assert config.timestep_sampling == "stratified_uniform"
     assert config.timestep_bins == 16
     assert config.q_max == 0.5
@@ -90,6 +95,13 @@ def test_config_allows_reasonable_overrides_but_rejects_invalid_ranges():
     raw = _config()
     raw["activator_token_dim"] = 16
     with pytest.raises(ValueError, match="32 dimensions"):
+        load_config(raw)
+
+    raw = _config()
+    raw["gradient_checkpointing"] = {"enabled": True, "every_n_blocks": 2}
+    assert load_config(raw).gradient_checkpointing.every_n_blocks == 2
+    raw["gradient_checkpointing"]["every_n_blocks"] = 0
+    with pytest.raises(ValueError, match="every_n_blocks"):
         load_config(raw)
 
 
@@ -211,7 +223,75 @@ def test_validation_grid_and_best_selection_use_validation_name_only():
     assert select_best_validation(records) == pytest.approx((50, 0.1))
 
 
-def test_phase_c_process_exposes_timestamped_progress_output(monkeypatch):
+def test_checkpoint_stride_two_preserves_gate_gradients_across_all_blocks(monkeypatch):
+    module_path = (
+        Path(__file__).parents[1]
+        / "extensions_built_in"
+        / "diffusion_models"
+        / "ideogram4"
+        / "src"
+        / "transformer.py"
+    )
+    spec = importlib.util.spec_from_file_location("phase_c_test_transformer", module_path)
+    transformer_module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = transformer_module
+    spec.loader.exec_module(transformer_module)
+    model_class = transformer_module.Ideogram4Transformer2DModel
+    model = object.__new__(model_class)
+    torch.nn.Module.__init__(model)
+    model.gradient_checkpointing = False
+    model.gradient_checkpointing_every_n_blocks = 1
+
+    calls = []
+
+    class GateLayer(torch.nn.Module):
+        def __init__(self, index):
+            super().__init__()
+            self.index = index
+
+        def forward(self, hidden, *args):
+            from toolkit.residual_gating import current_residual_gates
+
+            gates = current_residual_gates()
+            return hidden + gates[:, :1] * float(self.index + 1)
+
+    model.layers = torch.nn.ModuleList([GateLayer(index) for index in range(4)])
+    original_checkpoint = transformer_module.checkpoint
+
+    def recording_checkpoint(function, *args, **kwargs):
+        calls.append(function)
+        return original_checkpoint(function, *args, **kwargs)
+
+    monkeypatch.setattr(transformer_module, "checkpoint", recording_checkpoint)
+    model.enable_gradient_checkpointing(every_n_blocks=2)
+    gates = torch.tensor([[1.0]], requires_grad=True)
+    hidden = torch.zeros(1, 1, requires_grad=True)
+    from toolkit.residual_gating import residual_gate_tensor_context
+
+    with residual_gate_tensor_context(gates):
+        residual_gates = transformer_module.current_residual_gates()
+        for layer_index, layer in enumerate(model.layers):
+            checkpoint_layer = (
+                model.gradient_checkpointing
+                and torch.is_grad_enabled()
+                and layer_index % model.gradient_checkpointing_every_n_blocks == 0
+            )
+            if checkpoint_layer:
+                def checkpointed_layer(hidden_states, gate_tensor, current_layer=layer):
+                    with residual_gate_tensor_context(gate_tensor):
+                        return current_layer(hidden_states, None, None, None, None, None)
+
+                hidden = transformer_module.checkpoint(
+                    checkpointed_layer, hidden, residual_gates, use_reentrant=False
+                )
+            else:
+                hidden = layer(hidden, None, None, None, None, None)
+    hidden.sum().backward()
+    assert len(calls) == 2
+    assert gates.grad.item() == pytest.approx(10.0)
+
+
+def _phase_c_process_class(monkeypatch):
     class FakeBaseExtensionProcess:
         pass
 
@@ -222,9 +302,93 @@ def test_phase_c_process_exposes_timestamped_progress_output(monkeypatch):
     monkeypatch.setitem(sys.modules, "jobs", jobs_module)
     monkeypatch.setitem(sys.modules, "jobs.process", process_module)
     sys.modules.pop("extensions_built_in.ideogram4_v3_router_phase_c.process", None)
-    process_class = importlib.import_module(
+    return importlib.import_module(
         "extensions_built_in.ideogram4_v3_router_phase_c.process"
     ).Ideogram4V3RouterPhaseCProcess
+
+
+def test_batched_validation_modes_preserve_mode_and_gate_order(monkeypatch):
+    process_class = _phase_c_process_class(monkeypatch)
+    from toolkit.residual_gating import current_residual_gates
+
+    instance = object.__new__(process_class)
+    instance.network = types.SimpleNamespace(_residual_gate_runtime=None)
+
+    def fake_predict(prepared, prompt, runtime_mode):
+        assert prepared["latent"].shape[0] == 3
+        assert len(prepared["calibrated_embeds"].text_embeds) == 3
+        return current_residual_gates()[:, :1].clone()
+
+    instance._predict = fake_predict
+    prepared = {
+        "latent": torch.zeros(1, 1),
+        "noise": torch.zeros(1, 1),
+        "noisy_latents": torch.zeros(1, 1),
+        "timesteps": torch.tensor([500.0]),
+        "target": torch.zeros(1, 1),
+        "prompt_template": "prompt",
+        "calibrated_embeds": AdvancedPromptEmbeds(text_embeds=[torch.zeros(2, 4)]),
+    }
+    predictions = instance._predict_validation_modes(
+        prepared,
+        {
+            "universal_only": torch.tensor([[0.1]]),
+            "full_router": torch.tensor([[0.2]]),
+            "context_shuffled": torch.tensor([[0.3]]),
+        },
+        "registry",
+        torch,
+    )
+    assert list(predictions) == ["universal_only", "full_router", "context_shuffled"]
+    assert predictions["universal_only"].item() == pytest.approx(1.1)
+    assert predictions["full_router"].item() == pytest.approx(1.2)
+    assert predictions["context_shuffled"].item() == pytest.approx(1.3)
+
+
+def test_normal_v3_validation_cache_reuses_and_finally_verifies(monkeypatch):
+    process_class = _phase_c_process_class(monkeypatch)
+
+    instance = object.__new__(process_class)
+    instance._normal_v3_validation_cache = {}
+    calls = []
+    instance._validation_q = lambda **kwargs: (
+        torch.zeros(1, 1),
+        torch.zeros(1, 1),
+        torch.zeros(1, 1),
+    )
+
+    def fake_modes(prepared, q_by_mode, registry_fingerprint, torch_module):
+        calls.append(True)
+        return {"normal_v3": torch.tensor([[2.0]])}
+
+    instance._predict_validation_modes = fake_modes
+    prepared = {"target": torch.tensor([[1.0]])}
+    router = object()
+    first = instance._normal_v3_validation_loss(
+        router, prepared, "item", 500, 42, "registry", torch, verify=False
+    )
+    second = instance._normal_v3_validation_loss(
+        router, prepared, "item", 500, 42, "registry", torch, verify=False
+    )
+    verified = instance._normal_v3_validation_loss(
+        router, prepared, "item", 500, 42, "registry", torch, verify=True
+    )
+    assert first.item() == pytest.approx(1.0)
+    assert second.item() == pytest.approx(1.0)
+    assert verified.item() == pytest.approx(1.0)
+    assert len(calls) == 2
+
+    instance._predict_validation_modes = lambda *args, **kwargs: {
+        "normal_v3": torch.tensor([[3.0]])
+    }
+    with pytest.raises(RuntimeError, match="cache verification failed"):
+        instance._normal_v3_validation_loss(
+            router, prepared, "item", 500, 42, "registry", torch, verify=True
+        )
+
+
+def test_phase_c_process_exposes_timestamped_progress_output(monkeypatch):
+    process_class = _phase_c_process_class(monkeypatch)
     messages = []
     print_module = types.ModuleType("toolkit.print")
     print_module.print_acc = messages.append

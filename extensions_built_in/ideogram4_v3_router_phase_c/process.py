@@ -75,12 +75,21 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
         self._projected_activator_fingerprints = {}
         self._stock_embed_cache = {}
         self._latent_cache = {}
+        self._normal_v3_validation_cache = {}
 
     def _phase_c_progress(self, message: str) -> None:
         from toolkit.print import print_acc
 
         elapsed = 0.0 if self._run_started_at is None else time.monotonic() - self._run_started_at
         print_acc(f"[Phase C +{self._format_duration(elapsed)}] {message}")
+
+    def _enable_checkpointing(self):
+        enable = getattr(self.sd.model, "enable_gradient_checkpointing", None)
+        if not callable(enable):
+            raise RuntimeError("Phase C V2 gate gradients require transformer checkpointing support")
+        enable(every_n_blocks=self.phase_c.gradient_checkpointing.every_n_blocks)
+        if not getattr(self.sd.model, "gradient_checkpointing", False):
+            raise RuntimeError("Phase C V2 gate gradients require transformer checkpointing")
 
     def run(self):
         BaseExtensionProcess.run(self)
@@ -103,7 +112,10 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
         self._freeze()
         self._enable_checkpointing()
         self.network.is_active = True
-        self._phase_c_progress("model, V3 LoRA, activator, and checkpointing ready")
+        self._phase_c_progress(
+            "model, V3 LoRA, activator, and checkpointing ready "
+            f"(every_n_blocks={self.phase_c.gradient_checkpointing.every_n_blocks})"
+        )
 
         self._phase_c_progress("building and validating active residual registry")
         actual_registry = build_module_registry(self.network.get_all_modules())
@@ -765,6 +777,51 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
             return None
         return float(torch.nn.functional.cosine_similarity(left.float(), right.float(), dim=0).item())
 
+    @staticmethod
+    def _validation_cache_key(item_id, timestep, noise_seed):
+        return str(item_id), int(timestep), int(noise_seed)
+
+    def _predict_validation_modes(self, prepared, q_by_mode, registry_fingerprint, torch):
+        mode_names = tuple(q_by_mode)
+        if not mode_names:
+            return {}
+        mode_count = len(mode_names)
+        batched = dict(prepared)
+        for key in ("latent", "noise", "noisy_latents", "timesteps", "target"):
+            batched[key] = prepared[key].repeat((mode_count,) + (1,) * (prepared[key].ndim - 1))
+        embeds = prepared["calibrated_embeds"]
+        concat = getattr(embeds.__class__, "concat_prompt_embeds", None)
+        if not callable(concat):
+            raise TypeError("Phase C validation prompt embeddings do not support batching")
+        batched["calibrated_embeds"] = concat([embeds for _ in mode_names])
+        gates = torch.cat([1.0 + q_by_mode[mode] for mode in mode_names], dim=0)
+        runtime = ResidualGateRuntime(gates, registry_fingerprint=registry_fingerprint)
+        with residual_gate_runtime_context(self.network, runtime):
+            predictions = self._predict(batched, batched["prompt_template"], "full")
+        if predictions.shape[0] != mode_count:
+            raise RuntimeError("batched Phase C validation returned an unexpected batch size")
+        return {mode: predictions[index : index + 1] for index, mode in enumerate(mode_names)}
+
+    def _normal_v3_validation_loss(
+        self, router, prepared, item_id, timestep, noise_seed, registry_fingerprint, torch, *, verify
+    ):
+        cache_key = self._validation_cache_key(item_id, timestep, noise_seed)
+        cached = self._normal_v3_validation_cache.get(cache_key)
+        if cached is not None and not verify:
+            return cached
+        zero_q, _, _ = self._validation_q(router=router, item_id=item_id, timestep=timestep, mode="normal_v3")
+        prediction = self._predict_validation_modes(
+            prepared, {"normal_v3": zero_q}, registry_fingerprint, torch
+        )["normal_v3"]
+        loss = torch.mean((prediction.float() - prepared["target"].float()).square())
+        if cached is not None and not torch.allclose(loss, cached, rtol=1.0e-5, atol=1.0e-7):
+            raise RuntimeError(
+                "normal V3 validation cache verification failed; frozen baseline changed during Phase C"
+            )
+        cached_loss = loss.detach()
+        self._normal_v3_validation_cache[cache_key] = cached_loss
+        return cached_loss
+
     def _validate(self, router, items, step, registry_fingerprint, paths, torch) -> None:
         router.eval()
         item_ids = [item["dataset_relative_item_id"] for item in items]
@@ -808,15 +865,33 @@ class Ideogram4V3RouterPhaseCProcess(Ideogram4V3ResidualAblationProcess):
                     if spec["grid"] != "canonical":
                         continue
                     prepared = self._prepare_training_case(item, spec["timestep"], spec["seed"], torch)
-                    losses = {}
-                    for mode in modes:
-                        q_values, _, _ = self._validation_q(
-                            router, item_id, spec["timestep"], mode, shuffled_item_id=shuffled_id
+                    verify_baseline = step == self.phase_c.steps
+                    losses = {
+                        "normal_v3": self._normal_v3_validation_loss(
+                            router,
+                            prepared,
+                            item_id,
+                            spec["timestep"],
+                            spec["seed"],
+                            registry_fingerprint,
+                            torch,
+                            verify=verify_baseline,
                         )
-                        runtime = ResidualGateRuntime(1.0 + q_values, registry_fingerprint=registry_fingerprint)
-                        with residual_gate_runtime_context(self.network, runtime):
-                            prediction = self._predict(prepared, prepared["prompt_template"], "full")
-                        losses[mode] = torch.mean((prediction.float() - prepared["target"].float()).square())
+                    }
+                    routed_modes = [mode for mode in modes if mode != "normal_v3"]
+                    q_by_mode = {
+                        mode: self._validation_q(
+                            router, item_id, spec["timestep"], mode, shuffled_item_id=shuffled_id
+                        )[0]
+                        for mode in routed_modes
+                    }
+                    predictions = self._predict_validation_modes(
+                        prepared, q_by_mode, registry_fingerprint, torch
+                    )
+                    losses.update({
+                        mode: torch.mean((predictions[mode].float() - prepared["target"].float()).square())
+                        for mode in routed_modes
+                    })
                     baseline = losses["normal_v3"].clamp_min(1.0e-12)
                     full_loss = losses["full_router"]
                     shuffled_loss = losses.get("context_shuffled")

@@ -364,6 +364,7 @@ class Ideogram4Transformer2DModel(nn.Module):
         super().__init__()
         self.config = config
         self.gradient_checkpointing = False
+        self.gradient_checkpointing_every_n_blocks = 1
         self.attention_backend = "native"
 
         head_dim = config.emb_dim // config.num_heads
@@ -411,8 +412,11 @@ class Ideogram4Transformer2DModel(nn.Module):
     def dtype(self) -> torch.dtype:
         return next(self.parameters()).dtype
 
-    def enable_gradient_checkpointing(self):
+    def enable_gradient_checkpointing(self, every_n_blocks: int = 1):
+        if not isinstance(every_n_blocks, int) or every_n_blocks <= 0:
+            raise ValueError("every_n_blocks must be a positive integer")
         self.gradient_checkpointing = True
+        self.gradient_checkpointing_every_n_blocks = every_n_blocks
 
     def disable_gradient_checkpointing(self):
         self.gradient_checkpointing = False
@@ -518,8 +522,13 @@ class Ideogram4Transformer2DModel(nn.Module):
             flash_meta = None
 
         residual_gates = current_residual_gates()
-        for layer in self.layers:
-            if self.gradient_checkpointing and torch.is_grad_enabled() and residual_gates is not None:
+        for layer_index, layer in enumerate(self.layers):
+            checkpoint_layer = (
+                self.gradient_checkpointing
+                and torch.is_grad_enabled()
+                and layer_index % self.gradient_checkpointing_every_n_blocks == 0
+            )
+            if checkpoint_layer and residual_gates is not None:
                 def checkpointed_layer(hidden_states, gate_tensor, current_layer=layer):
                     with residual_gate_tensor_context(gate_tensor):
                         return current_layer(hidden_states, attn_mask, cos, sin, adaln_input, flash_meta)
@@ -530,7 +539,7 @@ class Ideogram4Transformer2DModel(nn.Module):
                     residual_gates,
                     use_reentrant=False,
                 )
-            elif self.gradient_checkpointing and torch.is_grad_enabled():
+            elif checkpoint_layer:
                 h = checkpoint(
                     layer,
                     h,

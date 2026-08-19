@@ -15,6 +15,12 @@ class TemporalSmoothnessConfig:
 
 
 @dataclass(frozen=True)
+class GradientCheckpointingConfig:
+    enabled: bool = True
+    every_n_blocks: int = 1
+
+
+@dataclass(frozen=True)
 class StyleStrengthConfig:
     min: float = 0.0
     max: float = 1.0
@@ -73,6 +79,7 @@ class PhaseCRouterConfig:
     contextual_rank: int = 4
     q_max: float = 0.5
     style_strength: StyleStrengthConfig = field(default_factory=StyleStrengthConfig)
+    gradient_checkpointing: GradientCheckpointingConfig = field(default_factory=GradientCheckpointingConfig)
     same_timestep_content_batch: int = 4
     distinct_items_per_update: bool = True
     timestep_sampling: str = "stratified_uniform"
@@ -118,10 +125,12 @@ def load_config(raw: Mapping[str, Any]) -> PhaseCRouterConfig:
     _reject_unknown_keys(raw, {item.name for item in fields(PhaseCRouterConfig)}, "phase_c_v2")
     smooth_raw = dict(raw.get("temporal_smoothness", {}))
     strength_raw = dict(raw.get("style_strength", {}))
+    checkpointing_raw = dict(raw.get("gradient_checkpointing", {}))
     validation_raw = dict(raw.get("validation", {}))
     artifacts_raw = dict(raw.get("artifacts", {}))
     _reject_unknown_keys(smooth_raw, {item.name for item in fields(TemporalSmoothnessConfig)}, "temporal_smoothness")
     _reject_unknown_keys(strength_raw, {item.name for item in fields(StyleStrengthConfig)}, "style_strength")
+    _reject_unknown_keys(checkpointing_raw, {item.name for item in fields(GradientCheckpointingConfig)}, "gradient_checkpointing")
     _reject_unknown_keys(validation_raw, {item.name for item in fields(ValidationConfig)}, "validation")
     _reject_unknown_keys(artifacts_raw, {item.name for item in fields(ArtifactConfig)}, "artifacts")
     required = {name: str(raw.get(name, "")) for name in (
@@ -141,6 +150,10 @@ def load_config(raw: Mapping[str, Any]) -> PhaseCRouterConfig:
         contextual_rank=int(raw.get("contextual_rank", 4)),
         q_max=float(raw.get("q_max", 0.5)),
         style_strength=StyleStrengthConfig(**strength_raw),
+        gradient_checkpointing=GradientCheckpointingConfig(
+            enabled=_strict_bool(checkpointing_raw.get("enabled", True), "gradient_checkpointing.enabled"),
+            every_n_blocks=int(checkpointing_raw.get("every_n_blocks", 1)),
+        ),
         same_timestep_content_batch=int(raw.get("same_timestep_content_batch", 4)),
         distinct_items_per_update=_strict_bool(raw.get("distinct_items_per_update", True), "distinct_items_per_update"),
         timestep_sampling=str(raw.get("timestep_sampling", "stratified_uniform")),
@@ -215,6 +228,10 @@ def validate_config(config: PhaseCRouterConfig) -> None:
     strength = config.style_strength
     if (strength.min, strength.max, strength.default, strength.step) != (0.0, 1.0, 0.5, 0.01):
         raise ValueError("style_strength contract must remain [0,1], default 0.5, step 0.01")
+    if not config.gradient_checkpointing.enabled:
+        raise ValueError("Phase C V2 requires gradient checkpointing to preserve the supported memory contract")
+    if not 1 <= config.gradient_checkpointing.every_n_blocks <= 34:
+        raise ValueError("gradient_checkpointing.every_n_blocks must lie in [1,34]")
     if config.same_timestep_content_batch <= 1 or not config.distinct_items_per_update:
         raise ValueError("Phase C V2 requires multiple distinct contents per same-timestep update")
     if config.timestep_sampling != "stratified_uniform" or not 2 <= config.timestep_bins <= 100:
