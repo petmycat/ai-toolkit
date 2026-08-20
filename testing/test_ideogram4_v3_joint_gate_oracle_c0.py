@@ -130,6 +130,30 @@ def test_fd_prior_keeps_missing_neutral_and_balances_train_heldout():
     assert prior["fd_q"][1] == pytest.approx(0.0)
 
 
+def test_fd_prior_ignores_only_known_non_gate_diagnostic_groups():
+    rows = _group_rows()
+    records = []
+    for row in rows:
+        records.append({
+            "run_id": "run", "probe_case_id": f"local-{row['group_id']}", "split": "train",
+            "item_id": "item", "noise_seed": 42, "timestep": 100, "group_id": row["group_id"],
+            "candidate_losses": {"1.0": 1.0},
+            "metrics": {"dL_dg": 0.0, "finite_difference_selected": False, "fd_result": "not_selected_joint_gradient_only"},
+        })
+    for group in ("global:adaln", "global:other"):
+        records.append({
+            "run_id": "run", "probe_case_id": f"diagnostic-{group}", "split": "train",
+            "item_id": "item", "noise_seed": 42, "timestep": 100, "group_id": group,
+            "candidate_losses": {"1.0": 1.0}, "metrics": {"dL_dg": 1.0},
+        })
+    prior = build_prior_vectors(records, rows, 100)
+    assert prior["ignored_non_gate_diagnostic_groups"] == ["global:adaln", "global:other"]
+    assert prior["unknown_groups"] == []
+    records.append({**records[-1], "probe_case_id": "bad", "group_id": "global:attention"})
+    with pytest.raises(RuntimeError, match="unknown groups"):
+        build_prior_vectors(records, rows, 100)
+
+
 def test_fd_prior_rejects_truncated_group_coverage():
     rows = _group_rows()
     with pytest.raises(RuntimeError, match="lack all evidence"):

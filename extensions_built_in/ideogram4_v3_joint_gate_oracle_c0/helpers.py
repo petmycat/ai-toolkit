@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterable, Mapping, Sequence, Tuple
 
 
 FAMILY_ORDER = ("adaln", "attention", "mlp")
+NON_GATE_DIAGNOSTIC_GROUPS = frozenset({"global:adaln", "global:other"})
 
 
 def sha256_file(path: os.PathLike | str) -> str:
@@ -193,12 +194,22 @@ def build_prior_vectors(
     group_ids = [str(row["group_id"]) for row in group_rows]
     group_set = set(group_ids)
     scoped = [row for row in records if int(row.get("timestep", -1)) == int(timestep)]
-    unknown = sorted({str(row.get("group_id")) for row in scoped if str(row.get("group_id")) not in group_set})
+    non_gate_diagnostics = sorted({
+        str(row.get("group_id")) for row in scoped
+        if str(row.get("group_id")) in NON_GATE_DIAGNOSTIC_GROUPS
+    })
+    unknown = sorted({
+        str(row.get("group_id")) for row in scoped
+        if str(row.get("group_id")) not in group_set
+        and str(row.get("group_id")) not in NON_GATE_DIAGNOSTIC_GROUPS
+    })
     if unknown:
         raise RuntimeError(f"C0 prior records contain unknown groups: {unknown[:10]}")
     duplicate_keys = set()
     by_group: Dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     for row in scoped:
+        if str(row.get("group_id")) in NON_GATE_DIAGNOSTIC_GROUPS:
+            continue
         key = (str(row.get("run_id", "")), str(row.get("probe_case_id", "")), str(row.get("group_id", "")))
         if key in duplicate_keys:
             raise RuntimeError(f"duplicate C0 prior record key: {key}")
@@ -231,7 +242,7 @@ def build_prior_vectors(
         fd_q.append(fd_q_value)
         mean_grad.append(mean_gradient)
         details.append({"group_id": group, "gradient_mean": mean_gradient, "gradient_status": "complete" if len(available_gradients) == 2 else ("partial" if available_gradients else "no_finite_gradient"), "fd_composition": composition, "fd_status": fd_status, "fd_q": fd_q_value, "split_stats": split_stats})
-    return {"fd_q": fd_q, "mean_gradient": mean_grad, "details": details, "unknown_groups": unknown, "timestep": int(timestep), "fd_evidence_splits": list(fd_splits), "fd_tie_policy": "center_then_symmetric_outer", "balance_order": ["noise_seed", "item_id", "split"]}
+    return {"fd_q": fd_q, "mean_gradient": mean_grad, "details": details, "unknown_groups": unknown, "ignored_non_gate_diagnostic_groups": non_gate_diagnostics, "timestep": int(timestep), "fd_evidence_splits": list(fd_splits), "fd_tie_policy": "center_then_symmetric_outer", "balance_order": ["noise_seed", "item_id", "split"]}
 
 
 def select_balanced_batch(items: Sequence[Any], step: int, count: int, seed: int) -> list[Any]:
