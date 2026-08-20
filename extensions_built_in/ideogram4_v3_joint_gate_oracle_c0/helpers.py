@@ -245,6 +245,33 @@ def build_prior_vectors(
     return {"fd_q": fd_q, "mean_gradient": mean_grad, "details": details, "unknown_groups": unknown, "ignored_non_gate_diagnostic_groups": non_gate_diagnostics, "timestep": int(timestep), "fd_evidence_splits": list(fd_splits), "fd_tie_policy": "center_then_symmetric_outer", "balance_order": ["noise_seed", "item_id", "split"]}
 
 
+def validate_visual_prompt_placeholders(
+    prompts: Sequence[str],
+    placeholder: str,
+    *,
+    expected_occurrences: int | None = None,
+) -> list[Dict[str, Any]]:
+    if not placeholder:
+        raise ValueError("C0 visual placeholder must be non-empty")
+    if expected_occurrences is not None and expected_occurrences <= 0:
+        raise ValueError("expected visual placeholder occurrences must be positive")
+    audit = []
+    for index, prompt in enumerate(prompts):
+        count = str(prompt).count(placeholder)
+        if count == 0:
+            raise ValueError(
+                f"C0 novel_visuals.prompts[{index}] must contain the calibrated activator "
+                f"placeholder {placeholder!r} at least once"
+            )
+        if expected_occurrences is not None and count != expected_occurrences:
+            raise ValueError(
+                f"C0 novel_visuals.prompts[{index}] contains {count} occurrences of {placeholder!r}; "
+                f"Phase C V2 comparison requires exactly {expected_occurrences}"
+            )
+        audit.append({"prompt_index": index, "placeholder": placeholder, "occurrence_count": count})
+    return audit
+
+
 def select_balanced_batch(items: Sequence[Any], step: int, count: int, seed: int) -> list[Any]:
     import random
 

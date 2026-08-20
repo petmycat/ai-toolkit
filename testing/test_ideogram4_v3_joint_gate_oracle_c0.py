@@ -11,6 +11,7 @@ from extensions_built_in.ideogram4_v3_joint_gate_oracle_c0.helpers import (
     metric_payload,
     sign_agreement,
     select_balanced_batch,
+    validate_visual_prompt_placeholders,
 )
 
 
@@ -36,6 +37,18 @@ def test_c0_rejects_prompts_without_visual_seeds(tmp_path):
     raw["novel_visuals"]["seeds"] = []
     with pytest.raises(ValueError, match="seeds must be non-empty"):
         load_config(raw)
+
+
+def test_visual_prompt_placeholder_contract_is_explicit():
+    assert validate_visual_prompt_placeholders(("a [trigger] object",), "[trigger]")[0]["occurrence_count"] == 1
+    with pytest.raises(ValueError, match=r"prompts\[0\].*at least once"):
+        validate_visual_prompt_placeholders(("a plain object",), "[trigger]")
+    with pytest.raises(ValueError, match="requires exactly 3"):
+        validate_visual_prompt_placeholders(("[trigger] and [trigger]",), "[trigger]", expected_occurrences=3)
+    audit = validate_visual_prompt_placeholders(
+        ("[trigger] near [trigger] behind [trigger]",), "[trigger]", expected_occurrences=3
+    )
+    assert audit[0]["occurrence_count"] == 3
 
 
 def test_c0_accepts_zero_one_or_many_novel_prompts(tmp_path):

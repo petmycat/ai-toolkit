@@ -26,6 +26,7 @@ from .helpers import (
     sha256_file,
     sign_agreement,
     summarize_validation,
+    validate_visual_prompt_placeholders,
 )
 
 
@@ -97,6 +98,29 @@ class Ideogram4V3JointGateOracleC0Process(Ideogram4V3ResidualAblationProcess):
         if not set(self.c0.timesteps).issubset(record_timesteps):
             raise RuntimeError(f"C0 residual records lack required timesteps: {sorted(set(self.c0.timesteps) - record_timesteps)}")
         return load_json(registry_path), records, residual_manifest
+
+    def _preflight_visual_prompts(self):
+        visual = self.c0.novel_visuals
+        if not visual.enabled or not visual.prompts:
+            return []
+        expected_occurrences = None
+        if visual.include_phase_c_v2:
+            handoff_path = Path(visual.phase_c_v2_handoff)
+            handoff = load_json(handoff_path)
+            if handoff.get("schema") != "ai-toolkit.ideogram4-v3-phase-c-v2-handoff" or int(handoff.get("schema_version", 0)) != 2 or handoff.get("status") != "completed":
+                raise RuntimeError("invalid or incomplete Phase C V2 handoff for C0 visual prompt preflight")
+            refs = handoff.get(visual.phase_c_v2_checkpoint, {})
+            config_ref = refs.get("config", {}) if isinstance(refs, Mapping) else {}
+            config_path = (handoff_path.parent / str(config_ref.get("path", ""))).resolve()
+            if not config_path.is_file() or sha256_file(config_path) != config_ref.get("sha256"):
+                raise RuntimeError("Phase C V2 visual router config file/hash mismatch during prompt preflight")
+            router_config = load_json(config_path)
+            if router_config.get("schema") != "ai-toolkit.ideogram4-v3-phase-c-v2-router-config" or int(router_config.get("schema_version", 0)) != 2:
+                raise RuntimeError("invalid Phase C V2 router config during visual prompt preflight")
+            expected_occurrences = int(router_config.get("activator_occurrence_count", 0))
+        return validate_visual_prompt_placeholders(
+            visual.prompts, self.placeholder, expected_occurrences=expected_occurrences
+        )
 
     def _build_active_registry(self, recorded_registry):
         from toolkit.residual_gating import (
@@ -341,6 +365,9 @@ class Ideogram4V3JointGateOracleC0Process(Ideogram4V3ResidualAblationProcess):
         self._visual_summary = {"status": "not_started", "image_count": 0, "prompt_count": 0}
         self._progress("resolving V9 A2, V3, residual-ablation, registry, and split contracts")
         recorded_registry, fd_records, residual_manifest = self._resolve_c0_inputs()
+        visual_prompt_audit = self._preflight_visual_prompts()
+        if visual_prompt_audit:
+            self._progress(f"validated {len(visual_prompt_audit)} novel visual prompt placeholder contracts")
         if self.output_root.exists() and any(self.output_root.iterdir()):
             raise RuntimeError(
                 f"C0 output_root is not empty and resume is disabled: {self.output_root}; "
@@ -503,6 +530,7 @@ class Ideogram4V3JointGateOracleC0Process(Ideogram4V3ResidualAblationProcess):
         manifest = {
             "schema": "ai-toolkit.ideogram4-v3-c0-visuals", "schema_version": 1,
             "prompt_count": len(visual.prompts), "seeds": list(visual.seeds), "images": [],
+            "prompt_placeholder_audit": validate_visual_prompt_placeholders(visual.prompts, self.placeholder) if visual.prompts else [],
             "c0_trajectory": "piecewise linear interpolation of q_100/q_500/q_900 with endpoint clamping",
         }
         if not visual.enabled or not visual.prompts:
