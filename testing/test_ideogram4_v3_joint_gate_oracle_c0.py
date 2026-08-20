@@ -7,6 +7,7 @@ from extensions_built_in.ideogram4_v3_joint_gate_oracle_c0.config import load_co
 from extensions_built_in.ideogram4_v3_joint_gate_oracle_c0.helpers import (
     build_prior_vectors,
     canonical_group_rows,
+    interpolate_anchor_values,
     interpolation_weights,
     metric_payload,
     sign_agreement,
@@ -90,6 +91,12 @@ def test_three_anchor_interpolation_clamps_and_interpolates():
     assert interpolation_weights(900) == (2, 2, 0.0)
     assert interpolation_weights(300) == (0, 1, pytest.approx(0.5))
     assert interpolation_weights(700) == (1, 2, pytest.approx(0.5))
+    anchors = {100: 1.0, 500: 2.0, 900: 4.0}
+    assert interpolate_anchor_values(50, anchors) == pytest.approx(1.0)
+    assert interpolate_anchor_values(100, anchors) == pytest.approx(1.0)
+    assert interpolate_anchor_values(500, anchors) == pytest.approx(2.0)
+    assert interpolate_anchor_values(900, anchors) == pytest.approx(4.0)
+    assert interpolate_anchor_values(700, anchors) == pytest.approx(3.0)
 
 
 def _group_rows():

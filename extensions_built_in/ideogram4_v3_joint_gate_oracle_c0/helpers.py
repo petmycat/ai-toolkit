@@ -369,6 +369,18 @@ def interpolate_oracle(timestep: float, q_by_timestep: Mapping[int, Any]):
     return ordered[left] * (1.0 - weight) + ordered[right] * weight
 
 
+def interpolate_anchor_values(timestep: float, values_by_timestep: Mapping[int, Any]):
+    if not values_by_timestep:
+        raise ValueError("anchor interpolation requires at least one timestep")
+    anchors = tuple(sorted(int(key) for key in values_by_timestep))
+    left_index, right_index, weight = interpolation_weights(timestep, anchors)
+    left_value = values_by_timestep[anchors[left_index]]
+    if left_index == right_index:
+        return left_value
+    right_value = values_by_timestep[anchors[right_index]]
+    return left_value * (1.0 - weight) + right_value * weight
+
+
 def metric_payload(v3_loss: float, candidate_loss: float, epsilon: float = 1.0e-12) -> Dict[str, float]:
     gain = float(v3_loss) - float(candidate_loss)
     return {

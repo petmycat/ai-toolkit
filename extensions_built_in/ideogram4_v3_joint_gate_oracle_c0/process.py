@@ -19,6 +19,7 @@ from .helpers import (
     cosine,
     load_json,
     load_jsonl,
+    interpolate_anchor_values,
     metric_payload,
     q_statistics,
     select_balanced_batch,
@@ -631,28 +632,9 @@ class Ideogram4V3JointGateOracleC0Process(Ideogram4V3ResidualAblationProcess):
         if condition == "v3":
             return torch.zeros(102, device=self.sd.device_torch, dtype=torch.float32)
         if condition == "c0_three_anchor_interpolation":
-            anchors = sorted(oracle_vectors)
-            if timestep <= anchors[0]:
-                return oracle_vectors[anchors[0]]
-            if timestep >= anchors[-1]:
-                return oracle_vectors[anchors[-1]]
-            left = max(value for value in anchors if value <= timestep)
-            right = min(value for value in anchors if value >= timestep)
-            if left == right:
-                return oracle_vectors[left]
-            alpha = (timestep - left) / (right - left)
-            return oracle_vectors[left] * (1.0 - alpha) + oracle_vectors[right] * alpha
+            return interpolate_anchor_values(timestep, oracle_vectors)
         if condition == "global_best":
-            anchors = sorted(best_global)
-            if timestep <= anchors[0]:
-                value = best_global[anchors[0]]
-            elif timestep >= anchors[-1]:
-                value = best_global[anchors[-1]]
-            else:
-                left = max(value for value in anchors if value <= timestep)
-                right = min(value for value in anchors if value >= timestep)
-                alpha = (timestep - left) / (right - left)
-                value = best_global[left] * (1.0 - alpha) + best_global[right] * alpha
+            value = interpolate_anchor_values(timestep, best_global)
             return torch.full((102,), value, device=self.sd.device_torch, dtype=torch.float32)
         if condition == "phase_c_v2":
             router, router_config = phase_c
