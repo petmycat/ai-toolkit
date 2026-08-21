@@ -12,6 +12,7 @@ from extensions_built_in.ideogram4_v3_joint_gate_oracle_c0.helpers import (
     metric_payload,
     sign_agreement,
     select_balanced_batch,
+    validate_completed_q_payload,
     validate_visual_prompt_placeholders,
 )
 
@@ -58,6 +59,12 @@ def test_c0_accepts_zero_one_or_many_novel_prompts(tmp_path):
     assert load_config(_config(tmp_path, prompts=("one", "two"))).novel_visuals.prompts == ("one", "two")
 
 
+def test_c0_accepts_explicit_resume_for_completed_timestep_artifacts(tmp_path):
+    raw = _config(tmp_path)
+    raw["resume"] = True
+    assert load_config(raw).resume is True
+
+
 def test_c0_rejects_non_stage1_timesteps_and_q_bound_override(tmp_path):
     raw = _config(tmp_path)
     raw["timesteps"] = [100, 500]
@@ -74,6 +81,45 @@ def test_c0_requires_safe_unique_artifact_paths(tmp_path):
     raw["artifacts"] = {"config": "../escape.json"}
     with pytest.raises(ValueError, match="artifact paths"):
         load_config(raw)
+
+
+def test_completed_q_resume_contract_is_strict():
+    payload = {
+        "schema": "ai-toolkit.ideogram4-v3-c0-oracle-gates",
+        "schema_version": 1,
+        "timestep": 100,
+        "optimizer_step": 100,
+        "q_bound": 0.25,
+        "registry_fingerprint": "registry",
+        "q": [0.0] * 102,
+    }
+    values = validate_completed_q_payload(
+        payload, timestep=100, optimizer_steps=100, q_bound=0.25, registry_fingerprint="registry"
+    )
+    assert values == [0.0] * 102
+    payload["registry_fingerprint"] = "wrong"
+    with pytest.raises(RuntimeError, match="contract mismatch"):
+        validate_completed_q_payload(
+            payload, timestep=100, optimizer_steps=100, q_bound=0.25, registry_fingerprint="registry"
+        )
+
+
+def test_unscaled_backward_then_divide_preserves_tiny_half_path_gradients():
+    item_count = 32
+    parameter_scaled = torch.zeros(1, dtype=torch.float32, requires_grad=True)
+    for _ in range(item_count):
+        gate = parameter_scaled.to(torch.float16)
+        loss = gate * torch.tensor(5.0e-7, dtype=torch.float16)
+        (loss / item_count).backward()
+    assert float(parameter_scaled.grad.item()) == 0.0
+
+    parameter_accumulated = torch.zeros(1, dtype=torch.float32, requires_grad=True)
+    for _ in range(item_count):
+        gate = parameter_accumulated.to(torch.float16)
+        loss = gate * torch.tensor(5.0e-7, dtype=torch.float16)
+        loss.backward()
+    parameter_accumulated.grad.div_(float(item_count))
+    assert float(parameter_accumulated.grad.item()) > 0.0
 
 
 def test_endpoint_and_metric_contracts_are_exact():

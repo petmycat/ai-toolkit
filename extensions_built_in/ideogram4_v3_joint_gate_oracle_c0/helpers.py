@@ -31,6 +31,48 @@ def load_json(path: os.PathLike | str) -> Dict[str, Any]:
     return value
 
 
+def validate_completed_q_payload(
+    payload: Mapping[str, Any],
+    *,
+    timestep: int,
+    optimizer_steps: int,
+    q_bound: float,
+    registry_fingerprint: str,
+) -> list[float]:
+    expected = {
+        "schema": "ai-toolkit.ideogram4-v3-c0-oracle-gates",
+        "schema_version": 1,
+        "timestep": int(timestep),
+        "optimizer_step": int(optimizer_steps),
+        "q_bound": float(q_bound),
+        "registry_fingerprint": registry_fingerprint,
+    }
+    mismatches = {
+        key: {"expected": value, "actual": payload.get(key)}
+        for key, value in expected.items()
+        if payload.get(key) != value
+    }
+    if mismatches:
+        raise RuntimeError(f"C0 resume q_final contract mismatch for t={timestep}: {mismatches}")
+    raw_values = payload.get("q")
+    if not isinstance(raw_values, list) or len(raw_values) != 102:
+        raise RuntimeError(f"C0 resume q_final for t={timestep} must contain exactly 102 gates")
+    values = []
+    for index, raw in enumerate(raw_values):
+        if isinstance(raw, bool):
+            raise RuntimeError(f"C0 resume q_final for t={timestep} gate {index} is not numeric")
+        try:
+            value = float(raw)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(f"C0 resume q_final for t={timestep} gate {index} is not numeric") from error
+        if not math.isfinite(value):
+            raise RuntimeError(f"C0 resume q_final for t={timestep} contains non-finite gates")
+        if abs(value) > q_bound + 1.0e-6:
+            raise RuntimeError(f"C0 resume q_final for t={timestep} exceeds q_bound")
+        values.append(value)
+    return values
+
+
 def load_jsonl(path: os.PathLike | str) -> list[Dict[str, Any]]:
     output = []
     with open(path, "r", encoding="utf-8") as handle:

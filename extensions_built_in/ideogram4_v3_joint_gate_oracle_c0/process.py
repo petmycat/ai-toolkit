@@ -27,6 +27,7 @@ from .helpers import (
     sha256_file,
     sign_agreement,
     summarize_validation,
+    validate_completed_q_payload,
     validate_visual_prompt_placeholders,
 )
 
@@ -246,14 +247,17 @@ class Ideogram4V3JointGateOracleC0Process(Ideogram4V3ResidualAblationProcess):
                 prepared = self._prepare_item_case(item, timestep, seed, torch)
                 q_micro = self.c0.q_bound * torch.tanh(parameter)
                 loss = self._prediction_loss(prepared, q_micro, registry_fingerprint, torch)
-                (loss / len(train_items)).backward()
+                loss.backward()
                 cases.append({"item_id": item["dataset_relative_item_id"], "noise_seed": seed})
             if parameter.grad is None or not bool(torch.isfinite(parameter.grad).all()):
                 raise RuntimeError(f"C0 q={timestep} zero-point gradient is missing or non-finite")
-            gradients.append(parameter.grad.detach().clone())
+            gradients.append(parameter.grad.detach().clone() / float(len(train_items)))
         gradient = torch.stack(gradients).mean(dim=0)
         if float(gradient.norm().item()) == 0.0:
-            raise RuntimeError(f"C0 q={timestep} mean zero-point gradient is exactly zero")
+            raise RuntimeError(
+                f"C0 q={timestep} mean zero-point gradient is exactly zero after unscaled "
+                "per-case backward accumulation"
+            )
         return gradient, cases
 
     def _validation_records(self, q, fd_q, gradient_at_zero, train_items, heldout_items, timestep, registry_fingerprint, torch):
@@ -357,6 +361,25 @@ class Ideogram4V3JointGateOracleC0Process(Ideogram4V3ResidualAblationProcess):
         self.sd.model.zero_grad(set_to_none=True)
         self.network.zero_grad(set_to_none=True)
 
+    def _load_completed_q(self, checkpoint_dir, timestep, registry_fingerprint, torch):
+        final_path = checkpoint_dir / "q_final.json"
+        if not final_path.is_file():
+            if checkpoint_dir.exists() and any(checkpoint_dir.iterdir()):
+                raise RuntimeError(
+                    f"C0 resume found partial timestep artifacts without q_final.json: {checkpoint_dir}; "
+                    "only fully optimized timesteps can be resumed"
+                )
+            return None
+        payload = load_json(final_path)
+        values = validate_completed_q_payload(
+            payload,
+            timestep=timestep,
+            optimizer_steps=self.c0.optimizer.steps,
+            q_bound=self.c0.q_bound,
+            registry_fingerprint=registry_fingerprint,
+        )
+        return torch.tensor(values, device=self.sd.device_torch, dtype=torch.float32)
+
     def run(self):
         BaseExtensionProcess.run(self)
         import torch
@@ -369,10 +392,11 @@ class Ideogram4V3JointGateOracleC0Process(Ideogram4V3ResidualAblationProcess):
         visual_prompt_audit = self._preflight_visual_prompts()
         if visual_prompt_audit:
             self._progress(f"validated {len(visual_prompt_audit)} novel visual prompt placeholder contracts")
-        if self.output_root.exists() and any(self.output_root.iterdir()):
+        if self.output_root.exists() and any(self.output_root.iterdir()) and not self.c0.resume:
             raise RuntimeError(
                 f"C0 output_root is not empty and resume is disabled: {self.output_root}; "
-                "use a fresh output_root or explicitly remove the prior run"
+                "use a fresh output_root, remove the prior run, or set resume: true to reuse only "
+                "strictly validated q_final timestep artifacts"
             )
         self.output_root.mkdir(parents=True, exist_ok=True)
         self._progress("loading frozen Ideogram4, V3 LoRA, and calibrated A2 activator")
@@ -397,56 +421,62 @@ class Ideogram4V3JointGateOracleC0Process(Ideogram4V3ResidualAblationProcess):
             prior_vectors[timestep] = prior
             fd_q = torch.tensor(prior["fd_q"], device=self.sd.device_torch, dtype=torch.float32)
             prior_gradient = torch.tensor(prior["mean_gradient"], device=self.sd.device_torch, dtype=torch.float32)
-            parameter = torch.zeros(102, device=self.sd.device_torch, dtype=torch.float32, requires_grad=True)
-            optimizer = torch.optim.AdamW([parameter], lr=self.c0.optimizer.learning_rate, weight_decay=0.0)
-            metrics = []
             checkpoint_dir = self.output_root / "canonical" / f"t{timestep}"
-            self._save_q(checkpoint_dir / "q_step000000.json", timestep, 0, torch.zeros_like(parameter), registry_fingerprint)
-            progress = tqdm(range(1, self.c0.optimizer.steps + 1), desc=f"C0 q_{timestep}", unit="step", dynamic_ncols=True, leave=True)
-            for step in progress:
-                selected = self._select_train_items(train_items, step, self.c0.same_timestep_content_batch, self.c0.seed + timestep)
-                noise_seed = self.c0.optimizer.noise_seeds[(step - 1) % len(self.c0.optimizer.noise_seeds)]
-                optimizer.zero_grad(set_to_none=True)
-                q_before_update = (self.c0.q_bound * torch.tanh(parameter)).detach()
-                micro_losses = []
-                v3_losses = []
-                for item in selected:
-                    prepared = self._prepare_item_case(item, timestep, noise_seed, torch)
-                    q_micro = self.c0.q_bound * torch.tanh(parameter)
-                    loss = self._prediction_loss(prepared, q_micro, registry_fingerprint, torch)
-                    (loss / len(selected)).backward()
-                    micro_losses.append(loss.detach())
-                    with torch.no_grad():
-                        v3_losses.append(self._prediction_loss(prepared, torch.zeros_like(q_micro), registry_fingerprint, torch))
-                grad_norm = float(parameter.grad.detach().norm().item())
-                if not bool(torch.isfinite(parameter.grad).all()) or grad_norm == 0.0:
-                    raise RuntimeError(f"C0 q_{timestep} step {step} has invalid oracle gradient")
-                optimizer.step()
-                if not bool(torch.isfinite(parameter).all()):
-                    raise RuntimeError(f"C0 q_{timestep} step {step} produced non-finite parameters")
-                q_logged = self.c0.q_bound * torch.tanh(parameter.detach())
-                oracle_loss = float(torch.stack(micro_losses).mean().item())
-                v3_loss = float(torch.stack(v3_losses).mean().item())
-                metrics.append({
-                    "schema": "ai-toolkit.ideogram4-v3-c0-training", "schema_version": 1,
-                    "timestep": timestep, "optimizer_step": step,
-                    "item_ids": [item["dataset_relative_item_id"] for item in selected],
-                    "noise_seeds": [noise_seed] * len(selected),
-                    "train_loss_v3": v3_loss, "train_loss_oracle": oracle_loss,
-                    "train_absolute_gain": v3_loss - oracle_loss,
-                    "train_normalized_gain": (v3_loss - oracle_loss) / (v3_loss + 1.0e-12),
-                    "gate_grad_norm": grad_norm,
-                    "q_before_update": q_statistics(q_before_update, self._group_rows),
-                    "q_after_update": q_statistics(q_logged, self._group_rows),
-                })
-                progress.set_postfix(loss=f"{oracle_loss:.5g}", gain=f"{v3_loss - oracle_loss:.3g}", abs_q=f"{q_logged.abs().mean().item():.3g}", refresh=False)
-                if step in self.c0.optimizer.snapshot_steps:
-                    self._save_q(checkpoint_dir / f"q_step{step:06d}.json", timestep, step, q_logged, registry_fingerprint)
-            progress.close()
-            q_final = self.c0.q_bound * torch.tanh(parameter.detach())
+            resumed_q = self._load_completed_q(checkpoint_dir, timestep, registry_fingerprint, torch) if self.c0.resume else None
+            if resumed_q is not None:
+                self._progress(f"resuming completed q_{timestep} optimization from validated q_final.json")
+                q_final = resumed_q
+            else:
+                parameter = torch.zeros(102, device=self.sd.device_torch, dtype=torch.float32, requires_grad=True)
+                optimizer = torch.optim.AdamW([parameter], lr=self.c0.optimizer.learning_rate, weight_decay=0.0)
+                metrics = []
+                self._save_q(checkpoint_dir / "q_step000000.json", timestep, 0, torch.zeros_like(parameter), registry_fingerprint)
+                progress = tqdm(range(1, self.c0.optimizer.steps + 1), desc=f"C0 q_{timestep}", unit="step", dynamic_ncols=True, leave=True)
+                for step in progress:
+                    selected = self._select_train_items(train_items, step, self.c0.same_timestep_content_batch, self.c0.seed + timestep)
+                    noise_seed = self.c0.optimizer.noise_seeds[(step - 1) % len(self.c0.optimizer.noise_seeds)]
+                    optimizer.zero_grad(set_to_none=True)
+                    q_before_update = (self.c0.q_bound * torch.tanh(parameter)).detach()
+                    micro_losses = []
+                    v3_losses = []
+                    for item in selected:
+                        prepared = self._prepare_item_case(item, timestep, noise_seed, torch)
+                        q_micro = self.c0.q_bound * torch.tanh(parameter)
+                        loss = self._prediction_loss(prepared, q_micro, registry_fingerprint, torch)
+                        loss.backward()
+                        micro_losses.append(loss.detach())
+                        with torch.no_grad():
+                            v3_losses.append(self._prediction_loss(prepared, torch.zeros_like(q_micro), registry_fingerprint, torch))
+                    parameter.grad.div_(float(len(selected)))
+                    grad_norm = float(parameter.grad.detach().norm().item())
+                    if not bool(torch.isfinite(parameter.grad).all()) or grad_norm == 0.0:
+                        raise RuntimeError(f"C0 q_{timestep} step {step} has invalid oracle gradient")
+                    optimizer.step()
+                    if not bool(torch.isfinite(parameter).all()):
+                        raise RuntimeError(f"C0 q_{timestep} step {step} produced non-finite parameters")
+                    q_logged = self.c0.q_bound * torch.tanh(parameter.detach())
+                    oracle_loss = float(torch.stack(micro_losses).mean().item())
+                    v3_loss = float(torch.stack(v3_losses).mean().item())
+                    metrics.append({
+                        "schema": "ai-toolkit.ideogram4-v3-c0-training", "schema_version": 1,
+                        "timestep": timestep, "optimizer_step": step,
+                        "item_ids": [item["dataset_relative_item_id"] for item in selected],
+                        "noise_seeds": [noise_seed] * len(selected),
+                        "train_loss_v3": v3_loss, "train_loss_oracle": oracle_loss,
+                        "train_absolute_gain": v3_loss - oracle_loss,
+                        "train_normalized_gain": (v3_loss - oracle_loss) / (v3_loss + 1.0e-12),
+                        "gate_grad_norm": grad_norm,
+                        "q_before_update": q_statistics(q_before_update, self._group_rows),
+                        "q_after_update": q_statistics(q_logged, self._group_rows),
+                    })
+                    progress.set_postfix(loss=f"{oracle_loss:.5g}", gain=f"{v3_loss - oracle_loss:.3g}", abs_q=f"{q_logged.abs().mean().item():.3g}", refresh=False)
+                    if step in self.c0.optimizer.snapshot_steps:
+                        self._save_q(checkpoint_dir / f"q_step{step:06d}.json", timestep, step, q_logged, registry_fingerprint)
+                progress.close()
+                q_final = self.c0.q_bound * torch.tanh(parameter.detach())
+                atomic_write_jsonl(checkpoint_dir / "training_metrics.jsonl", metrics)
+                self._save_q(checkpoint_dir / "q_final.json", timestep, self.c0.optimizer.steps, q_final, registry_fingerprint)
             oracle_vectors[timestep] = q_final
-            atomic_write_jsonl(checkpoint_dir / "training_metrics.jsonl", metrics)
-            self._save_q(checkpoint_dir / "q_final.json", timestep, self.c0.optimizer.steps, q_final, registry_fingerprint)
             current_gradient, gradient_cases = self._gradient_at_zero(
                 train_items, timestep, registry_fingerprint, torch
             )

@@ -166,8 +166,6 @@ def validate_config(config: C0Config) -> None:
         raise ValueError(f"C0 configuration is missing paths: {missing}")
     if config.timesteps != (100, 500, 900):
         raise ValueError("C0 Stage 1 requires exactly timesteps [100,500,900]")
-    if config.resume:
-        raise ValueError("C0 resume is not implemented; set resume: false to avoid silently restarting")
     if config.same_timestep_content_batch < 2:
         raise ValueError("same_timestep_content_batch must be at least 2")
     if config.train_item_limit is not None and config.train_item_limit < config.same_timestep_content_batch:
