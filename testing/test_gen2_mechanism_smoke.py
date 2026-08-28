@@ -13,7 +13,7 @@ from extensions_built_in.gen2_trainer.checkpoint import load_phase_checkpoint, s
 from extensions_built_in.gen2_trainer.config import validate_gen2_config
 from extensions_built_in.gen2_trainer.registry import AdapterRuntimeContext, Gen2AdapterBank, TargetSpec, enable_adapter_training, install_ideogram_adapters
 from extensions_built_in.gen2_trainer.temporal_rank_field import TemporalRankFieldLoRA
-from extensions_built_in.gen2_trainer.sampling import make_flowmatch_noisy_latents, sample_stratified_timesteps
+from extensions_built_in.gen2_trainer.sampling import build_validation_matrix, make_flowmatch_noisy_latents, sample_stratified_timesteps
 
 
 ROOT = Path(__file__).parents[1]
@@ -65,6 +65,8 @@ class MechanismSmokeTest(unittest.TestCase):
         self.assertTrue(process["model"]["unconditional"]["enabled"])
         self.assertTrue(process["network"]["image_token_only"])
         self.assertEqual(len(process["datasets"][0]["helpers"]), 2)
+        cases = build_validation_matrix(1, [1], [0.0, 0.5, 1.0])
+        self.assertEqual([case.eta_u for case in cases], [0.0, 0.0, 0.5, 1.0])
         self.assertTrue(process["train"]["phase_a"]["helper_margin"]["enabled"])
         self.assertTrue(process["sample"]["require_official_unconditional"])
         validate_gen2_config(process)

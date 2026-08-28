@@ -20,6 +20,7 @@ from .activator import (
     normalize_inline_helpers,
     replace_token_spans_with_soft_tokens,
 )
+from .artifacts import load_tensor_artifact, save_tensor_artifact
 from .checkpoint import load_phase_checkpoint, save_phase_checkpoint
 from .config import Gen2RuntimeConfig, validate_gen2_config
 from toolkit.optimizer import get_optimizer
@@ -55,17 +56,24 @@ class Gen2Trainer(BaseSDTrainProcess):
             return 0
         return int(settings.get("steps", 0))
 
-    def _write_manifest(self, completed_phase: str) -> None:
+    def _write_manifest(self, status: str, completed_phase: str | None = None, error: str | None = None) -> None:
         self.gen2_root.mkdir(parents=True, exist_ok=True)
         manifest = {
             "schema_version": 1,
             "trainer": "gen2_trainer",
+            "status": status,
             "completed_phase": completed_phase,
             "mode": self.gen2_config.mode,
             "placeholder": self.gen2_config.placeholder,
             "official_unconditional_required": True,
             "training_scope": "conditional_only",
+            "artifacts": {
+                "activator": "phase_a/activator.safetensors",
+                "style_adapter": "phase_b/adapter.safetensors",
+            },
         }
+        if error is not None:
+            manifest["error"] = error
         (self.gen2_root / "gen2_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     def hook_after_model_load(self):
@@ -324,6 +332,11 @@ class Gen2Trainer(BaseSDTrainProcess):
                 progress.update(1)
                 if hasattr(batch, "cleanup"):
                     batch.cleanup()
+        save_tensor_artifact(
+            self.phase_a_root / "activator.safetensors",
+            {"A": self.soft_tokens.A},
+            {"artifact": "gen2_activator", "tokens": self.soft_tokens.tokens, "dimension": self.soft_tokens.dimension, "helpers": self.helpers},
+        )
         torch.save({"A": self.soft_tokens.A.detach().cpu(), "helpers": self.helpers}, self.phase_a_root / "activator.pt")
 
     def _install_phase_b_optimizer(self) -> None:
@@ -366,8 +379,12 @@ class Gen2Trainer(BaseSDTrainProcess):
             return
         if not artifact_path:
             raise ValueError(f"{self.gen2_config.mode} requires activator.artifact_path")
-        payload = torch.load(artifact_path, map_location="cpu", weights_only=False)
-        if "A" not in payload:
+        if Path(artifact_path).suffix == ".safetensors":
+            tensors, _ = load_tensor_artifact(artifact_path)
+            payload = {"A": tensors.get("A")}
+        else:
+            payload = torch.load(artifact_path, map_location="cpu", weights_only=False)
+        if payload.get("A") is None:
             raise ValueError("activator artifact must contain A")
         if tuple(payload["A"].shape) != tuple(self.soft_tokens.A.shape):
             raise ValueError("activator artifact shape does not match configured soft tokens")
@@ -466,6 +483,22 @@ class Gen2Trainer(BaseSDTrainProcess):
             optimizer,
             scheduler=self.lr_scheduler,
         )
+        network = self.config.get("network") or {}
+        temporal = network.get("temporal") or {}
+        save_tensor_artifact(
+            self.phase_b_root / "adapter.safetensors",
+            dict(self._adapter_bank.state_dict()),
+            {
+                "artifact": "gen2_temporal_rank_field_lora",
+                "rank": int(network.get("rank", 32)),
+                "alpha": float(network.get("alpha", network.get("rank", 32))),
+                "temporal_knots": int(temporal.get("knots", 8)),
+                "temporal_delta_max": float(temporal.get("delta_max", 1.0)),
+                "registry": self._adapter_bank.registry,
+                "training_scope": "conditional_only",
+                "image_token_only": True,
+            },
+        )
         torch.save({"state_dict": self._adapter_bank.state_dict(), "registry": self._adapter_bank.registry}, adapter_path)
         if self.official_unconditional is not None:
             unconditional_bank = getattr(self.official_unconditional.transformer, "_gen2_adapter_bank", None)
@@ -488,44 +521,71 @@ class Gen2Trainer(BaseSDTrainProcess):
         self.validation_cases = cases
         output_root = self.gen2_root / "samples" / f"step_{self._phase_steps('b'):06d}"
         output_root.mkdir(parents=True, exist_ok=True)
-        for case in cases:
-            if case.eta_u > 0 and self.official_unconditional is None:
-                raise RuntimeError("positive eta_u requires official unconditional transformer")
-            raw_prompt = self.gen2_config.validation_prompts[case.prompt_index]
-            if case.helper_off:
-                materialized = self.placeholder_contract.replace(raw_prompt, self.helpers[0]["replacement"])
-                embeds = self.sd.get_prompt_embeds([materialized])
-            else:
-                base = self.sd.get_prompt_embeds([raw_prompt])
-                embeds = type(base)(text_embeds=[self._encode_soft_prompt(raw_prompt).detach()])
-            generator = torch.Generator(device=self.device_torch).manual_seed(case.seed)
-            images = self.sd.pipeline(
-                conditional_embeds=embeds,
-                unconditional_embeds=None,
-                height=int(sample.get("height", 512)),
-                width=int(sample.get("width", 512)),
-                num_inference_steps=int(sample.get("steps", 4)),
-                guidance_scale=float(sample.get("guidance_scale", 7.0)),
-                generator=generator,
-                require_official_unconditional=True,
-                official_unconditional_transformer=self.official_unconditional,
-                style_adapter_conditional_scale=case.eta_c,
-                style_adapter_unconditional_scale=case.eta_u,
-                style_gate=torch.tensor([case.style_gate], device=self.device_torch),
-            )
-            case_root = output_root / f"prompt_{case.prompt_index:02d}" / f"seed_{case.seed}" 
-            case_root.mkdir(parents=True, exist_ok=True)
-            name = "helper_off" if case.helper_off else f"activator_on_eta_u_{case.eta_u:g}"
-            images[0].save(case_root / f"{name}.png")
-            self.official_unconditional.transformer.to("cpu")
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        progress = ToolkitProgressBar(total=len(cases), desc=f"Gen2 official CFG validation ({len(cases)} cases)")
+        try:
+            for case_index, case in enumerate(cases, start=1):
+                if case.eta_u > 0 and self.official_unconditional is None:
+                    raise RuntimeError("positive eta_u requires official unconditional transformer")
+                raw_prompt = self.gen2_config.validation_prompts[case.prompt_index]
+                if case.helper_off:
+                    materialized = self.placeholder_contract.replace(raw_prompt, self.helpers[0]["replacement"])
+                    embeds = self.sd.get_prompt_embeds([materialized])
+                else:
+                    base = self.sd.get_prompt_embeds([raw_prompt])
+                    embeds = type(base)(text_embeds=[self._encode_soft_prompt(raw_prompt).detach()])
+                generator = torch.Generator(device=self.device_torch).manual_seed(case.seed)
+                denoise_progress = ToolkitProgressBar(
+                    total=int(sample.get("steps", 4)),
+                    desc=f"CFG case {case_index}/{len(cases)}",
+                    leave=False,
+                )
+                try:
+                    images = self.sd.pipeline(
+                        conditional_embeds=embeds,
+                        unconditional_embeds=None,
+                        height=int(sample.get("height", 512)),
+                        width=int(sample.get("width", 512)),
+                        num_inference_steps=int(sample.get("steps", 4)),
+                        guidance_scale=float(sample.get("guidance_scale", 7.0)),
+                        generator=generator,
+                        require_official_unconditional=True,
+                        official_unconditional_transformer=self.official_unconditional,
+                        style_adapter_conditional_scale=case.eta_c,
+                        style_adapter_unconditional_scale=case.eta_u,
+                        style_gate=torch.tensor([case.style_gate], device=self.device_torch),
+                        step_callback=lambda _step, _total: denoise_progress.update(1),
+                    )
+                finally:
+                    denoise_progress.close()
+                case_root = output_root / f"prompt_{case.prompt_index:02d}" / f"seed_{case.seed}"
+                case_root.mkdir(parents=True, exist_ok=True)
+                name = "helper_off" if case.helper_off else f"activator_on_eta_u_{case.eta_u:g}"
+                images[0].save(case_root / f"{name}.png")
+                progress.set_postfix(case=case_index, eta_u=f"{case.eta_u:g}", helper_off=case.helper_off)
+                progress.update(1)
+                self.official_unconditional.transformer.to("cpu")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        finally:
+            progress.close()
         if self.accelerator.is_main_process:
             self.logger.log({"gen2/official_cfg_validation_cases": len(cases)})
             self.logger.commit()
+            print(f"Gen2 official CFG validation completed: {len(cases)} cases")
 
     def run(self) -> None:
         mode = self.gen2_config.mode
+        self._write_manifest("running")
+        try:
+            self._run_impl(mode)
+        except KeyboardInterrupt:
+            self._write_manifest("interrupted", error="KeyboardInterrupt")
+            raise
+        except Exception as error:
+            self._write_manifest("failed", error=f"{type(error).__name__}: {error}")
+            raise
+
+    def _run_impl(self, mode: str) -> None:
         self._initialize_soft_tokens()
         self.train_config = copy.copy(self.train_config)
         self.train_config.steps = self._phase_steps("a")
@@ -539,10 +599,11 @@ class Gen2Trainer(BaseSDTrainProcess):
         self._prepare_only = False
         if mode in {"auto", "phase_a_only"}:
             self._run_phase_a()
-            self._write_manifest("phase_a")
+            self._write_manifest("phase_a_training_completed", completed_phase="phase_a")
         else:
             self._load_activator_artifact()
         if mode == "phase_a_only":
+            print("Gen2 training completed: Phase A only")
             self.accelerator.end_training()
             return
         official = self.load_official_unconditional()
@@ -567,8 +628,10 @@ class Gen2Trainer(BaseSDTrainProcess):
         if mode in {"auto", "phase_b_from_activator", "resume_phase_b"}:
             self._install_phase_b_optimizer()
             self._run_phase_b()
-            self._write_manifest("phase_b")
+            self._write_manifest("phase_b_training_completed", completed_phase="phase_b")
             self._run_official_cfg_validation()
+            self._write_manifest("completed", completed_phase="phase_b")
+        print("Gen2 training completed: Phase A + Phase B + official CFG validation")
         self.accelerator.end_training()
 
     def _initialize_soft_tokens(self) -> None:

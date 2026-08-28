@@ -27,7 +27,9 @@ def build_validation_matrix(prompt_count: int, seeds: Iterable[int], eta_u_value
             cases.append(ValidationCase(prompt_index, int(seed), 0.0, True, 0.0, 0.0))
             if include_sweep:
                 for eta_u in eta_u_values:
-                    cases.append(ValidationCase(prompt_index, int(seed), 1.0, False, 1.0, float(eta_u)))
+                    eta_u = float(eta_u)
+                    if eta_u != 0.0:
+                        cases.append(ValidationCase(prompt_index, int(seed), 1.0, False, 1.0, eta_u))
     return cases
 
 

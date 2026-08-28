@@ -404,8 +404,9 @@ class Ideogram4Pipeline:
         # unconditional pass. We force it off before each conditional pass since the
         # outer sampling context (``with network:``) may switch it on globally.
         uncond_lora = getattr(model, "unconditional_lora", None)
+        step_callback = kwargs.get("step_callback")
 
-        for sigma, sigma_next in zip(sigmas[:-1], sigmas[1:]):
+        for step_index, (sigma, sigma_next) in enumerate(zip(sigmas[:-1], sigmas[1:]), start=1):
             t01 = sigma.expand(latents.shape[0])
             if unconditional_transformer is not None:
                 unconditional_transformer.to(device)
@@ -443,6 +444,8 @@ class Ideogram4Pipeline:
             else:
                 v = v_cond
             latents = latents + v.to(torch.float32) * (sigma_next - sigma)
+            if step_callback is not None:
+                step_callback(step_index, len(sigmas) - 1)
 
         images = model.decode_latents(latents, device=device, dtype=dtype)
         images = images.float().clamp(-1.0, 1.0)
