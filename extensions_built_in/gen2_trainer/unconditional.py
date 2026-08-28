@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -30,7 +31,20 @@ class OfficialIdeogramUnconditionalLoader:
     def _component_path(self) -> Path:
         root = Path(self.conditional_source)
         if not root.exists():
-            raise FileNotFoundError(f"official unconditional loading requires a local HF cache/path: {root}")
+            cache_roots = [
+                Path(os.environ[key])
+                for key in ("HF_HOME", "HUGGINGFACE_HUB_CACHE")
+                if os.environ.get(key)
+            ]
+            cache_roots.append(Path.home() / ".cache" / "huggingface" / "hub")
+            repo_key = "models--" + self.conditional_source.replace("/", "--")
+            snapshots = []
+            for cache_root in cache_roots:
+                repo_root = cache_root / repo_key
+                snapshots.extend((repo_root / "snapshots").glob("*") if (repo_root / "snapshots").is_dir() else [])
+            if not snapshots:
+                raise FileNotFoundError(f"official unconditional model is not present in local HF cache: {self.conditional_source}")
+            root = max(snapshots, key=lambda item: item.stat().st_mtime)
         component = root / "unconditional_transformer"
         if not component.is_dir():
             raise FileNotFoundError(f"official component not found: {component}")

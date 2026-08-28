@@ -20,11 +20,19 @@ class Gen2ActivatorTest(unittest.TestCase):
         self.assertIn("style, with punctuation", replaced)
 
     def test_soft_token_span_length(self):
-        bank = SoftTokenBank(3, 4, torch.ones(3, 4))
+        bank = SoftTokenBank(3, 4, torch.ones(3, 4, dtype=torch.float32))
         embeddings = torch.arange(6 * 4, dtype=torch.float32).reshape(6, 4)
         expanded, spans = replace_token_spans_with_soft_tokens(embeddings, [(1, 3), (4, 5)], bank)
         self.assertEqual(expanded.shape[0], 6 - 3 + 2 * 3)
         self.assertEqual([end - start for start, end in spans], [3, 3])
+
+    def test_soft_tokens_follow_input_dtype_and_keep_gradient(self):
+        bank = SoftTokenBank(3, 4, torch.ones(3, 4, dtype=torch.float32))
+        embeddings = torch.zeros(6, 4, dtype=torch.bfloat16)
+        expanded, _ = replace_token_spans_with_soft_tokens(embeddings, [(1, 2)], bank)
+        self.assertEqual(expanded.dtype, torch.bfloat16)
+        expanded.sum().backward()
+        self.assertIsNotNone(bank.A.grad)
 
     def test_missing_placeholder_fails(self):
         with self.assertRaises(ValueError):

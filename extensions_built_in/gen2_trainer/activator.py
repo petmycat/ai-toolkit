@@ -145,7 +145,8 @@ def replace_token_spans_with_soft_tokens(
         prefix = token_embeddings[cursor:start]
         pieces.append(prefix)
         output_cursor += prefix.shape[0]
-        pieces.append(bank.A)
+        soft_tokens = bank.A.to(device=token_embeddings.device, dtype=token_embeddings.dtype)
+        pieces.append(soft_tokens)
         expanded_spans.append((output_cursor, output_cursor + bank.tokens))
         output_cursor += bank.tokens
         cursor = end
@@ -178,7 +179,11 @@ def encode_qwen_inputs_embeds(
     from transformers.masking_utils import create_causal_mask
 
     language_model = text_encoder.language_model
-    position_ids_4d = pos_2d[None, ...].expand(4, pos_2d.shape[0], -1)
+    embedding_weight = language_model.embed_tokens.weight
+    inputs_embeds = inputs_embeds.to(device=embedding_weight.device, dtype=embedding_weight.dtype)
+    if inputs_embeds.dtype != embedding_weight.dtype:
+        raise RuntimeError("Gen2 Qwen inputs_embeds dtype must match the Qwen embedding dtype")
+    position_ids_4d = pos_2d.to(device=inputs_embeds.device)[None, ...].expand(4, pos_2d.shape[0], -1)
     text_position_ids = position_ids_4d[0]
     mrope_position_ids = position_ids_4d[1:]
     causal_mask = create_causal_mask(
@@ -189,22 +194,48 @@ def encode_qwen_inputs_embeds(
         position_ids=text_position_ids,
     )
     position_embeddings = language_model.rotary_emb(inputs_embeds, mrope_position_ids)
+    if isinstance(position_embeddings, tuple):
+        position_embeddings = tuple(item.to(dtype=inputs_embeds.dtype) for item in position_embeddings)
+    else:
+        position_embeddings = position_embeddings.to(dtype=inputs_embeds.dtype)
     captured: dict[int, torch.Tensor] = {}
     hidden_states = inputs_embeds
     tap_set = set(activation_layers)
-    for layer_index, decoder_layer in enumerate(language_model.layers):
-        hidden_states = decoder_layer(
-            hidden_states,
-            attention_mask=causal_mask,
-            position_ids=text_position_ids,
-            past_key_values=None,
-            use_cache=False,
-            position_embeddings=position_embeddings,
-        )
-        if isinstance(hidden_states, tuple):
-            hidden_states = hidden_states[0]
-        if layer_index in tap_set:
-            captured[layer_index] = hidden_states
+    projection_hooks = []
+    output_projection_hooks = []
+    for module_name, module in language_model.named_modules():
+        if module_name.endswith(".v_proj"):
+            projection_hooks.append(
+                module.register_forward_hook(
+                    lambda _module, _inputs, output: output.float()
+                )
+            )
+        elif module_name.endswith(".o_proj"):
+            def cast_output_projection_input(_module, inputs):
+                if not inputs:
+                    return inputs
+                return (inputs[0].to(dtype=_module.weight.dtype), *inputs[1:])
+
+            output_projection_hooks.append(module.register_forward_pre_hook(cast_output_projection_input))
+    try:
+        for layer_index, decoder_layer in enumerate(language_model.layers):
+            hidden_states = decoder_layer(
+                hidden_states,
+                attention_mask=causal_mask,
+                position_ids=text_position_ids,
+                past_key_values=None,
+                use_cache=False,
+                position_embeddings=position_embeddings,
+            )
+            if isinstance(hidden_states, tuple):
+                hidden_states = hidden_states[0]
+            if layer_index in tap_set:
+                captured[layer_index] = hidden_states
+    finally:
+        for hook in projection_hooks:
+            hook.remove()
+        for hook in output_projection_hooks:
+            hook.remove()
     missing = tap_set.difference(captured)
     if missing:
         raise RuntimeError(f"Qwen activation layers were not captured: {sorted(missing)}")

@@ -113,6 +113,10 @@ def validate_gen2_config(raw: Mapping[str, Any]) -> Gen2RuntimeConfig:
     _require(temporal.get("init", 0.0) == 0.0, "temporal field must initialize at zero")
 
     sample = config.get("sample") or {}
+    _require(not bool(sample.get("disable_sampling", False)), "Gen2 smoke requires sample.disable_sampling=false")
+    phase_b_steps = int(((config.get("train") or {}).get("phase_b") or {}).get("steps", 0))
+    sample_every = int(sample.get("sample_every", phase_b_steps or 1))
+    _require(sample_every == phase_b_steps or phase_b_steps == 0, "Gen2 V1 runs official validation after Phase B; sample.sample_every must equal phase_b.steps")
     prompts = tuple(sample.get("validation_prompts") or ())
     _require(bool(prompts), "sample.validation_prompts must contain inline JSON prompts")
     for index, prompt in enumerate(prompts):

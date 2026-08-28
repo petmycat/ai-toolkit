@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import shutil
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any
@@ -119,7 +120,7 @@ class Gen2Trainer(BaseSDTrainProcess):
         self.optimizer.zero_grad(set_to_none=True)
         total = torch.zeros((), device=self.device_torch)
         for batch in batch_list:
-            noisy_latents, noise, timesteps, prompts, _ = self._prepare_real_batch(batch)
+            noisy_latents, noise, timesteps, prompts, _ = self._prepare_real_batch(batch, "a")
             activator_features = [self._encode_soft_prompt(prompt) for prompt in prompts]
             conditioned = type(self.sd.get_prompt_embeds(prompts))(text_embeds=activator_features)
             prediction = self.sd.get_noise_prediction(noisy_latents, timesteps, conditioned)
@@ -162,10 +163,25 @@ class Gen2Trainer(BaseSDTrainProcess):
             iterator = iter(dataloader)
             return next(iterator), iterator
 
-    def _prepare_real_batch(self, batch):
-        noisy_latents, noise, timesteps, _, imgs = self.process_general_training_batch(batch)
+    def _prepare_real_batch(self, batch, phase: str):
+        noisy_latents, noise, _, _, imgs = self.process_general_training_batch(batch)
         raw_prompts = [item.raw_caption for item in batch.file_items]
+        timesteps = self._sample_gen2_timesteps(noisy_latents.shape[0], phase, noisy_latents.device)
+        noisy_latents = self._make_flowmatch_noisy_latents(batch.latents, noise, timesteps)
         return noisy_latents, noise, timesteps, raw_prompts, imgs
+
+    def _sample_gen2_timesteps(self, batch_size: int, phase: str, device: torch.device) -> torch.Tensor:
+        settings = self.gen2_config.phase_a if phase == "a" else self.gen2_config.phase_b
+        bins = int(settings.get("timestep_bins", 10))
+        if settings.get("timestep_sampling", "stratified_uniform") != "stratified_uniform":
+            raise ValueError(f"unsupported {phase} timestep sampling")
+        indices = torch.arange(batch_size, device=device) % bins
+        offsets = torch.rand(batch_size, device=device)
+        return ((indices.float() + offsets) / bins).clamp(0.0, 1.0)
+
+    def _make_flowmatch_noisy_latents(self, clean: torch.Tensor, noise: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
+        t = timestep.to(device=clean.device, dtype=clean.dtype).view(-1, 1, 1, 1)
+        return (1.0 - t) * clean + t * noise
 
     def _encode_soft_prompt(self, raw_caption: str):
         from extensions_built_in.diffusion_models.ideogram4.src.pipeline import QWEN3_VL_ACTIVATION_LAYERS
@@ -212,8 +228,17 @@ class Gen2Trainer(BaseSDTrainProcess):
         )[0].to(self.sd.torch_dtype)
 
     def _phase_checkpoint(self, phase: str, step: int, tensors: dict[str, torch.Tensor], metadata: dict[str, Any], optimizer, scheduler=None) -> None:
-        path = (self.phase_a_root if phase == "a" else self.phase_b_root) / f"step_{step:06d}"
+        root = self.phase_a_root if phase == "a" else self.phase_b_root
+        path = root / f"step_{step:06d}"
         save_phase_checkpoint(path, tensors, metadata, optimizer=optimizer, scheduler=scheduler)
+        keep = int((self.config.get("save") or {}).get("max_step_saves_to_keep", 0))
+        if keep > 0:
+            checkpoints = sorted(
+                (item for item in root.iterdir() if item.is_dir() and item.name.startswith("step_")),
+                key=lambda item: int(item.name.removeprefix("step_")),
+            )
+            for old_checkpoint in checkpoints[:-keep]:
+                shutil.rmtree(old_checkpoint)
 
     def _run_phase_a(self) -> None:
         steps = self._phase_steps("a")
@@ -231,7 +256,7 @@ class Gen2Trainer(BaseSDTrainProcess):
         with ToolkitProgressBar(total=steps, desc="Phase A-lite") as progress:
             for step in range(steps):
                 batch, iterator = self._next_batch(iterator, self.data_loader)
-                noisy_latents, noise, timesteps, prompts, _ = self._prepare_real_batch(batch)
+                noisy_latents, noise, timesteps, prompts, _ = self._prepare_real_batch(batch, "a")
                 base_embeds = self.sd.get_prompt_embeds(prompts)
                 target = self.sd.get_loss_target(noise=noise, batch=batch)
                 optimizer.zero_grad(set_to_none=True)
@@ -352,6 +377,7 @@ class Gen2Trainer(BaseSDTrainProcess):
         if self.data_loader is None or self._adapter_bank is None:
             raise RuntimeError("Phase B requires a loaded Ideogram model and real dataloader")
         self._adapter_bank.train()
+        settings = self.gen2_config.phase_b
         if self.optimizer is None:
             raise RuntimeError("Phase B optimizer was not installed")
         optimizer = self.optimizer
@@ -362,7 +388,7 @@ class Gen2Trainer(BaseSDTrainProcess):
         with ToolkitProgressBar(total=steps, desc="Phase B2 TRF-LoRA") as progress:
             for step in range(start_step, steps):
                 batch, iterator = self._next_batch(iterator, self.data_loader)
-                noisy_latents, noise, timesteps, prompts, _ = self._prepare_real_batch(batch)
+                noisy_latents, noise, timesteps, prompts, _ = self._prepare_real_batch(batch, "b")
                 embeds = type(self.sd.get_prompt_embeds(prompts))(
                     text_embeds=[self._encode_soft_prompt(prompt).detach() for prompt in prompts]
                 )
