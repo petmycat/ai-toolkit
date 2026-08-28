@@ -34,6 +34,12 @@ class Gen2ActivatorTest(unittest.TestCase):
         expanded.sum().backward()
         self.assertIsNotNone(bank.A.grad)
 
+    def test_qwen_position_embeddings_are_explicitly_dtype_aligned(self):
+        source = __import__("pathlib").Path(__file__).parents[1] / "extensions_built_in" / "gen2_trainer" / "activator.py"
+        text = source.read_text(encoding="utf-8")
+        self.assertIn("position_embeddings = tuple(item.to(dtype=inputs_embeds.dtype)", text)
+        self.assertIn("position_embeddings = position_embeddings.to(dtype=inputs_embeds.dtype)", text)
+
     def test_missing_placeholder_fails(self):
         with self.assertRaises(ValueError):
             PlaceholderContract().replace('{"a":"plain"}', "style")
