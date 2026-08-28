@@ -403,6 +403,9 @@ class Gen2Trainer(BaseSDTrainProcess):
         if self.optimizer is None:
             raise RuntimeError("Phase B optimizer was not installed")
         optimizer = self.optimizer
+        trainable = [parameter for parameter in self._adapter_bank.parameters() if parameter.requires_grad]
+        if not trainable:
+            raise RuntimeError("Phase B adapter bank has no trainable parameters at loop start")
         self.modules_being_trained = [self._adapter_bank]
         self.phase_b_root.mkdir(parents=True, exist_ok=True)
         start_step = self._restore_phase_b_checkpoint(optimizer)
