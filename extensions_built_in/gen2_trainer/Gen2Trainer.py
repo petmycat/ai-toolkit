@@ -521,7 +521,8 @@ class Gen2Trainer(BaseSDTrainProcess):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         if self.accelerator.is_main_process:
-            self.logger.info(f"Gen2 official CFG validation cases completed: {len(cases)}")
+            self.logger.log({"gen2/official_cfg_validation_cases": len(cases)})
+            self.logger.commit()
 
     def run(self) -> None:
         mode = self.gen2_config.mode
