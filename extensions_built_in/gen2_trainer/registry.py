@@ -147,6 +147,14 @@ def clear_adapter_context(transformer: nn.Module) -> None:
     transformer._gen2_adapter_context = None
 
 
+def enable_adapter_training(bank: Gen2AdapterBank) -> list[nn.Parameter]:
+    bank.requires_grad_(True)
+    parameters = [parameter for parameter in bank.parameters() if parameter.requires_grad]
+    if not parameters:
+        raise RuntimeError("Phase B adapter bank has no trainable parameters")
+    return parameters
+
+
 def iter_ideogram_targets(transformer: nn.Module) -> list[TargetSpec]:
     targets: list[TargetSpec] = []
     hidden_size = transformer.config.emb_dim

@@ -11,7 +11,7 @@ from torch import nn
 from extensions_built_in.gen2_trainer.activator import PlaceholderContract, SoftTokenBank, replace_token_spans_with_soft_tokens
 from extensions_built_in.gen2_trainer.checkpoint import load_phase_checkpoint, save_phase_checkpoint
 from extensions_built_in.gen2_trainer.config import validate_gen2_config
-from extensions_built_in.gen2_trainer.registry import AdapterRuntimeContext, install_ideogram_adapters
+from extensions_built_in.gen2_trainer.registry import AdapterRuntimeContext, Gen2AdapterBank, TargetSpec, enable_adapter_training, install_ideogram_adapters
 from extensions_built_in.gen2_trainer.temporal_rank_field import TemporalRankFieldLoRA
 from extensions_built_in.gen2_trainer.sampling import make_flowmatch_noisy_latents, sample_stratified_timesteps
 
@@ -84,6 +84,20 @@ class MechanismSmokeTest(unittest.TestCase):
         noise = torch.zeros_like(clean)
         mixed = make_flowmatch_noisy_latents(clean, noise, torch.tensor([0.0, 250.0, 500.0, 1000.0]))
         self.assertTrue(torch.allclose(mixed.flatten(), torch.tensor([1.0, 0.75, 0.5, 0.0])))
+
+    def test_adapter_training_is_reenabled_after_parent_freeze(self):
+        bank = Gen2AdapterBank()
+        base = nn.Linear(4, 4)
+        adapter = TemporalRankFieldLoRA(4, 4, rank=2)
+        bank.add("linear", adapter, TargetSpec("linear", base, None))
+        base.requires_grad_(False)
+        bank.requires_grad_(False)
+        self.assertFalse(any(parameter.requires_grad for parameter in bank.parameters()))
+        trainable = enable_adapter_training(bank)
+        self.assertTrue(trainable)
+        self.assertTrue(all(parameter.requires_grad for parameter in trainable))
+        self.assertTrue(all(parameter.requires_grad for parameter in adapter.parameters()))
+        self.assertFalse(any(parameter.requires_grad for parameter in base.parameters()))
 
     def test_packed_velocity_and_adapter_gradient(self):
         if IDEOGRAM_RUNTIME_IMPORT_ERROR is not None:

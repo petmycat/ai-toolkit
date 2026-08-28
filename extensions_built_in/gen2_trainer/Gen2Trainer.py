@@ -24,7 +24,7 @@ from .checkpoint import load_phase_checkpoint, save_phase_checkpoint
 from .config import Gen2RuntimeConfig, validate_gen2_config
 from toolkit.optimizer import get_optimizer
 from toolkit.scheduler import get_lr_scheduler
-from .registry import AdapterRuntimeContext, install_ideogram_adapters
+from .registry import AdapterRuntimeContext, enable_adapter_training, install_ideogram_adapters
 from .sampling import build_validation_matrix, make_flowmatch_noisy_latents, sample_stratified_timesteps
 from .temporal_rank_field import time_smooth_regularizer, time_mean_diagnostic
 
@@ -329,6 +329,7 @@ class Gen2Trainer(BaseSDTrainProcess):
     def _install_phase_b_optimizer(self) -> None:
         if self._adapter_bank is None:
             raise RuntimeError("Phase B adapter bank has not been installed")
+        trainable = enable_adapter_training(self._adapter_bank)
         self.train_config.steps = self._phase_steps("b")
         settings = self.gen2_config.phase_b
         network_params = []
@@ -423,11 +424,15 @@ class Gen2Trainer(BaseSDTrainProcess):
                     embeds,
                     adapter_context=AdapterRuntimeContext(timesteps.float(), style_gate, 1.0),
                 )
+                if not prediction.requires_grad:
+                    raise RuntimeError("Phase B prediction has no grad_fn; adapter parameters are not connected")
                 fm = torch.nn.functional.mse_loss(prediction.float(), target.float())
                 smooth = time_smooth_regularizer(self._adapter_bank.temporal_fields())
                 loss = fm + float(settings.get("temporal_smooth_weight", 1e-4)) * smooth
                 self.accelerator.backward(loss)
-                self.accelerator.clip_grad_norm_(self._adapter_bank.parameters(), self.train_config.max_grad_norm)
+                if not any(parameter.grad is not None for parameter in trainable):
+                    raise RuntimeError("Phase B backward produced no adapter gradients")
+                self.accelerator.clip_grad_norm_(trainable, self.train_config.max_grad_norm)
                 optimizer.step()
                 if self.lr_scheduler is not None:
                     self.lr_scheduler.step()
