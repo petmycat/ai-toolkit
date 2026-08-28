@@ -68,8 +68,10 @@ class TemporalRankFieldLoRA(nn.Module):
             raise ValueError("x must have shape (batch, sequence, features)")
         if image_token_mask is None:
             image_token_mask = torch.ones(x.shape[0], x.shape[1], 1, device=x.device, dtype=x.dtype)
-        scale = self.temporal(timestep).to(dtype=x.dtype).unsqueeze(1)
-        raw = torch.matmul(torch.matmul(x, self.down.t()) * scale, self.up.t())
+        scale = self.temporal(timestep).to(device=x.device, dtype=x.dtype).unsqueeze(1)
+        down = self.down.to(device=x.device, dtype=x.dtype)
+        up = self.up.to(device=x.device, dtype=x.dtype)
+        raw = torch.matmul(torch.matmul(x, down.t()) * scale, up.t())
         return raw * image_token_mask.to(dtype=raw.dtype) * (self.alpha / self.rank)
 
     def forward(self, x: torch.Tensor, timestep: torch.Tensor, image_token_mask: torch.Tensor | None = None, style_gate: torch.Tensor | None = None, branch_scale: torch.Tensor | float = 1.0) -> torch.Tensor:

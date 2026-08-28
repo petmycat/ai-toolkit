@@ -13,6 +13,7 @@ from extensions_built_in.gen2_trainer.checkpoint import load_phase_checkpoint, s
 from extensions_built_in.gen2_trainer.config import validate_gen2_config
 from extensions_built_in.gen2_trainer.registry import AdapterRuntimeContext, install_ideogram_adapters
 from extensions_built_in.gen2_trainer.temporal_rank_field import TemporalRankFieldLoRA
+from extensions_built_in.gen2_trainer.sampling import make_flowmatch_noisy_latents, sample_stratified_timesteps
 
 
 ROOT = Path(__file__).parents[1]
@@ -67,6 +68,22 @@ class MechanismSmokeTest(unittest.TestCase):
         self.assertTrue(process["train"]["phase_a"]["helper_margin"]["enabled"])
         self.assertTrue(process["sample"]["require_official_unconditional"])
         validate_gen2_config(process)
+
+    def test_timestep_sampler_uses_model_scale_and_all_bins(self):
+        torch.manual_seed(0)
+        order = torch.arange(4)
+        cursor = 0
+        chunks = []
+        for _ in range(2):
+            timesteps, order, cursor = sample_stratified_timesteps(2, 4, order, cursor, torch.device("cpu"))
+            chunks.append(timesteps)
+        timesteps = torch.cat(chunks)
+        self.assertTrue(torch.all((timesteps >= 0.0) & (timesteps <= 1000.0)))
+        self.assertEqual(torch.unique(torch.floor(timesteps / 250.0).clamp_max(3)).numel(), 4)
+        clean = torch.ones(4, 1, 1, 1)
+        noise = torch.zeros_like(clean)
+        mixed = make_flowmatch_noisy_latents(clean, noise, torch.tensor([0.0, 250.0, 500.0, 1000.0]))
+        self.assertTrue(torch.allclose(mixed.flatten(), torch.tensor([1.0, 0.75, 0.5, 0.0])))
 
     def test_packed_velocity_and_adapter_gradient(self):
         if IDEOGRAM_RUNTIME_IMPORT_ERROR is not None:

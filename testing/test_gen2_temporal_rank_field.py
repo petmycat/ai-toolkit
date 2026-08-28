@@ -17,6 +17,18 @@ class TemporalRankFieldTest(unittest.TestCase):
         residual = module(x, torch.tensor([0.1, 0.9]), mask, torch.ones(2), 1.0)
         self.assertTrue(torch.equal(residual, torch.zeros_like(residual)))
 
+    def test_mixed_dtype_residual_keeps_parameter_gradients(self):
+        module = TemporalRankFieldLoRA(3, 4, rank=2, knots=4)
+        module.up.data.fill_(1.0)
+        x = torch.randn(2, 5, 3, dtype=torch.bfloat16)
+        mask = torch.ones(2, 5, 1, dtype=torch.bfloat16)
+        output = module(x, torch.tensor([0.2, 0.8]), mask, torch.ones(2), 1.0)
+        self.assertEqual(output.dtype, torch.bfloat16)
+        output.float().square().mean().backward()
+        self.assertIsNotNone(module.down.grad)
+        self.assertIsNotNone(module.up.grad)
+        self.assertIsNotNone(module.temporal.values.grad)
+
     def test_text_rows_are_zero_and_gate_zero_is_noop(self):
         module = TemporalRankFieldLoRA(3, 4, rank=2, knots=4)
         module.up.data.fill_(1.0)

@@ -25,7 +25,7 @@ from .config import Gen2RuntimeConfig, validate_gen2_config
 from toolkit.optimizer import get_optimizer
 from toolkit.scheduler import get_lr_scheduler
 from .registry import AdapterRuntimeContext, install_ideogram_adapters
-from .sampling import build_validation_matrix
+from .sampling import build_validation_matrix, make_flowmatch_noisy_latents, sample_stratified_timesteps
 from .temporal_rank_field import time_smooth_regularizer, time_mean_diagnostic
 
 
@@ -46,6 +46,8 @@ class Gen2Trainer(BaseSDTrainProcess):
         self.helpers = normalize_inline_helpers(self.gen2_config.helpers)
         self._prepared = False
         self._adapter_bank = None
+        self._timestep_bin_orders: dict[str, torch.Tensor] = {}
+        self._timestep_bin_cursors: dict[str, int] = {"a": 0, "b": 0}
 
     def _phase_steps(self, phase: str) -> int:
         settings = self.gen2_config.phase_a if phase == "a" else self.gen2_config.phase_b
@@ -175,13 +177,20 @@ class Gen2Trainer(BaseSDTrainProcess):
         bins = int(settings.get("timestep_bins", 10))
         if settings.get("timestep_sampling", "stratified_uniform") != "stratified_uniform":
             raise ValueError(f"unsupported {phase} timestep sampling")
-        indices = torch.arange(batch_size, device=device) % bins
-        offsets = torch.rand(batch_size, device=device)
-        return ((indices.float() + offsets) / bins).clamp(0.0, 1.0)
+        phase_key = phase.lower()
+        timesteps, order, cursor = sample_stratified_timesteps(
+            batch_size,
+            bins,
+            self._timestep_bin_orders.get(phase_key),
+            self._timestep_bin_cursors.get(phase_key, 0),
+            device,
+        )
+        self._timestep_bin_orders[phase_key] = order
+        self._timestep_bin_cursors[phase_key] = cursor
+        return timesteps
 
     def _make_flowmatch_noisy_latents(self, clean: torch.Tensor, noise: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
-        t = timestep.to(device=clean.device, dtype=clean.dtype).view(-1, 1, 1, 1)
-        return (1.0 - t) * clean + t * noise
+        return make_flowmatch_noisy_latents(clean, noise, timestep)
 
     def _encode_soft_prompt(self, raw_caption: str):
         from extensions_built_in.diffusion_models.ideogram4.src.pipeline import QWEN3_VL_ACTIVATION_LAYERS
@@ -230,6 +239,13 @@ class Gen2Trainer(BaseSDTrainProcess):
     def _phase_checkpoint(self, phase: str, step: int, tensors: dict[str, torch.Tensor], metadata: dict[str, Any], optimizer, scheduler=None) -> None:
         root = self.phase_a_root if phase == "a" else self.phase_b_root
         path = root / f"step_{step:06d}"
+        phase_key = phase.lower()
+        order = self._timestep_bin_orders.get(phase_key)
+        metadata = dict(metadata)
+        metadata["timestep_sampler"] = {
+            "order": order.detach().cpu().tolist() if order is not None else None,
+            "cursor": int(self._timestep_bin_cursors.get(phase_key, 0)),
+        }
         save_phase_checkpoint(path, tensors, metadata, optimizer=optimizer, scheduler=scheduler)
         keep = int((self.config.get("save") or {}).get("max_step_saves_to_keep", 0))
         if keep > 0:
@@ -363,8 +379,13 @@ class Gen2Trainer(BaseSDTrainProcess):
         if not candidates:
             raise FileNotFoundError("resume_phase_b requires a phase_b/step_<step> checkpoint")
         checkpoint = max(candidates, key=lambda item: int(item.name.removeprefix("step_")))
-        tensors, metadata = load_phase_checkpoint(checkpoint, optimizer=optimizer)
+        tensors, metadata = load_phase_checkpoint(checkpoint, optimizer=optimizer, scheduler=self.lr_scheduler)
         self._adapter_bank.load_state_dict(tensors, strict=True)
+        sampler_state = metadata.get("timestep_sampler") or {}
+        order = sampler_state.get("order")
+        if order is not None:
+            self._timestep_bin_orders["b"] = torch.tensor(order, device=self.device_torch, dtype=torch.long)
+            self._timestep_bin_cursors["b"] = int(sampler_state.get("cursor", 0))
         expected_phase = "b"
         if metadata.get("phase") != expected_phase:
             raise ValueError(f"resume checkpoint phase must be {expected_phase}")
@@ -419,6 +440,7 @@ class Gen2Trainer(BaseSDTrainProcess):
                         {key: value.detach().cpu() for key, value in self._adapter_bank.state_dict().items()},
                         {"phase": "b", "step": current_step, "temporal_mean": time_mean_diagnostic(self._adapter_bank.temporal_fields()).detach().cpu().tolist()},
                         optimizer,
+                        scheduler=self.lr_scheduler,
                     )
                 progress.set_postfix(step=current_step, total=steps, fm=f"{fm.item():.4g}", time_smooth=f"{smooth.item():.4g}")
                 progress.update(1)
@@ -434,6 +456,7 @@ class Gen2Trainer(BaseSDTrainProcess):
             {key: value.detach().cpu() for key, value in self._adapter_bank.state_dict().items()},
             {"phase": "b", "step": final_step, "temporal_mean": time_mean_diagnostic(self._adapter_bank.temporal_fields()).detach().cpu().tolist()},
             optimizer,
+            scheduler=self.lr_scheduler,
         )
         torch.save({"state_dict": self._adapter_bank.state_dict(), "registry": self._adapter_bank.registry}, adapter_path)
         if self.official_unconditional is not None:
