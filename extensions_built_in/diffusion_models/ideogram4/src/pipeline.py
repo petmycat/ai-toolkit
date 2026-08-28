@@ -195,6 +195,8 @@ def predict_velocity(
     t: torch.Tensor,  # (B,) toolkit flow time in [0, 1] (1 = pure noise)
     llm_features: torch.Tensor,  # (B, Lt, llm_dim)
     text_mask: torch.Tensor,  # (B, Lt) 1 for real text tokens
+    adapter_context=None,
+    preprojected_llm_features: bool = False,
 ) -> torch.Tensor:
     """Run the transformer on the packed [text | image] sequence.
 
@@ -273,15 +275,28 @@ def predict_velocity(
     # Flip into the model's time convention (t=1 -> clean).
     model_t = 1.0 - t
 
-    out = transformer(
-        llm_features=llm_full,
-        x=x,
-        t=model_t,
-        position_ids=position_ids,
-        segment_ids=segment_ids,
-        indicator=indicator,
+    retain_adapter_context = bool(
+        adapter_context is not None
+        and torch.is_grad_enabled()
+        and getattr(transformer, "gradient_checkpointing", False)
     )
+    if adapter_context is not None:
+        from extensions_built_in.gen2_trainer.registry import clear_adapter_context, set_adapter_context
 
+        set_adapter_context(transformer, t, indicator, adapter_context.style_gate, adapter_context.branch_scale)
+    try:
+        out = transformer(
+            llm_features=llm_full,
+            x=x,
+            t=model_t,
+            position_ids=position_ids,
+            segment_ids=segment_ids,
+            indicator=indicator,
+            preprojected_llm_features=preprojected_llm_features,
+        )
+    finally:
+        if adapter_context is not None and not retain_adapter_context:
+            clear_adapter_context(transformer)
     image_velocity = out[:, num_text_tokens:]  # (B, Li, 128)
     image_velocity = image_velocity.reshape(b, gh, gw, c).permute(0, 3, 1, 2)
     # Model predicts clean - noise; negate to return toolkit velocity (noise - clean).
@@ -325,6 +340,14 @@ class Ideogram4Pipeline:
         device = model.device_torch
         dtype = model.torch_dtype
         transformer = model.transformer
+        unconditional_transformer = kwargs.get("official_unconditional_transformer") or getattr(self, "official_unconditional_transformer", None)
+        if unconditional_transformer is not None and hasattr(unconditional_transformer, "transformer"):
+            unconditional_transformer = unconditional_transformer.transformer
+        eta_c = float(kwargs.get("style_adapter_conditional_scale", getattr(self, "style_adapter_conditional_scale", 1.0)))
+        eta_u = float(kwargs.get("style_adapter_unconditional_scale", getattr(self, "style_adapter_unconditional_scale", 0.0)))
+        style_gate = kwargs.get("style_gate")
+        if style_gate is None:
+            style_gate = torch.ones(latents.shape[0] if latents is not None else 1, device=device)
         patch = model.patch_size
 
         schedule_mu = float(
@@ -365,6 +388,8 @@ class Ideogram4Pipeline:
             conditional_embeds.text_embeds, device, dtype
         )
         if do_cfg:
+            if (kwargs.get("require_official_unconditional", False) or getattr(self, "require_official_unconditional", False)) and unconditional_transformer is None:
+                raise RuntimeError("official Ideogram unconditional transformer is required for Gen2 CFG")
             # Image-only unconditional: zero-length text sequence. predict_velocity
             # then produces an image-token-only forward pass with zeroed llm
             # features, matching the reference's asymmetric CFG.
@@ -382,17 +407,34 @@ class Ideogram4Pipeline:
 
         for sigma, sigma_next in zip(sigmas[:-1], sigmas[1:]):
             t01 = sigma.expand(latents.shape[0])
+            if unconditional_transformer is not None:
+                unconditional_transformer.to(device)
             if uncond_lora is not None:
+                if kwargs.get("require_official_unconditional", False) or getattr(self, "require_official_unconditional", False):
+                    raise RuntimeError("Gen2 forbids unconditional LoRA during official CFG")
                 uncond_lora.is_active = False
+            cond_context = None
+            if getattr(transformer, "_gen2_adapter_bank", None) is not None:
+                from extensions_built_in.gen2_trainer.registry import AdapterRuntimeContext
+
+                cond_context = AdapterRuntimeContext(t01, style_gate, eta_c)
             v_cond = predict_velocity(
-                transformer, latents.to(dtype), t01, cond_feats, cond_mask
+                transformer, latents.to(dtype), t01, cond_feats, cond_mask, adapter_context=cond_context
             )
             if do_cfg:
                 if uncond_lora is not None:
                     uncond_lora.is_active = True
                 try:
+                    if unconditional_transformer is None:
+                        raise RuntimeError("Gen2 CFG cannot fall back to the conditional transformer")
+                    uncond_model = unconditional_transformer
+                    uncond_context = None
+                    if getattr(uncond_model, "_gen2_adapter_bank", None) is not None:
+                        from extensions_built_in.gen2_trainer.registry import AdapterRuntimeContext
+
+                        uncond_context = AdapterRuntimeContext(t01, style_gate, eta_u)
                     v_uncond = predict_velocity(
-                        transformer, latents.to(dtype), t01, uncond_feats, uncond_mask
+                        uncond_model, latents.to(dtype), t01, uncond_feats, uncond_mask, adapter_context=uncond_context
                     )
                 finally:
                     if uncond_lora is not None:

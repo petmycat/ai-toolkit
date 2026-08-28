@@ -1,0 +1,226 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import dataclass
+from typing import Any, Iterable, Mapping
+
+import torch
+from torch import nn
+
+
+@dataclass(frozen=True)
+class PlaceholderOccurrence:
+    index: int
+    path: tuple[str | int, ...]
+    start: int
+    end: int
+
+
+class PlaceholderContract:
+    def __init__(self, placeholder: str = "[trigger]") -> None:
+        if placeholder != "[trigger]":
+            raise ValueError("Gen2 V1 only supports the literal [trigger] placeholder")
+        self.placeholder = placeholder
+
+    def parse(self, raw: str | dict[str, Any]) -> tuple[dict[str, Any], list[PlaceholderOccurrence]]:
+        value = json.loads(raw) if isinstance(raw, str) else raw
+        if not isinstance(value, dict):
+            raise ValueError("Ideogram caption must be a JSON object")
+        occurrences: list[PlaceholderOccurrence] = []
+
+        def visit(node: Any, path: tuple[str | int, ...]) -> Any:
+            if isinstance(node, dict):
+                return {key: visit(child, path + (key,)) for key, child in node.items()}
+            if isinstance(node, list):
+                return [visit(child, path + (index,)) for index, child in enumerate(node)]
+            if isinstance(node, str):
+                cursor = 0
+                while True:
+                    start = node.find(self.placeholder, cursor)
+                    if start < 0:
+                        break
+                    occurrences.append(PlaceholderOccurrence(len(occurrences), path, start, start + len(self.placeholder)))
+                    cursor = start + len(self.placeholder)
+            return node
+
+        visit(value, ())
+        return value, occurrences
+
+    def replace(self, raw: str | dict[str, Any], replacement: str | Iterable[str]) -> str:
+        value, occurrences = self.parse(raw)
+        if not occurrences:
+            raise ValueError("caption contains no [trigger] placeholder")
+        replacements = [replacement] if isinstance(replacement, str) else list(replacement)
+        if len(replacements) == 1:
+            replacements *= len(occurrences)
+        if len(replacements) != len(occurrences):
+            raise ValueError("replacement count must equal placeholder occurrence count")
+        counter = 0
+
+        def visit(node: Any) -> Any:
+            nonlocal counter
+            if isinstance(node, dict):
+                return {key: visit(child) for key, child in node.items()}
+            if isinstance(node, list):
+                return [visit(child) for child in node]
+            if isinstance(node, str):
+                while self.placeholder in node:
+                    node = node.replace(self.placeholder, replacements[counter], 1)
+                    counter += 1
+            return node
+
+        result = visit(value)
+        if counter != len(occurrences):
+            raise RuntimeError("placeholder replacement traversal diverged")
+        return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+
+    def fingerprint(self, raw: str | dict[str, Any]) -> str:
+        normalized = self.replace(raw, self.placeholder)
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+class SoftTokenBank(nn.Module):
+    def __init__(self, tokens: int, dimension: int, initialization: torch.Tensor | None = None) -> None:
+        super().__init__()
+        if tokens < 1 or dimension < 1:
+            raise ValueError("tokens and dimension must be positive")
+        if initialization is None:
+            initialization = torch.empty(tokens, dimension)
+            nn.init.normal_(initialization, std=0.02)
+        if tuple(initialization.shape) != (tokens, dimension):
+            raise ValueError("initialization shape must match (tokens, dimension)")
+        self.tokens = tokens
+        self.dimension = dimension
+        self.embedding = nn.Parameter(initialization.detach().clone())
+
+    @property
+    def A(self) -> nn.Parameter:
+        return self.embedding
+
+    def expand(self, occurrence_count: int) -> torch.Tensor:
+        if occurrence_count < 0:
+            raise ValueError("occurrence_count cannot be negative")
+        return self.embedding.unsqueeze(0).expand(occurrence_count, -1, -1)
+
+
+def resample_embedding_sequence(embedding: torch.Tensor, tokens: int) -> torch.Tensor:
+    if embedding.ndim != 2 or embedding.shape[0] == 0:
+        raise ValueError("embedding must have shape (sequence, dimension)")
+    if tokens < 1:
+        raise ValueError("tokens must be positive")
+    if embedding.shape[0] == tokens:
+        return embedding.clone()
+    positions = torch.linspace(0, embedding.shape[0] - 1, tokens, device=embedding.device, dtype=torch.float32)
+    left = positions.floor().long()
+    right = positions.ceil().long()
+    weight = (positions - left).unsqueeze(-1).to(embedding.dtype)
+    return embedding[left] * (1 - weight) + embedding[right] * weight
+
+
+def initialize_from_helper_embeddings(helper_embeddings: list[torch.Tensor], tokens: int) -> torch.Tensor:
+    if not helper_embeddings:
+        raise ValueError("at least one helper embedding is required")
+    resampled = [resample_embedding_sequence(item, tokens) for item in helper_embeddings]
+    return torch.stack(resampled, dim=0).mean(dim=0)
+
+
+def replace_token_spans_with_soft_tokens(
+    token_embeddings: torch.Tensor,
+    spans: list[tuple[int, int]],
+    bank: SoftTokenBank,
+) -> tuple[torch.Tensor, list[tuple[int, int]]]:
+    if token_embeddings.ndim != 2:
+        raise ValueError("token_embeddings must have shape (sequence, dimension)")
+    if token_embeddings.shape[-1] != bank.dimension:
+        raise ValueError("embedding dimension does not match soft token bank")
+    ordered = sorted(spans)
+    pieces: list[torch.Tensor] = []
+    expanded_spans: list[tuple[int, int]] = []
+    cursor = 0
+    output_cursor = 0
+    for start, end in ordered:
+        if start < cursor or end <= start or end > token_embeddings.shape[0]:
+            raise ValueError("placeholder token spans must be ordered, disjoint, and in range")
+        prefix = token_embeddings[cursor:start]
+        pieces.append(prefix)
+        output_cursor += prefix.shape[0]
+        pieces.append(bank.A)
+        expanded_spans.append((output_cursor, output_cursor + bank.tokens))
+        output_cursor += bank.tokens
+        cursor = end
+    pieces.append(token_embeddings[cursor:])
+    return torch.cat(pieces, dim=0), expanded_spans
+
+
+def pad_expanded_embeddings(sequences: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+    if not sequences:
+        raise ValueError("at least one embedding sequence is required")
+    max_length = max(item.shape[0] for item in sequences)
+    dimension = sequences[0].shape[-1]
+    padded = sequences[0].new_zeros(len(sequences), max_length, dimension)
+    mask = torch.zeros(len(sequences), max_length, dtype=torch.long, device=sequences[0].device)
+    for index, item in enumerate(sequences):
+        if item.shape[-1] != dimension:
+            raise ValueError("all embedding sequences must have the same dimension")
+        padded[index, : item.shape[0]] = item
+        mask[index, : item.shape[0]] = 1
+    return padded, mask
+
+
+def encode_qwen_inputs_embeds(
+    text_encoder,
+    inputs_embeds: torch.Tensor,
+    attention_mask: torch.Tensor,
+    pos_2d: torch.Tensor,
+    activation_layers: tuple[int, ...],
+) -> torch.Tensor:
+    from transformers.masking_utils import create_causal_mask
+
+    language_model = text_encoder.language_model
+    position_ids_4d = pos_2d[None, ...].expand(4, pos_2d.shape[0], -1)
+    text_position_ids = position_ids_4d[0]
+    mrope_position_ids = position_ids_4d[1:]
+    causal_mask = create_causal_mask(
+        config=language_model.config,
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        past_key_values=None,
+        position_ids=text_position_ids,
+    )
+    position_embeddings = language_model.rotary_emb(inputs_embeds, mrope_position_ids)
+    captured: dict[int, torch.Tensor] = {}
+    hidden_states = inputs_embeds
+    tap_set = set(activation_layers)
+    for layer_index, decoder_layer in enumerate(language_model.layers):
+        hidden_states = decoder_layer(
+            hidden_states,
+            attention_mask=causal_mask,
+            position_ids=text_position_ids,
+            past_key_values=None,
+            use_cache=False,
+            position_embeddings=position_embeddings,
+        )
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[0]
+        if layer_index in tap_set:
+            captured[layer_index] = hidden_states
+    missing = tap_set.difference(captured)
+    if missing:
+        raise RuntimeError(f"Qwen activation layers were not captured: {sorted(missing)}")
+    features = torch.cat([captured[index] for index in activation_layers], dim=-1)
+    return features * attention_mask.to(features.dtype).unsqueeze(-1)
+
+
+def normalize_inline_helpers(helpers: Iterable[Mapping[str, Any]]) -> list[dict[str, str]]:
+    result = []
+    for item in helpers:
+        if not isinstance(item, Mapping) or not item.get("id") or not isinstance(item.get("replacement"), str):
+            raise ValueError('each inline helper must contain "id" and string "replacement"')
+        replacement = item["replacement"].strip()
+        if not replacement:
+            raise ValueError("inline helper replacement cannot be empty")
+        result.append({"id": str(item["id"]), "replacement": replacement})
+    if not result:
+        raise ValueError("at least one inline helper is required")
+    return result

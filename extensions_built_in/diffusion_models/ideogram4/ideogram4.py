@@ -499,6 +499,8 @@ class Ideogram4Model(BaseModel):
             t01,
             llm_features,
             text_mask,
+            adapter_context=kwargs.get("adapter_context"),
+            preprojected_llm_features=kwargs.get("preprojected_llm_features", False),
         )
         return pred
 

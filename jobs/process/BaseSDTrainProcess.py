@@ -2274,6 +2274,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.last_save_step = self.step_num
         ### HOOK ###
         self.hook_before_train_loop()
+        if getattr(self, "_prepare_only", False):
+            return
 
         # ============================================================
         # COMPILE

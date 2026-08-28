@@ -448,6 +448,7 @@ class Ideogram4Transformer2DModel(nn.Module):
         position_ids: torch.Tensor,
         segment_ids: torch.Tensor,
         indicator: torch.Tensor,
+        preprojected_llm_features: bool = False,
     ) -> torch.Tensor:
         """Velocity prediction.
 
@@ -489,8 +490,10 @@ class Ideogram4Transformer2DModel(nn.Module):
             t_cond = t_cond.unsqueeze(1)
         adaln_input = F.silu(self.adaln_proj(t_cond))
 
-        llm_features = self.llm_cond_norm(llm_features)
-        llm_features = self.llm_cond_proj(llm_features) * llm_token_mask
+        if not preprojected_llm_features:
+            llm_features = self.llm_cond_norm(llm_features)
+            llm_features = self.llm_cond_proj(llm_features)
+        llm_features = llm_features * llm_token_mask
 
         h = x + llm_features
 

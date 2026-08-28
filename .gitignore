@@ -192,3 +192,5 @@ aitk_db.db-shm
 .claude
 original_repo
 .next
+gen2_trainer_logs/
+.cursor/
