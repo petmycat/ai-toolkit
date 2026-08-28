@@ -405,6 +405,7 @@ class Ideogram4Pipeline:
         # outer sampling context (``with network:``) may switch it on globally.
         uncond_lora = getattr(model, "unconditional_lora", None)
         step_callback = kwargs.get("step_callback")
+        diagnostics_callback = kwargs.get("diagnostics_callback")
 
         for step_index, (sigma, sigma_next) in enumerate(zip(sigmas[:-1], sigmas[1:]), start=1):
             t01 = sigma.expand(latents.shape[0])
@@ -422,6 +423,19 @@ class Ideogram4Pipeline:
             v_cond = predict_velocity(
                 transformer, latents.to(dtype), t01, cond_feats, cond_mask, adapter_context=cond_context
             )
+            if diagnostics_callback is not None:
+                diagnostics_callback(
+                    {
+                        "step": step_index,
+                        "branch": "conditional",
+                        "timestep_01": float(t01[0].item()),
+                        "text_length": int(cond_feats.shape[1]),
+                        "text_mask_sum": int(cond_mask[0].sum().item()),
+                        "latent_norm": float(latents.float().norm().item()),
+                        "velocity_norm": float(v_cond.float().norm().item()),
+                        "adapter_enabled": bool(cond_context is not None and eta_c != 0.0),
+                    }
+                )
             if do_cfg:
                 if uncond_lora is not None:
                     uncond_lora.is_active = True
@@ -437,6 +451,19 @@ class Ideogram4Pipeline:
                     v_uncond = predict_velocity(
                         uncond_model, latents.to(dtype), t01, uncond_feats, uncond_mask, adapter_context=uncond_context
                     )
+                    if diagnostics_callback is not None:
+                        diagnostics_callback(
+                            {
+                                "step": step_index,
+                                "branch": "unconditional",
+                                "timestep_01": float(t01[0].item()),
+                                "text_length": 0,
+                                "text_mask_sum": 0,
+                                "latent_norm": float(latents.float().norm().item()),
+                                "velocity_norm": float(v_uncond.float().norm().item()),
+                                "adapter_enabled": bool(uncond_context is not None and eta_u != 0.0),
+                            }
+                        )
                 finally:
                     if uncond_lora is not None:
                         uncond_lora.is_active = False

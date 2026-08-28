@@ -17,19 +17,33 @@ class ValidationCase:
     helper_off: bool
     eta_c: float
     eta_u: float
+    conditioning_mode: str = "soft_tokens"
+    helper_index: int = 0
 
 
-def build_validation_matrix(prompt_count: int, seeds: Iterable[int], eta_u_values: Iterable[float], include_sweep: bool = True) -> list[ValidationCase]:
+def build_validation_matrix(
+    prompt_count: int,
+    seeds: Iterable[int],
+    eta_u_values: Iterable[float],
+    include_sweep: bool = True,
+) -> list[ValidationCase]:
     cases = []
     for prompt_index in range(prompt_count):
         for seed in seeds:
-            cases.append(ValidationCase(prompt_index, int(seed), 1.0, False, 1.0, 0.0))
-            cases.append(ValidationCase(prompt_index, int(seed), 0.0, True, 0.0, 0.0))
+            seed = int(seed)
+            cases.extend(
+                [
+                    ValidationCase(prompt_index, seed, 0.0, True, 0.0, 0.0, "native_helper"),
+                    ValidationCase(prompt_index, seed, 0.0, False, 0.0, 0.0, "soft_tokens"),
+                    ValidationCase(prompt_index, seed, 1.0, True, 1.0, 0.0, "native_helper"),
+                    ValidationCase(prompt_index, seed, 1.0, False, 1.0, 0.0, "soft_tokens"),
+                ]
+            )
             if include_sweep:
                 for eta_u in eta_u_values:
                     eta_u = float(eta_u)
                     if eta_u != 0.0:
-                        cases.append(ValidationCase(prompt_index, int(seed), 1.0, False, 1.0, eta_u))
+                        cases.append(ValidationCase(prompt_index, seed, 1.0, False, 1.0, eta_u, "soft_tokens"))
     return cases
 
 

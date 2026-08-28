@@ -51,6 +51,11 @@ class TemporalRankFieldTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             field(torch.zeros(2, 3))
 
+    def test_timestep_must_be_normalized(self):
+        field = TemporalField(knots=4, rank=2)
+        with self.assertRaises(ValueError):
+            field(torch.tensor([500.0]))
+
     def test_smooth_regularizer_has_gradient(self):
         field = TemporalField(knots=4, rank=2)
         field.values.data[1].fill_(1.0)

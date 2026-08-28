@@ -200,7 +200,7 @@ class Gen2Trainer(BaseSDTrainProcess):
     def _make_flowmatch_noisy_latents(self, clean: torch.Tensor, noise: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
         return make_flowmatch_noisy_latents(clean, noise, timestep)
 
-    def _encode_soft_prompt(self, raw_caption: str):
+    def _encode_soft_prompt(self, raw_caption: str, diagnostics: dict[str, Any] | None = None):
         from extensions_built_in.diffusion_models.ideogram4.src.pipeline import QWEN3_VL_ACTIVATION_LAYERS
         from toolkit.ideogram_caption import digest_caption_string
 
@@ -232,7 +232,25 @@ class Gen2Trainer(BaseSDTrainProcess):
             cursor = end
         token_ids = torch.tensor(encoded["input_ids"], device=self.sd.text_encoder.device, dtype=torch.long)
         ordinary = self.sd.text_encoder.language_model.embed_tokens(token_ids)
-        expanded, _ = replace_token_spans_with_soft_tokens(ordinary, spans, self.soft_tokens)
+        expanded, expanded_spans = replace_token_spans_with_soft_tokens(ordinary, spans, self.soft_tokens)
+        if diagnostics is not None:
+            ordinary_norm = ordinary.float().norm(dim=-1)
+            soft_norm = self.soft_tokens.A.float().norm(dim=-1)
+            diagnostics.update(
+                {
+                    "raw_token_length": int(ordinary.shape[0]),
+                    "expanded_token_length": int(expanded.shape[0]),
+                    "placeholder_spans": [list(span) for span in spans],
+                    "expanded_spans": [list(span) for span in expanded_spans],
+                    "attention_mask_sum": int(expanded.shape[0]),
+                    "position_id_min": 0,
+                    "position_id_max": int(expanded.shape[0] - 1),
+                    "ordinary_embedding_norm_mean": float(ordinary_norm.mean().item()),
+                    "ordinary_embedding_norm_max": float(ordinary_norm.max().item()),
+                    "soft_token_norm_mean": float(soft_norm.mean().item()),
+                    "soft_token_norm_max": float(soft_norm.max().item()),
+                }
+            )
         expanded = expanded.unsqueeze(0)
         attention_mask = torch.ones(expanded.shape[:2], device=expanded.device, dtype=torch.long)
         pos_2d = (attention_mask.cumsum(dim=-1) - 1).clamp(min=0)
@@ -442,7 +460,7 @@ class Gen2Trainer(BaseSDTrainProcess):
                     noisy_latents,
                     timesteps,
                     embeds,
-                    adapter_context=AdapterRuntimeContext(timesteps.float(), style_gate, 1.0),
+                    adapter_context=AdapterRuntimeContext(timesteps.float() / 1000.0, style_gate, 1.0),
                 )
                 if not prediction.requires_grad:
                     raise RuntimeError("Phase B prediction has no grad_fn; adapter parameters are not connected")
@@ -521,19 +539,43 @@ class Gen2Trainer(BaseSDTrainProcess):
         self.validation_cases = cases
         output_root = self.gen2_root / "samples" / f"step_{self._phase_steps('b'):06d}"
         output_root.mkdir(parents=True, exist_ok=True)
+        diagnostics_path = output_root / "conditioning_diagnostics.json"
+        diagnostics_records: list[dict[str, Any]] = []
         progress = ToolkitProgressBar(total=len(cases), desc=f"Gen2 official CFG validation ({len(cases)} cases)")
         try:
             for case_index, case in enumerate(cases, start=1):
                 if case.eta_u > 0 and self.official_unconditional is None:
                     raise RuntimeError("positive eta_u requires official unconditional transformer")
                 raw_prompt = self.gen2_config.validation_prompts[case.prompt_index]
-                if case.helper_off:
-                    materialized = self.placeholder_contract.replace(raw_prompt, self.helpers[0]["replacement"])
+                case_diagnostics: dict[str, Any] = {
+                    "case_index": case_index,
+                    "prompt_index": case.prompt_index,
+                    "seed": case.seed,
+                    "conditioning_mode": case.conditioning_mode,
+                    "style_gate": case.style_gate,
+                    "eta_c": case.eta_c,
+                    "eta_u": case.eta_u,
+                    "adapter_conditional_enabled": case.style_gate != 0.0 and case.eta_c != 0.0,
+                    "adapter_unconditional_enabled": case.style_gate != 0.0 and case.eta_u != 0.0,
+                }
+                if case.conditioning_mode == "native_helper":
+                    materialized = self.placeholder_contract.replace(raw_prompt, self.helpers[case.helper_index]["replacement"])
                     embeds = self.sd.get_prompt_embeds([materialized])
+                    case_diagnostics["materialized_helper_id"] = self.helpers[case.helper_index]["id"]
+                    case_diagnostics["text_length"] = int(embeds.text_embeds[0].shape[0])
+                    case_diagnostics["text_feature_norm_mean"] = float(embeds.text_embeds[0].float().norm(dim=-1).mean().item())
+                    case_diagnostics["text_feature_norm_max"] = float(embeds.text_embeds[0].float().norm(dim=-1).max().item())
+                elif case.conditioning_mode == "soft_tokens":
+                    embeds = type(self.sd.get_prompt_embeds([raw_prompt]))(
+                        text_embeds=[self._encode_soft_prompt(raw_prompt, case_diagnostics).detach()]
+                    )
+                    case_diagnostics["text_length"] = int(embeds.text_embeds[0].shape[0])
+                    case_diagnostics["text_feature_norm_mean"] = float(embeds.text_embeds[0].float().norm(dim=-1).mean().item())
+                    case_diagnostics["text_feature_norm_max"] = float(embeds.text_embeds[0].float().norm(dim=-1).max().item())
                 else:
-                    base = self.sd.get_prompt_embeds([raw_prompt])
-                    embeds = type(base)(text_embeds=[self._encode_soft_prompt(raw_prompt).detach()])
+                    raise RuntimeError(f"unknown validation conditioning mode: {case.conditioning_mode}")
                 generator = torch.Generator(device=self.device_torch).manual_seed(case.seed)
+                denoise_diagnostics: list[dict[str, Any]] = []
                 denoise_progress = ToolkitProgressBar(
                     total=int(sample.get("steps", 4)),
                     desc=f"CFG case {case_index}/{len(cases)}",
@@ -554,14 +596,18 @@ class Gen2Trainer(BaseSDTrainProcess):
                         style_adapter_unconditional_scale=case.eta_u,
                         style_gate=torch.tensor([case.style_gate], device=self.device_torch),
                         step_callback=lambda _step, _total: denoise_progress.update(1),
+                        diagnostics_callback=denoise_diagnostics.append,
                     )
                 finally:
                     denoise_progress.close()
                 case_root = output_root / f"prompt_{case.prompt_index:02d}" / f"seed_{case.seed}"
                 case_root.mkdir(parents=True, exist_ok=True)
-                name = "helper_off" if case.helper_off else f"activator_on_eta_u_{case.eta_u:g}"
+                name = f"{case.conditioning_mode}_adapter_{'on' if case.style_gate and case.eta_c else 'off'}_eta_u_{case.eta_u:g}"
                 images[0].save(case_root / f"{name}.png")
-                progress.set_postfix(case=case_index, eta_u=f"{case.eta_u:g}", helper_off=case.helper_off)
+                case_diagnostics["denoise"] = denoise_diagnostics
+                diagnostics_records.append(case_diagnostics)
+                diagnostics_path.write_text(json.dumps(diagnostics_records, ensure_ascii=False, indent=2), encoding="utf-8")
+                progress.set_postfix(case=case_index, mode=case.conditioning_mode, eta_u=f"{case.eta_u:g}")
                 progress.update(1)
                 self.official_unconditional.transformer.to("cpu")
                 if torch.cuda.is_available():

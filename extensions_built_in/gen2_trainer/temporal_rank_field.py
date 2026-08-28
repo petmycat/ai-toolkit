@@ -38,7 +38,9 @@ class TemporalField(nn.Module):
     def forward(self, timestep: torch.Tensor) -> torch.Tensor:
         if timestep.ndim != 1:
             raise ValueError("TemporalField expects timestep with shape (batch,)")
-        t = timestep.float().clamp(0.0, 1.0)
+        t = timestep.float()
+        if not torch.all((t >= 0.0) & (t <= 1.0)):
+            raise ValueError("TemporalField timestep must be normalized to the 0..1 range")
         values = self.centered_values()
         scaled = t * (self.knots - 1)
         left = scaled.floor().long().clamp(max=self.knots - 2)

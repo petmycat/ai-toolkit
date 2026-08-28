@@ -66,7 +66,17 @@ class MechanismSmokeTest(unittest.TestCase):
         self.assertTrue(process["network"]["image_token_only"])
         self.assertEqual(len(process["datasets"][0]["helpers"]), 2)
         cases = build_validation_matrix(1, [1], [0.0, 0.5, 1.0])
-        self.assertEqual([case.eta_u for case in cases], [0.0, 0.0, 0.5, 1.0])
+        self.assertEqual(
+            [(case.conditioning_mode, case.style_gate, case.eta_c, case.eta_u) for case in cases],
+            [
+                ("native_helper", 0.0, 0.0, 0.0),
+                ("soft_tokens", 0.0, 0.0, 0.0),
+                ("native_helper", 1.0, 1.0, 0.0),
+                ("soft_tokens", 1.0, 1.0, 0.0),
+                ("soft_tokens", 1.0, 1.0, 0.5),
+                ("soft_tokens", 1.0, 1.0, 1.0),
+            ],
+        )
         self.assertTrue(process["train"]["phase_a"]["helper_margin"]["enabled"])
         self.assertTrue(process["sample"]["require_official_unconditional"])
         validate_gen2_config(process)
