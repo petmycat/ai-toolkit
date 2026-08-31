@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import gc
 import json
 import shutil
 from collections import OrderedDict
@@ -25,6 +26,7 @@ from .activator import (
 from .artifacts import load_tensor_artifact, save_tensor_artifact
 from .checkpoint import load_phase_checkpoint, save_phase_checkpoint
 from .config import Gen2RuntimeConfig, validate_gen2_config
+from toolkit.data_loader import get_dataloader_from_datasets
 from toolkit.optimizer import get_optimizer
 from toolkit.scheduler import get_lr_scheduler
 from .registry import AdapterRuntimeContext, enable_adapter_training, install_ideogram_adapters
@@ -68,6 +70,19 @@ class Gen2Trainer(BaseSDTrainProcess):
         trainable = [name for name, parameter in self.sd.text_encoder.named_parameters() if parameter.requires_grad]
         if trainable:
             raise RuntimeError(f"Gen2 requires frozen Qwen parameters, but these are trainable: {trainable[:8]}")
+
+    def _rebuild_dataloader_for_phase(self, phase: str) -> None:
+        settings = self.gen2_config.phase_a if phase == "a" else self.gen2_config.phase_b
+        batch_size = int(settings.get("batch_size", self.train_config.batch_size))
+        if batch_size < 1:
+            raise ValueError(f"phase_{phase}.batch_size must be positive")
+        if self.datasets is not None:
+            self.data_loader = get_dataloader_from_datasets(self.datasets, batch_size, self.sd)
+        if self.datasets_reg is not None:
+            self.data_loader_reg = get_dataloader_from_datasets(self.datasets_reg, batch_size, self.sd)
+        self.train_config.batch_size = batch_size
+        if self.accelerator.is_main_process:
+            print(f"Gen2 Phase {phase.upper()} dataloader batch_size={batch_size}")
 
     def _phase_steps(self, phase: str) -> int:
         settings = self.gen2_config.phase_a if phase == "a" else self.gen2_config.phase_b
@@ -293,6 +308,7 @@ class Gen2Trainer(BaseSDTrainProcess):
             activator_mask=activator_mask.unsqueeze(0),
             trigger_local_adapter=self.trigger_local_adapter,
             return_details=diagnostics is not None or return_pooled,
+            gradient_checkpointing=bool(self.gen2_config.phase_a.get("gradient_checkpointing", self.config.get("train", {}).get("gradient_checkpointing", False))),
         )
         if diagnostics is not None or return_pooled:
             features, pooled, ordinary_pooled = encoded
@@ -500,6 +516,7 @@ class Gen2Trainer(BaseSDTrainProcess):
             return
         if self.data_loader is None:
             raise RuntimeError("Phase A requires the real dataset dataloader")
+        self._rebuild_dataloader_for_phase("a")
         self._initialize_soft_tokens_from_literal_trigger()
         settings = self.gen2_config.phase_a
         curriculum = settings.get("curriculum") or {}
@@ -518,6 +535,9 @@ class Gen2Trainer(BaseSDTrainProcess):
         self._phase_a_probes = probes[:probe_count]
         self._phase_a_heldout_probes = probes[probe_count:]
         calibration_result = self._run_helper_calibration(self._phase_a_probes)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         helper_supervision_available = int(self._helper_calibration.get("reliable_count", 0)) > 0
         if self._phase_a_heldout_probes:
             self._heldout_competence = self._competence_probe(self._phase_a_heldout_probes)
@@ -772,6 +792,7 @@ class Gen2Trainer(BaseSDTrainProcess):
             return
         if self.data_loader is None or self._adapter_bank is None:
             raise RuntimeError("Phase B requires a loaded Ideogram model and real dataloader")
+        self._rebuild_dataloader_for_phase("b")
         self._adapter_bank.train()
         settings = self.gen2_config.phase_b
         if self.optimizer is None:

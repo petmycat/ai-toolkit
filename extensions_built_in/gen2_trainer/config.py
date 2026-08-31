@@ -143,8 +143,9 @@ def validate_gen2_config(raw: Mapping[str, Any]) -> Gen2RuntimeConfig:
     phase_a = train.get("phase_a") or {}
     phase_b = train.get("phase_b") or {}
     _require(int(phase_a.get("steps", 0)) >= 0 and int(phase_b.get("steps", 0)) >= 0, "phase steps must be non-negative")
-    _require(int(phase_a.get("batch_size", train.get("batch_size", 1))) == int(train.get("batch_size", 1)), "V1 requires phase_a.batch_size to equal train.batch_size")
-    _require(int(phase_b.get("batch_size", train.get("batch_size", 1))) == int(train.get("batch_size", 1)), "V1 requires phase_b.batch_size to equal train.batch_size")
+    _require(int(train.get("batch_size", 1)) >= 1, "train.batch_size must be positive")
+    _require(int(phase_a.get("batch_size", train.get("batch_size", 1))) >= 1, "phase_a.batch_size must be positive")
+    _require(int(phase_b.get("batch_size", train.get("batch_size", 1))) >= 1, "phase_b.batch_size must be positive")
     for phase_name, phase in (("phase_a", phase_a), ("phase_b", phase_b)):
         optimizer = phase.get("optimizer", config.get("train", {}).get("optimizer", "adamw"))
         _require(isinstance(optimizer, str) and bool(optimizer.strip()), f"{phase_name}.optimizer must be a non-empty string supported by ai-toolkit")

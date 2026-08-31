@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+
+import torch.utils.checkpoint as checkpoint
 from typing import Any, Iterable, Mapping
 
 import torch
@@ -209,6 +211,7 @@ def encode_qwen_inputs_embeds(
     activator_mask: torch.Tensor | None = None,
     trigger_local_adapter: TriggerLocalTEAdapter | None = None,
     return_details: bool = False,
+    gradient_checkpointing: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     from transformers.masking_utils import create_causal_mask
 
@@ -236,14 +239,21 @@ def encode_qwen_inputs_embeds(
     hidden_states = inputs_embeds
     tap_set = set(activation_layers)
     for layer_index, decoder_layer in enumerate(language_model.layers):
-        hidden_states = decoder_layer(
-            hidden_states,
-            attention_mask=causal_mask,
-            position_ids=text_position_ids,
-            past_key_values=None,
-            use_cache=False,
-            position_embeddings=position_embeddings,
-        )
+        def layer_forward(states, layer=decoder_layer):
+            output = layer(
+                states,
+                attention_mask=causal_mask,
+                position_ids=text_position_ids,
+                past_key_values=None,
+                use_cache=False,
+                position_embeddings=position_embeddings,
+            )
+            return output[0] if isinstance(output, tuple) else output
+
+        if gradient_checkpointing and torch.is_grad_enabled() and hidden_states.requires_grad:
+            hidden_states = checkpoint.checkpoint(layer_forward, hidden_states, use_reentrant=False, preserve_rng_state=False)
+        else:
+            hidden_states = layer_forward(hidden_states)
         if isinstance(hidden_states, tuple):
             hidden_states = hidden_states[0]
         if trigger_local_adapter is not None and activator_mask is not None:

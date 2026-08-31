@@ -83,6 +83,9 @@ class MechanismSmokeTest(unittest.TestCase):
         self.assertEqual(process["activator"]["tokens"], 24)
         self.assertTrue(process["train"]["phase_a"]["calibration"]["enabled"])
         self.assertEqual(process["train"]["phase_a"]["curriculum"]["effective_batch_size"], 4)
+        self.assertEqual(process["train"]["phase_a"]["batch_size"], 1)
+        self.assertEqual(process["train"]["phase_b"]["batch_size"], 2)
+        self.assertNotEqual(process["train"]["phase_a"]["batch_size"], process["train"]["phase_b"]["batch_size"])
         self.assertTrue(process["sample"]["require_official_unconditional"])
         validate_gen2_config(process)
 
