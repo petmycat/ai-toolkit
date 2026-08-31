@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from torch import nn
 
 from jobs.process.BaseSDTrainProcess import BaseSDTrainProcess
 from toolkit.progress_bar import ToolkitProgressBar
@@ -15,6 +16,7 @@ from toolkit.progress_bar import ToolkitProgressBar
 from .activator import (
     PlaceholderContract,
     SoftTokenBank,
+    TriggerLocalTEAdapter,
     encode_qwen_inputs_embeds,
     normalize_inline_helpers,
     replace_token_spans_with_soft_tokens,
@@ -28,6 +30,7 @@ from toolkit.scheduler import get_lr_scheduler
 from .registry import AdapterRuntimeContext, enable_adapter_training, install_ideogram_adapters
 from .sampling import build_validation_matrix, make_flowmatch_noisy_latents, sample_stratified_timesteps
 from .temporal_rank_field import time_smooth_regularizer, time_mean_diagnostic
+from .phase_a_math import calibrate_helper_losses, disturbance_projection, robust_competence, semantic_direction_loss, smooth_helper_weight
 
 
 class Gen2Trainer(BaseSDTrainProcess):
@@ -42,6 +45,17 @@ class Gen2Trainer(BaseSDTrainProcess):
         self.phase_b_root = self.gen2_root / "phase_b"
         self.soft_tokens: SoftTokenBank | None = None
         self._soft_tokens_initial: torch.Tensor | None = None
+        self.trigger_local_adapter: TriggerLocalTEAdapter | None = None
+        self._helper_calibration: dict[str, Any] | None = None
+        self._helper_latched = False
+        self._helper_release_streak = 0
+        self._heldout_competence: float | None = None
+        self._last_phase_a_diagnostics: dict[str, float] = {}
+        self._phase_a_history: list[dict[str, Any]] = []
+        self._phase_b_history: list[dict[str, Any]] = []
+        self._phase_a_probes: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, str]] = []
+        self._phase_a_heldout_probes: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, str]] = []
+        self._phase_b_probes: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, str]] = []
         self.adapter = torch.nn.ModuleDict()
         self.official_unconditional = None
         self.helpers = normalize_inline_helpers(self.gen2_config.helpers)
@@ -49,6 +63,11 @@ class Gen2Trainer(BaseSDTrainProcess):
         self._adapter_bank = None
         self._timestep_bin_orders: dict[str, torch.Tensor] = {}
         self._timestep_bin_cursors: dict[str, int] = {"a": 0, "b": 0}
+
+    def _assert_qwen_frozen(self) -> None:
+        trainable = [name for name, parameter in self.sd.text_encoder.named_parameters() if parameter.requires_grad]
+        if trainable:
+            raise RuntimeError(f"Gen2 requires frozen Qwen parameters, but these are trainable: {trainable[:8]}")
 
     def _phase_steps(self, phase: str) -> int:
         settings = self.gen2_config.phase_a if phase == "a" else self.gen2_config.phase_b
@@ -81,7 +100,17 @@ class Gen2Trainer(BaseSDTrainProcess):
             raise ValueError("Gen2 only supports the Ideogram 4 model")
         self.sd.model.requires_grad_(False)
         self.sd.text_encoder.requires_grad_(False)
+        self._assert_qwen_frozen()
         self.sd.vae.requires_grad_(False)
+        activator_config = self.config.get("activator") or {}
+        local_config = activator_config.get("trigger_local_adapter") or {}
+        self.trigger_local_adapter = TriggerLocalTEAdapter(
+            self.soft_tokens.dimension,
+            rank=int(local_config.get("rank", 4)),
+            alpha=float(local_config.get("alpha", 4.0)),
+        ) if bool(local_config.get("enabled", False)) else None
+        if self.trigger_local_adapter is not None:
+            self.trigger_local_adapter.to(self.device_torch)
         network = self.config.get("network") or {}
         temporal = network.get("temporal") or {}
         self._adapter_bank = install_ideogram_adapters(
@@ -94,6 +123,8 @@ class Gen2Trainer(BaseSDTrainProcess):
         self.sd.transformer = self.sd.model
         self.soft_tokens.to(self.device_torch)
         self.modules_being_trained = [self.soft_tokens]
+        if self.trigger_local_adapter is not None:
+            self.modules_being_trained.append(self.trigger_local_adapter)
 
     def hook_before_train_loop(self):
         self._preflight_loaded_datasets()
@@ -105,11 +136,20 @@ class Gen2Trainer(BaseSDTrainProcess):
         self.accelerator.even_batches = False
         self.sd.vae = self.accelerator.prepare(self.sd.vae)
         self.sd.unet = self.accelerator.prepare(self.sd.unet)
-        self.soft_tokens, self.optimizer = self.accelerator.prepare(self.soft_tokens, self.optimizer)
+        modules = [self.soft_tokens]
+        if self.trigger_local_adapter is not None:
+            modules.append(self.trigger_local_adapter)
+        prepared = self.accelerator.prepare(*modules, self.optimizer)
+        if self.trigger_local_adapter is not None:
+            self.soft_tokens, self.trigger_local_adapter, self.optimizer = prepared
+        else:
+            self.soft_tokens, self.optimizer = prepared
         self._prepared = True
         if self.lr_scheduler is not None:
             self.lr_scheduler = self.accelerator.prepare(self.lr_scheduler)
         self.modules_being_trained = [self.soft_tokens]
+        if self.trigger_local_adapter is not None:
+            self.modules_being_trained.append(self.trigger_local_adapter)
 
     def hook_add_extra_train_params(self, params):
         params.clear()
@@ -123,6 +163,13 @@ class Gen2Trainer(BaseSDTrainProcess):
             "params": [self.soft_tokens.A],
             "lr": self.train_config.lr,
         })
+        if self.trigger_local_adapter is not None:
+            local_config = ((self.config.get("activator") or {}).get("trigger_local_adapter") or {})
+            params.append({
+                "params": list(self.trigger_local_adapter.parameters()),
+                "lr": float(local_config.get("lr", self.train_config.lr * 0.25)),
+                "weight_decay": float(local_config.get("weight_decay", 0.0)),
+            })
         return params
 
     def before_dataset_load(self):
@@ -180,7 +227,7 @@ class Gen2Trainer(BaseSDTrainProcess):
     def _make_flowmatch_noisy_latents(self, clean: torch.Tensor, noise: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
         return make_flowmatch_noisy_latents(clean, noise, timestep)
 
-    def _encode_soft_prompt(self, raw_caption: str, diagnostics: dict[str, Any] | None = None):
+    def _encode_soft_prompt(self, raw_caption: str, diagnostics: dict[str, Any] | None = None, return_pooled: bool = False):
         from extensions_built_in.diffusion_models.ideogram4.src.pipeline import QWEN3_VL_ACTIVATION_LAYERS
         from toolkit.ideogram_caption import digest_caption_string
 
@@ -213,6 +260,9 @@ class Gen2Trainer(BaseSDTrainProcess):
         token_ids = torch.tensor(encoded["input_ids"], device=self.sd.text_encoder.device, dtype=torch.long)
         ordinary = self.sd.text_encoder.language_model.embed_tokens(token_ids)
         expanded, expanded_spans = replace_token_spans_with_soft_tokens(ordinary, spans, self.soft_tokens)
+        activator_mask = torch.zeros(expanded.shape[0], device=expanded.device, dtype=torch.long)
+        for start, end in expanded_spans:
+            activator_mask[start:end] = 1
         if diagnostics is not None:
             ordinary_norm = ordinary.float().norm(dim=-1)
             soft_norm = self.soft_tokens.A.float().norm(dim=-1)
@@ -234,13 +284,25 @@ class Gen2Trainer(BaseSDTrainProcess):
         expanded = expanded.unsqueeze(0)
         attention_mask = torch.ones(expanded.shape[:2], device=expanded.device, dtype=torch.long)
         pos_2d = (attention_mask.cumsum(dim=-1) - 1).clamp(min=0)
-        return encode_qwen_inputs_embeds(
+        encoded = encode_qwen_inputs_embeds(
             self.sd.text_encoder,
             expanded,
             attention_mask,
             pos_2d,
             QWEN3_VL_ACTIVATION_LAYERS,
-        )[0].to(self.sd.torch_dtype)
+            activator_mask=activator_mask.unsqueeze(0),
+            trigger_local_adapter=self.trigger_local_adapter,
+            return_details=diagnostics is not None or return_pooled,
+        )
+        if diagnostics is not None or return_pooled:
+            features, pooled, ordinary_pooled = encoded
+            if diagnostics is not None:
+                diagnostics["activator_pooled_norm"] = float(pooled.float().norm().item())
+                diagnostics["activator_mask_count"] = int(activator_mask.sum().item())
+            if return_pooled:
+                return features[0].to(self.sd.torch_dtype), pooled[0].to(self.sd.torch_dtype), ordinary_pooled[0].to(self.sd.torch_dtype)
+            return features[0].to(self.sd.torch_dtype)
+        return encoded[0].to(self.sd.torch_dtype)
 
     def _phase_checkpoint(self, phase: str, step: int, tensors: dict[str, torch.Tensor], metadata: dict[str, Any], optimizer, scheduler=None) -> None:
         root = self.phase_a_root if phase == "a" else self.phase_b_root
@@ -262,6 +324,163 @@ class Gen2Trainer(BaseSDTrainProcess):
             for old_checkpoint in checkpoints[:-keep]:
                 shutil.rmtree(old_checkpoint)
 
+    def _native_ordinary_pooled(self, prompts, replacements):
+        from toolkit.ideogram_caption import digest_caption_string
+
+        pooled = []
+        for prompt, replacement in zip(prompts, replacements):
+            materialized = self.placeholder_contract.replace(prompt, replacement)
+            normalized = digest_caption_string(materialized)
+            messages = [{"role": "user", "content": [{"type": "text", "text": normalized}]}]
+            text = self.sd.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+            encoded = self.sd.tokenizer(text, add_special_tokens=False, return_offsets_mapping=True, truncation=True, max_length=self.sd.max_text_length)
+            offsets = encoded.get("offset_mapping")
+            features = self.sd.get_prompt_embeds([materialized]).text_embeds[0].float()
+            if offsets is None:
+                pooled.append(features.mean(dim=0))
+                continue
+            replacement_indices = set()
+            cursor = 0
+            while True:
+                start = text.find(replacement, cursor)
+                if start < 0:
+                    break
+                end = start + len(replacement)
+                replacement_indices.update(index for index, (left, right) in enumerate(offsets) if right > start and left < end)
+                cursor = end
+            keep = [index for index in range(features.shape[0]) if index not in replacement_indices]
+            pooled.append(features[keep].mean(dim=0) if keep else features.mean(dim=0))
+        return torch.stack(pooled)
+
+    def _native_span_pooled(self, prompts, replacements):
+        from toolkit.ideogram_caption import digest_caption_string
+
+        pooled = []
+        for prompt, replacement in zip(prompts, replacements):
+            materialized = self.placeholder_contract.replace(prompt, replacement)
+            normalized = digest_caption_string(materialized)
+            messages = [{"role": "user", "content": [{"type": "text", "text": normalized}]}]
+            text = self.sd.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+            encoded = self.sd.tokenizer(text, add_special_tokens=False, return_offsets_mapping=True, truncation=True, max_length=self.sd.max_text_length)
+            offsets = encoded.get("offset_mapping")
+            features = self.sd.get_prompt_embeds([materialized]).text_embeds[0].float()
+            if offsets is None:
+                pooled.append(features.mean(dim=0))
+                continue
+            spans = []
+            cursor = 0
+            while True:
+                start = text.find(replacement, cursor)
+                if start < 0:
+                    break
+                end = start + len(replacement)
+                indices = [index for index, (left, right) in enumerate(offsets) if right > start and left < end]
+                if indices:
+                    spans.append((indices[0], indices[-1] + 1))
+                cursor = end
+            if not spans:
+                pooled.append(features.mean(dim=0))
+                continue
+            pieces = [features[start:min(end, features.shape[0])] for start, end in spans if start < features.shape[0]]
+            pooled.append(torch.stack([piece.mean(dim=0) for piece in pieces]).mean(dim=0))
+        return torch.stack(pooled)
+
+    def _prompt_prediction(self, prompts, noisy_latents, timesteps, target=None, adapter_context=None):
+        from extensions_built_in.gen2_trainer.registry import clear_adapter_context
+
+        clear_adapter_context(self.sd.transformer)
+        embeds = self.sd.get_prompt_embeds(prompts)
+        prediction = self.sd.get_noise_prediction(noisy_latents, timesteps, embeds, adapter_context=adapter_context)
+        clear_adapter_context(self.sd.transformer)
+        if target is None:
+            return prediction
+        return torch.nn.functional.mse_loss(prediction.float(), target.float(), reduction="none").flatten(1).mean(1)
+
+    def _activator_prediction(self, prompts, noisy_latents, timesteps, target=None):
+        from extensions_built_in.gen2_trainer.registry import clear_adapter_context
+
+        clear_adapter_context(self.sd.transformer)
+        base_embeds = self.sd.get_prompt_embeds(prompts)
+        features = [self._encode_soft_prompt(prompt) for prompt in prompts]
+        embeds = type(base_embeds)(text_embeds=features)
+        prediction = self.sd.get_noise_prediction(noisy_latents, timesteps, embeds)
+        if target is None:
+            return prediction
+        return torch.nn.functional.mse_loss(prediction.float(), target.float(), reduction="none").flatten(1).mean(1)
+
+    def _collect_phase_a_probes(self, count: int, iterator):
+        probes = []
+        while len(probes) < count:
+            batch, iterator = self._next_batch(iterator, self.data_loader)
+            noisy, noise, timesteps, prompts, _ = self._prepare_real_batch(batch, "a")
+            target = self.sd.get_loss_target(noise=noise, batch=batch)
+            for index, prompt in enumerate(prompts):
+                probes.append((noisy[index:index + 1].detach(), timesteps[index:index + 1].detach(), target[index:index + 1].detach(), prompt))
+                if len(probes) >= count:
+                    break
+            if hasattr(batch, "cleanup"):
+                batch.cleanup()
+        return probes, iterator
+
+    def _literal_prompt(self, prompt: str) -> str:
+        literal = ((self.config.get("activator") or {}).get("initialization") or {}).get("literal", "")
+        return self.placeholder_contract.replace(prompt, literal)
+
+    def _run_helper_calibration(self, probes):
+        calibration = self.gen2_config.phase_a.get("calibration") or {}
+        literal_losses = []
+        helper_losses = [[] for _ in self.helpers]
+        evaluations_per_probe = 1 + len(self.helpers)
+        total_evaluations = len(probes) * evaluations_per_probe
+        with ToolkitProgressBar(total=total_evaluations, desc="Phase A helper calibration") as progress:
+            with torch.no_grad():
+                for probe_index, (noisy, timesteps, target, prompt) in enumerate(probes, start=1):
+                    literal_prompt = self._literal_prompt(prompt)
+                    literal = self._prompt_prediction([literal_prompt], noisy, timesteps, target).detach()[0]
+                    literal_losses.append(literal)
+                    progress.update(1)
+                    progress.set_postfix(probe=f"{probe_index}/{len(probes)}", evaluation="literal")
+                    for helper_index, helper in enumerate(self.helpers, start=1):
+                        helper_prompt = self.placeholder_contract.replace(prompt, helper["replacement"])
+                        helper_losses[helper_index - 1].append(self._prompt_prediction([helper_prompt], noisy, timesteps, target).detach()[0])
+                        progress.update(1)
+                        progress.set_postfix(probe=f"{probe_index}/{len(probes)}", evaluation=f"helper {helper_index}/{len(self.helpers)}")
+        result = calibrate_helper_losses(
+            torch.stack(literal_losses),
+            torch.stack([torch.stack(losses) for losses in helper_losses]),
+            float(calibration.get("temperature", 0.1)),
+            float(calibration.get("min_gain", 0.0)),
+            float(calibration.get("min_positive_fraction", 0.6)),
+        )
+        self._helper_calibration = {
+            "weights": result.weights.detach(),
+            "reliable_mask": result.reliable_mask.detach(),
+            "median_gains": result.median_gains.detach(),
+            "literal_losses": torch.stack(literal_losses),
+            "helper_losses": torch.stack([torch.stack(losses) for losses in helper_losses]),
+        }
+        return result
+
+    def _competence_probe(self, probes):
+        reference = self._helper_calibration
+        if reference is None or not probes:
+            return 0.0
+        literal_losses = []
+        helper_losses = [[] for _ in self.helpers]
+        activator_losses = []
+        for noisy, timesteps, target, prompt in probes:
+            with torch.no_grad():
+                literal_losses.append(self._prompt_prediction([self._literal_prompt(prompt)], noisy, timesteps, target)[0])
+                activator_losses.append(self._activator_prediction([prompt], noisy, timesteps, target)[0])
+                for helper_index, helper in enumerate(self.helpers):
+                    helper_prompt = self.placeholder_contract.replace(prompt, helper["replacement"])
+                    helper_losses[helper_index].append(self._prompt_prediction([helper_prompt], noisy, timesteps, target)[0])
+        literal = torch.stack(literal_losses)
+        helpers = torch.stack([torch.stack(losses) for losses in helper_losses])
+        weighted_helper = (helpers * reference["weights"].to(helpers.device).unsqueeze(1)).sum(dim=0)
+        competence, _ = robust_competence(literal, torch.stack(activator_losses), weighted_helper)
+        return float(competence.item())
+
     def _run_phase_a(self) -> None:
         steps = self._phase_steps("a")
         if steps <= 0:
@@ -270,78 +489,175 @@ class Gen2Trainer(BaseSDTrainProcess):
             raise RuntimeError("Phase A requires the real dataset dataloader")
         self._initialize_soft_tokens_from_literal_trigger()
         settings = self.gen2_config.phase_a
+        curriculum = settings.get("curriculum") or {}
         optimizer = self.optimizer
         if optimizer is None:
             raise RuntimeError("Phase A optimizer was not prepared")
         iterator = iter(self.data_loader)
+        calibration_settings = settings.get("calibration") or {}
+        calibration_seed = int(calibration_settings.get("seed", 1234))
+        torch.random.manual_seed(calibration_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(calibration_seed)
+        probe_count = int(calibration_settings.get("probe_count", 8))
+        heldout_count = int((settings.get("calibration") or {}).get("heldout_count", 4))
+        probes, iterator = self._collect_phase_a_probes(probe_count + heldout_count, iterator)
+        self._phase_a_probes = probes[:probe_count]
+        self._phase_a_heldout_probes = probes[probe_count:]
+        calibration_result = self._run_helper_calibration(self._phase_a_probes)
+        if self._phase_a_heldout_probes:
+            self._heldout_competence = self._competence_probe(self._phase_a_heldout_probes)
+        physical_batch = int(settings.get("batch_size", 1))
+        microbatch_size = int(curriculum.get("microbatch_size", physical_batch))
+        effective_batch = int(curriculum.get("effective_batch_size", physical_batch))
+        if effective_batch % microbatch_size != 0:
+            raise ValueError("Phase A effective batch must be divisible by the microbatch size")
+        accumulation = max(1, effective_batch // microbatch_size)
+        if physical_batch != microbatch_size:
+            raise ValueError("Phase A physical batch and microbatch must match the loaded dataloader batch contract")
         self.phase_a_root.mkdir(parents=True, exist_ok=True)
-        with ToolkitProgressBar(total=steps, desc="Phase A-lite") as progress:
+        with ToolkitProgressBar(total=steps, desc="Phase A curriculum") as progress:
             for step in range(steps):
-                batch, iterator = self._next_batch(iterator, self.data_loader)
-                noisy_latents, noise, timesteps, prompts, _ = self._prepare_real_batch(batch, "a")
-                base_embeds = self.sd.get_prompt_embeds(prompts)
-                target = self.sd.get_loss_target(noise=noise, batch=batch)
+                self._assert_qwen_frozen()
                 optimizer.zero_grad(set_to_none=True)
-                activator_features = [self._encode_soft_prompt(prompt) for prompt in prompts]
-                conditioned = type(base_embeds)(text_embeds=activator_features)
-                prediction = self.sd.get_noise_prediction(noisy_latents, timesteps, conditioned)
-                loss_target = torch.nn.functional.mse_loss(prediction.float(), target.float())
-                loss_margin = torch.zeros_like(loss_target)
-                phase_a_settings = self.gen2_config.phase_a
-                margin_settings = phase_a_settings.get("helper_margin") or {}
-                if margin_settings.get("enabled", False) and (step + 1) % int(margin_settings.get("every", 1)) == 0:
-                    helper_prompt = [self.placeholder_contract.replace(prompt, self.helpers[0]["replacement"]) for prompt in prompts]
+                dataset_loss = torch.zeros((), device=self.device_torch)
+                semantic_loss = torch.zeros_like(dataset_loss)
+                disturbance_loss = torch.zeros_like(dataset_loss)
+                preserve_loss = torch.zeros_like(dataset_loss)
+                trust_region_loss = torch.zeros_like(dataset_loss)
+                cross_content_deltas = []
+                disturbance_alpha = []
+                for _ in range(accumulation):
+                    batch, iterator = self._next_batch(iterator, self.data_loader)
+                    noisy, noise, timesteps, prompts, _ = self._prepare_real_batch(batch, "a")
+                    target = self.sd.get_loss_target(noise=noise, batch=batch)
+                    activator_prediction = self._activator_prediction(prompts, noisy, timesteps)
+                    dataset_loss = dataset_loss + torch.nn.functional.mse_loss(activator_prediction.float(), target.float()) / accumulation
                     with torch.no_grad():
-                        helper_embeds = self.sd.get_prompt_embeds(helper_prompt)
-                        helper_prediction = self.sd.get_noise_prediction(noisy_latents, timesteps, helper_embeds)
-                        helper_loss = torch.nn.functional.mse_loss(helper_prediction.float(), target.float())
-                    margin = float(margin_settings.get("margin", 0.0))
-                    if margin_settings.get("mode", "absolute") == "relative":
-                        loss_margin = torch.relu((loss_target - helper_loss) / helper_loss.clamp_min(1e-8) + margin)
-                    else:
-                        loss_margin = torch.relu(loss_target - helper_loss + margin)
-                anchor = torch.zeros_like(loss_target)
-                anchor_settings = phase_a_settings.get("init_anchor") or {}
-                if self._soft_tokens_initial is not None and anchor_settings:
-                    fraction = min(1.0, (step + 1) / max(steps, 1))
-                    decay_fraction = float(anchor_settings.get("decay_fraction", 0.5))
-                    progress_fraction = min(1.0, fraction / max(decay_fraction, 1e-8))
-                    weight_start = float(anchor_settings.get("weight_start", 0.0))
-                    weight_end = float(anchor_settings.get("weight_end", 0.0))
-                    anchor_weight = weight_start + (weight_end - weight_start) * progress_fraction
-                    anchor = (self.soft_tokens.A.float() - self._soft_tokens_initial.float()).square().mean() * anchor_weight
-                total_loss = loss_target + float(margin_settings.get("weight", 1.0)) * loss_margin + anchor
+                        literal_prompts = [self._literal_prompt(prompt) for prompt in prompts]
+                        literal_prediction = self._prompt_prediction(literal_prompts, noisy, timesteps)
+                        helper_predictions = []
+                        helper_features = []
+                        for helper in self.helpers:
+                            helper_prompts = [self.placeholder_contract.replace(prompt, helper["replacement"]) for prompt in prompts]
+                            helper_predictions.append(self._prompt_prediction(helper_prompts, noisy, timesteps))
+                            helper_features.append(self._native_span_pooled(prompts, [helper["replacement"] for _ in prompts]))
+                        helper_prediction = torch.stack(helper_predictions)
+                        weights = self._helper_calibration["weights"].to(helper_prediction.device, helper_prediction.dtype)
+                        weighted_helper_prediction = (helper_prediction * weights.view(-1, 1, 1, 1, 1)).sum(dim=0)
+                        literal_features = self._native_span_pooled(prompts, [((self.config.get("activator") or {}).get("initialization") or {}).get("literal", "") for _ in prompts])
+                        weighted_helper_features = (torch.stack(helper_features) * weights.view(-1, 1, 1)).sum(dim=0)
+                    activator_encoded = [self._encode_soft_prompt(prompt, return_pooled=True) for prompt in prompts]
+                    activator_features = torch.stack([item[1].float() for item in activator_encoded])
+                    activator_ordinary_features = torch.stack([item[2].float() for item in activator_encoded])
+                    semantic_loss = semantic_loss + semantic_direction_loss(activator_features - literal_features, weighted_helper_features - literal_features) / accumulation
+                    alpha, beta, valid = disturbance_projection(activator_prediction - literal_prediction, weighted_helper_prediction - literal_prediction)
+                    disturbance_loss = disturbance_loss + (beta[valid].mean() if torch.any(valid) else activator_prediction.sum() * 0.0) / accumulation
+                    delta = activator_features - literal_features.detach()
+                    cross_content_deltas.append(delta)
+                    literal_ordinary_features = self._native_ordinary_pooled(prompts, [((self.config.get("activator") or {}).get("initialization") or {}).get("literal", "") for _ in prompts])
+                    preserve_loss = preserve_loss + (activator_ordinary_features - literal_ordinary_features.detach()).square().mean() / accumulation
+                    trust_region_loss = trust_region_loss + (self.soft_tokens.A.float() - self._soft_tokens_initial.float()).square().mean() / accumulation
+                    if torch.any(valid):
+                        disturbance_alpha.append(alpha[valid].mean().detach())
+                    if hasattr(batch, "cleanup"):
+                        batch.cleanup()
+                evaluate_competence = (step + 1) % int(curriculum.get("competence_eval_every", 10)) == 0
+                competence = self._competence_probe(self._phase_a_probes) if evaluate_competence else 0.0
+                heldout_competence = self._competence_probe(self._phase_a_heldout_probes) if evaluate_competence and self._phase_a_heldout_probes else 0.0
+                if competence >= float(curriculum.get("release_threshold", 0.75)):
+                    self._helper_release_streak += 1
+                elif competence != 0.0:
+                    self._helper_release_streak = 0
+                if self._helper_release_streak >= int(curriculum.get("release_consecutive", 3)):
+                    self._helper_latched = True
+                helper_weight = 0.0 if self._helper_latched else smooth_helper_weight(competence, float(curriculum.get("semantic_weight", 0.25)), float(curriculum.get("decay_threshold", 0.25)), float(curriculum.get("release_threshold", 0.75)))
+                if len(cross_content_deltas) > 1:
+                    stacked_deltas = torch.cat(cross_content_deltas, dim=0)
+                    mean_delta = stacked_deltas.mean(dim=0, keepdim=True)
+                    cross_content_loss = (1.0 - torch.nn.functional.cosine_similarity(stacked_deltas, mean_delta, dim=-1)).mean()
+                else:
+                    cross_content_loss = dataset_loss * 0.0
+                self._last_phase_a_diagnostics = {
+                    "dataset_loss": float(dataset_loss.detach().item()),
+                    "semantic_loss": float(semantic_loss.detach().item()),
+                    "disturbance_loss": float(disturbance_loss.detach().item()),
+                    "content_preserve_loss": float(preserve_loss.detach().item()),
+                    "cross_content_loss": float(cross_content_loss.detach().item()),
+                    "trust_region_loss": float(trust_region_loss.detach().item()),
+                    "disturbance_alpha": float(torch.stack(disturbance_alpha).mean().item()) if disturbance_alpha else 0.0,
+                    "competence": float(competence),
+                    "helper_weight": float(helper_weight),
+                    "helper_latched": float(self._helper_latched),
+                    "helper_release_streak": float(self._helper_release_streak),
+                }
+                self._last_phase_a_diagnostics["heldout_competence"] = float(heldout_competence)
+                self._phase_a_history.append({"step": step + 1, **self._last_phase_a_diagnostics})
+                calibration_snapshot = None
+                if self._helper_calibration is not None:
+                    calibration_snapshot = {key: value.detach().cpu().tolist() if torch.is_tensor(value) else value for key, value in self._helper_calibration.items()}
+                if self.accelerator.is_main_process:
+                    (self.phase_a_root / "diagnostics.json").write_text(json.dumps({"calibration": calibration_snapshot, "heldout_competence": self._heldout_competence, "history": self._phase_a_history}, ensure_ascii=False, indent=2), encoding="utf-8")
+                total_loss = (
+                    float(curriculum.get("dataset_weight", 1.0)) * dataset_loss
+                    + helper_weight * semantic_loss
+                    + float(curriculum.get("disturbance_weight", 0.01)) * disturbance_loss
+                    + float(curriculum.get("content_preserve_weight", 0.05)) * preserve_loss
+                    + float(curriculum.get("cross_content_weight", 0.01)) * cross_content_loss
+                    + float(curriculum.get("trust_region_weight", 0.001)) * trust_region_loss
+                )
                 self.accelerator.backward(total_loss)
-                torch.nn.utils.clip_grad_norm_([self.soft_tokens.A], self.train_config.max_grad_norm)
+                trainable = [self.soft_tokens.A]
+                if self.trigger_local_adapter is not None:
+                    trainable.extend(self.trigger_local_adapter.parameters())
+                torch.nn.utils.clip_grad_norm_(trainable, self.train_config.max_grad_norm)
                 optimizer.step()
                 if self.lr_scheduler is not None:
                     self.lr_scheduler.step()
                 current_step = step + 1
+                if self.accelerator.is_main_process:
+                    self.logger.log({f"gen2/phase_a/{key}": value for key, value in self._last_phase_a_diagnostics.items()})
+                    self.logger.commit()
                 save_every = int(self.config.get("save", {}).get("save_every", 0))
                 if save_every and current_step % save_every == 0:
-                    self._phase_checkpoint(
-                        "a",
-                        current_step,
-                        {"A": self.soft_tokens.A.detach().cpu()},
-                        {"phase": "a", "step": current_step, "helpers": self.helpers},
-                        optimizer,
-                    )
-                progress.set_postfix(step=current_step, total=steps, target=f"{loss_target.item():.4g}", lr=f"{optimizer.param_groups[0]['lr']:.2e}")
+                    tensors = {"A": self.soft_tokens.A.detach().cpu()}
+                    if self.trigger_local_adapter is not None:
+                        tensors.update({f"te_adapter.{key}": value.detach().cpu() for key, value in self.trigger_local_adapter.state_dict().items()})
+                    self._phase_checkpoint("a", current_step, tensors, {"phase": "a", "step": current_step, "helper_latched": self._helper_latched, "competence": competence, "heldout_competence": heldout_competence, "diagnostics": self._last_phase_a_diagnostics, "history_length": len(self._phase_a_history)}, optimizer)
+                progress.set_postfix(step=current_step, total=steps, dataset=f"{dataset_loss.item():.4g}", semantic=f"{semantic_loss.item():.4g}", disturbance=f"{disturbance_loss.item():.4g}", competence=f"{competence:.3f}", latch=int(self._helper_latched))
                 progress.update(1)
-                if hasattr(batch, "cleanup"):
-                    batch.cleanup()
-        save_tensor_artifact(
-            self.phase_a_root / "activator.safetensors",
-            {"A": self.soft_tokens.A},
-            {
-                "artifact": "gen2_activator",
-                "schema_version": 2,
-                "initializer": "literal_trigger_resampled",
-                "placeholder": self.placeholder_contract.placeholder,
-                "tokens": self.soft_tokens.tokens,
-                "dimension": self.soft_tokens.dimension,
-            },
-        )
+        tail_steps = int(curriculum.get("independent_tail_steps", 0)) if self._helper_latched else 0
+        with ToolkitProgressBar(total=tail_steps, desc="Phase A dataset-only tail") as tail_progress:
+            for _ in range(tail_steps):
+                optimizer.zero_grad(set_to_none=True)
+                tail_loss = torch.zeros((), device=self.device_torch)
+                last_batch = None
+                for _ in range(accumulation):
+                    batch, iterator = self._next_batch(iterator, self.data_loader)
+                    last_batch = batch
+                    noisy, noise, timesteps, prompts, _ = self._prepare_real_batch(batch, "a")
+                    target = self.sd.get_loss_target(noise=noise, batch=batch)
+                    tail_loss = tail_loss + self._activator_prediction(prompts, noisy, timesteps, target).mean() / accumulation
+                    if hasattr(batch, "cleanup"):
+                        batch.cleanup()
+                self.accelerator.backward(tail_loss)
+                trainable = [self.soft_tokens.A]
+                if self.trigger_local_adapter is not None:
+                    trainable.extend(self.trigger_local_adapter.parameters())
+                torch.nn.utils.clip_grad_norm_(trainable, self.train_config.max_grad_norm)
+                optimizer.step()
+                if self.lr_scheduler is not None:
+                    self.lr_scheduler.step()
+                tail_progress.set_postfix(loss=f"{tail_loss.item():.4g}")
+                tail_progress.update(1)
+        tensors = {"A": self.soft_tokens.A}
+        metadata = {"artifact": "gen2_activator", "schema_version": 3, "initializer": "literal_trigger_resampled", "literal": ((self.config.get("activator") or {}).get("initialization") or {}).get("literal"), "placeholder": self.placeholder_contract.placeholder, "tokens": self.soft_tokens.tokens, "dimension": self.soft_tokens.dimension, "trigger_local_adapter": self.trigger_local_adapter is not None, "trigger_local_adapter_rank": self.trigger_local_adapter.rank if self.trigger_local_adapter is not None else 0, "trigger_local_adapter_alpha": self.trigger_local_adapter.alpha if self.trigger_local_adapter is not None else 0.0, "helper_latched": self._helper_latched, "helper_release_streak": self._helper_release_streak, "heldout_competence": self._heldout_competence, "phase_a_diagnostics": self._last_phase_a_diagnostics}
+        if self._helper_calibration is not None:
+            metadata["helper_calibration"] = {key: value.detach().cpu().tolist() if torch.is_tensor(value) else value for key, value in self._helper_calibration.items()}
+        if self.trigger_local_adapter is not None:
+            tensors.update({f"te_adapter.{key}": value for key, value in self.trigger_local_adapter.state_dict().items()})
+        (self.phase_a_root / "diagnostics.json").write_text(json.dumps({"calibration": metadata.get("helper_calibration"), "heldout_competence": self._heldout_competence, "history": self._phase_a_history}, ensure_ascii=False, indent=2), encoding="utf-8")
+        save_tensor_artifact(self.phase_a_root / "activator.safetensors", tensors, metadata)
 
     def _install_phase_b_optimizer(self) -> None:
         if self._adapter_bank is None:
@@ -389,8 +705,11 @@ class Gen2Trainer(BaseSDTrainProcess):
         artifact = metadata.get("artifact")
         if artifact != "gen2_activator":
             raise ValueError(f"unsupported activator artifact type: {artifact!r}")
-        if int(metadata.get("schema_version", -1)) != 2:
-            raise ValueError("activator artifact schema_version must be 2")
+        if int(metadata.get("schema_version", -1)) != 3:
+            raise ValueError("activator artifact schema_version must be 3")
+        expected_literal = ((self.config.get("activator") or {}).get("initialization") or {}).get("literal")
+        if metadata.get("literal") != expected_literal:
+            raise ValueError("activator artifact literal bootstrap does not match the current configuration")
         if metadata.get("initializer") != "literal_trigger_resampled":
             raise ValueError("activator artifact was not initialized from the literal trigger")
         if metadata.get("placeholder") != self.placeholder_contract.placeholder:
@@ -403,6 +722,15 @@ class Gen2Trainer(BaseSDTrainProcess):
         if int(metadata.get("tokens", -1)) != self.soft_tokens.tokens or int(metadata.get("dimension", -1)) != self.soft_tokens.dimension:
             raise ValueError("activator artifact dimensions do not match the configured soft token bank")
         self.soft_tokens.A.data.copy_(activator.to(self.soft_tokens.A))
+        artifact_has_adapter = bool(metadata.get("trigger_local_adapter", False))
+        config_has_adapter = self.trigger_local_adapter is not None
+        if artifact_has_adapter != config_has_adapter:
+            raise ValueError("activator artifact trigger-local adapter setting does not match the current configuration")
+        if config_has_adapter:
+            adapter_state = {key.removeprefix("te_adapter."): value for key, value in tensors.items() if key.startswith("te_adapter.")}
+            if not adapter_state:
+                raise ValueError("activator artifact is missing trigger-local adapter state")
+            self.trigger_local_adapter.load_state_dict(adapter_state, strict=True)
 
     def _restore_phase_b_checkpoint(self, optimizer) -> int:
         if self.gen2_config.mode != "resume_phase_b":
@@ -441,8 +769,13 @@ class Gen2Trainer(BaseSDTrainProcess):
         self.phase_b_root.mkdir(parents=True, exist_ok=True)
         start_step = self._restore_phase_b_checkpoint(optimizer)
         iterator = iter(self.data_loader)
+        if not self._phase_b_probes:
+            self._phase_b_probes = self._phase_a_heldout_probes or self._phase_a_probes
+            if not self._phase_b_probes:
+                self._phase_b_probes, iterator = self._collect_phase_a_probes(4, iterator)
         with ToolkitProgressBar(total=steps, desc="Phase B2 TRF-LoRA") as progress:
             for step in range(start_step, steps):
+                self._assert_qwen_frozen()
                 batch, iterator = self._next_batch(iterator, self.data_loader)
                 noisy_latents, noise, timesteps, prompts, _ = self._prepare_real_batch(batch, "b")
                 embeds = type(self.sd.get_prompt_embeds(prompts))(
@@ -461,27 +794,87 @@ class Gen2Trainer(BaseSDTrainProcess):
                 if not prediction.requires_grad:
                     raise RuntimeError("Phase B prediction has no grad_fn; adapter parameters are not connected")
                 fm = torch.nn.functional.mse_loss(prediction.float(), target.float())
+                with torch.no_grad():
+                    probe_on_losses = []
+                    probe_off_losses = []
+                    probe_delta_norms = []
+                    from extensions_built_in.gen2_trainer.registry import clear_adapter_context
+                    for probe_noisy, probe_timesteps, probe_target, probe_prompt in self._phase_b_probes:
+                        probe_embeds = type(self.sd.get_prompt_embeds([probe_prompt]))(text_embeds=[self._encode_soft_prompt(probe_prompt).detach()])
+                        probe_on = self.sd.get_noise_prediction(probe_noisy, probe_timesteps, probe_embeds, adapter_context=AdapterRuntimeContext(probe_timesteps.float() / 1000.0, torch.ones(1, device=self.device_torch), 1.0))
+                        clear_adapter_context(self.sd.transformer)
+                        probe_off = self.sd.get_noise_prediction(probe_noisy, probe_timesteps, probe_embeds, adapter_context=AdapterRuntimeContext(probe_timesteps.float() / 1000.0, torch.zeros(1, device=self.device_torch), 1.0))
+                        clear_adapter_context(self.sd.transformer)
+                        probe_on_losses.append(torch.nn.functional.mse_loss(probe_on.float(), probe_target.float()))
+                        probe_off_losses.append(torch.nn.functional.mse_loss(probe_off.float(), probe_target.float()))
+                        probe_delta_norms.append((probe_on - probe_off).float().norm())
+                    probe_on_loss = torch.stack(probe_on_losses).mean()
+                    probe_off_loss = torch.stack(probe_off_losses).mean()
+                    probe_on_loss_std = torch.stack(probe_on_losses).std(unbiased=False)
+                    probe_off_loss_std = torch.stack(probe_off_losses).std(unbiased=False)
+                    probe_delta_norm = torch.stack(probe_delta_norms).mean()
                 smooth = time_smooth_regularizer(self._adapter_bank.temporal_fields())
                 loss = fm + float(settings.get("temporal_smooth_weight", 1e-4)) * smooth
                 self.accelerator.backward(loss)
                 if not any(parameter.grad is not None for parameter in trainable):
                     raise RuntimeError("Phase B backward produced no adapter gradients")
-                self.accelerator.clip_grad_norm_(trainable, self.train_config.max_grad_norm)
+                gradient_norm = float(self.accelerator.clip_grad_norm_(trainable, self.train_config.max_grad_norm).item())
                 optimizer.step()
                 if self.lr_scheduler is not None:
                     self.lr_scheduler.step()
                 current_step = step + 1
+                adapter_norm = torch.stack([parameter.detach().float().norm() for parameter in trainable]).mean()
+                temporal_values = time_mean_diagnostic(self._adapter_bank.temporal_fields()).detach()
+                with torch.no_grad():
+                    from extensions_built_in.gen2_trainer.registry import clear_adapter_context
+                    clear_adapter_context(self.sd.transformer)
+                    prediction_off = self.sd.get_noise_prediction(
+                        noisy_latents,
+                        timesteps,
+                        embeds,
+                        adapter_context=AdapterRuntimeContext(timesteps.float() / 1000.0, torch.zeros(batch_size, device=self.device_torch), 1.0),
+                    )
+                    clear_adapter_context(self.sd.transformer)
+                    current_prediction = self.sd.get_noise_prediction(
+                        noisy_latents,
+                        timesteps,
+                        embeds,
+                        adapter_context=AdapterRuntimeContext(timesteps.float() / 1000.0, torch.ones(batch_size, device=self.device_torch), 1.0),
+                    )
+                    clear_adapter_context(self.sd.transformer)
+                    residual_scale = (current_prediction - prediction_off).float().norm() / current_prediction.float().norm().clamp_min(1e-8)
+                phase_b_diagnostics = {
+                    "fm_loss": float(fm.detach().item()),
+                    "temporal_smooth_loss": float(smooth.detach().item()),
+                    "adapter_parameter_norm": float(adapter_norm.item()),
+                    "temporal_field_abs_mean": float(temporal_values.abs().mean().item()),
+                    "temporal_field_abs_max": float(temporal_values.abs().max().item()),
+                    "gradient_norm": gradient_norm,
+                    "probe_on_loss": float(probe_on_loss.item()),
+                    "probe_on_loss_std": float(probe_on_loss_std.item()),
+                    "probe_off_loss": float(probe_off_loss.item()),
+                    "probe_off_loss_std": float(probe_off_loss_std.item()),
+                    "probe_gain": float((probe_off_loss - probe_on_loss).item()),
+                    "probe_adapter_delta_norm": float(probe_delta_norm.item()),
+                    "training_residual_relative_norm": float(residual_scale.item()),
+                }
+                self._phase_b_history.append({"step": current_step, **phase_b_diagnostics})
+                if self.accelerator.is_main_process:
+                    (self.phase_b_root / "diagnostics.json").write_text(json.dumps({"history": self._phase_b_history}, ensure_ascii=False, indent=2), encoding="utf-8")
                 save_every = int(self.config.get("save", {}).get("save_every", 0))
                 if save_every and current_step % save_every == 0:
                     self._phase_checkpoint(
                         "b",
                         current_step,
                         {key: value.detach().cpu() for key, value in self._adapter_bank.state_dict().items()},
-                        {"phase": "b", "step": current_step, "temporal_mean": time_mean_diagnostic(self._adapter_bank.temporal_fields()).detach().cpu().tolist()},
+                        {"phase": "b", "step": current_step, "temporal_mean": temporal_values.cpu().tolist(), "diagnostics": phase_b_diagnostics, "history_length": len(self._phase_b_history)},
                         optimizer,
                         scheduler=self.lr_scheduler,
                     )
-                progress.set_postfix(step=current_step, total=steps, fm=f"{fm.item():.4g}", time_smooth=f"{smooth.item():.4g}")
+                if self.accelerator.is_main_process:
+                    self.logger.log({f"gen2/phase_b/{key}": value for key, value in phase_b_diagnostics.items()})
+                    self.logger.commit()
+                progress.set_postfix(step=current_step, total=steps, fm=f"{fm.item():.4g}", time_smooth=f"{smooth.item():.4g}", adapter_norm=f"{adapter_norm.item():.3g}")
                 progress.update(1)
                 if hasattr(batch, "cleanup"):
                     batch.cleanup()
@@ -499,6 +892,7 @@ class Gen2Trainer(BaseSDTrainProcess):
         )
         network = self.config.get("network") or {}
         temporal = network.get("temporal") or {}
+        (self.phase_b_root / "diagnostics.json").write_text(json.dumps({"history": self._phase_b_history}, ensure_ascii=False, indent=2), encoding="utf-8")
         save_tensor_artifact(
             self.phase_b_root / "adapter.safetensors",
             dict(self._adapter_bank.state_dict()),
@@ -690,8 +1084,11 @@ class Gen2Trainer(BaseSDTrainProcess):
                 "activator dimension must match the loaded Qwen embedding dimension: "
                 f"configured={self.soft_tokens.dimension}, actual={embedding_weight.shape[-1]}"
             )
+        literal = ((self.config.get("activator") or {}).get("initialization") or {}).get("literal", "")
+        if not isinstance(literal, str) or not literal.strip():
+            raise ValueError("activator.initialization.literal must be a non-empty string")
         encoded = self.sd.tokenizer(
-            self.placeholder_contract.placeholder,
+            literal,
             add_special_tokens=False,
             return_tensors="pt",
         )
@@ -704,6 +1101,9 @@ class Gen2Trainer(BaseSDTrainProcess):
             initialization = resample_embedding_sequence(literal_embeddings, self.soft_tokens.tokens)
         self.soft_tokens.A.data.copy_(initialization.to(self.soft_tokens.A.device, self.soft_tokens.A.dtype))
         self._soft_tokens_initial = self.soft_tokens.A.detach().clone()
+        if self.trigger_local_adapter is not None:
+            nn.init.zeros_(self.trigger_local_adapter.up.weight)
+            self.trigger_local_adapter.zero_reference = tuple(parameter.detach().clone() for parameter in self.trigger_local_adapter.parameters())
 
     def preflight_caption(self, raw_caption: str, source: str = "caption") -> int:
         _, occurrences = self.placeholder_contract.parse(raw_caption)

@@ -5,6 +5,7 @@ import torch
 from extensions_built_in.gen2_trainer.activator import (
     PlaceholderContract,
     SoftTokenBank,
+    TriggerLocalTEAdapter,
     pack_qwen_activation_features,
     replace_token_spans_with_soft_tokens,
 )
@@ -25,6 +26,15 @@ class Gen2ActivatorTest(unittest.TestCase):
         second = torch.tensor([[[10.0, 20.0, 30.0]]])
         packed = pack_qwen_activation_features({0: first, 1: second}, (0, 1))
         self.assertTrue(torch.equal(packed, torch.tensor([[[1.0, 10.0, 2.0, 20.0, 3.0, 30.0]]])))
+
+    def test_trigger_local_adapter_masks_only_activator_rows(self):
+        adapter = TriggerLocalTEAdapter(4, rank=2, alpha=2)
+        adapter.up.weight.data.fill_(1.0)
+        hidden = torch.randn(1, 4, 4)
+        mask = torch.tensor([[0, 1, 1, 0]])
+        residual = adapter(hidden, mask)
+        self.assertTrue(torch.equal(residual[:, [0, 3]], torch.zeros(1, 2, 4)))
+        self.assertTrue(torch.count_nonzero(residual[:, [1, 2]]) > 0)
 
     def test_soft_token_span_length(self):
         bank = SoftTokenBank(3, 4, torch.ones(3, 4, dtype=torch.float32))

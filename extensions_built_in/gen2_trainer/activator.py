@@ -9,6 +9,30 @@ import torch
 from torch import nn
 
 
+class TriggerLocalTEAdapter(nn.Module):
+    """Low-rank residual written only to expanded activator rows."""
+
+    def __init__(self, dimension: int, rank: int = 4, alpha: float = 4.0) -> None:
+        super().__init__()
+        if dimension < 1 or rank < 1 or alpha < 0:
+            raise ValueError("invalid trigger-local adapter dimensions")
+        self.dimension = dimension
+        self.rank = rank
+        self.alpha = float(alpha)
+        self.down = nn.Linear(dimension, rank, bias=False)
+        self.up = nn.Linear(rank, dimension, bias=False)
+        nn.init.kaiming_uniform_(self.down.weight, a=5 ** 0.5)
+        nn.init.zeros_(self.up.weight)
+        self.zero_reference: tuple[torch.Tensor, ...] | None = None
+
+    def forward(self, hidden_states: torch.Tensor, activator_mask: torch.Tensor) -> torch.Tensor:
+        if hidden_states.ndim != 3 or activator_mask.shape != hidden_states.shape[:2]:
+            raise ValueError("trigger-local adapter expects hidden states and (batch, sequence) mask")
+        mask = activator_mask.to(device=hidden_states.device, dtype=hidden_states.dtype).unsqueeze(-1)
+        residual = self.up(self.down(hidden_states)) * (self.alpha / self.rank)
+        return residual * mask
+
+
 @dataclass(frozen=True)
 class PlaceholderOccurrence:
     index: int
@@ -182,7 +206,10 @@ def encode_qwen_inputs_embeds(
     attention_mask: torch.Tensor,
     pos_2d: torch.Tensor,
     activation_layers: tuple[int, ...],
-) -> torch.Tensor:
+    activator_mask: torch.Tensor | None = None,
+    trigger_local_adapter: TriggerLocalTEAdapter | None = None,
+    return_details: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     from transformers.masking_utils import create_causal_mask
 
     language_model = text_encoder.language_model
@@ -219,10 +246,23 @@ def encode_qwen_inputs_embeds(
         )
         if isinstance(hidden_states, tuple):
             hidden_states = hidden_states[0]
+        if trigger_local_adapter is not None and activator_mask is not None:
+            hidden_states = hidden_states + trigger_local_adapter(hidden_states, activator_mask).to(hidden_states.dtype)
         if layer_index in tap_set:
             captured[layer_index] = hidden_states
     features = pack_qwen_activation_features(captured, activation_layers)
-    return features * attention_mask.to(features.dtype).unsqueeze(-1)
+    features = features * attention_mask.to(features.dtype).unsqueeze(-1)
+    if return_details:
+        if activator_mask is None:
+            activator_mask = torch.zeros_like(attention_mask)
+        activator_float = activator_mask.to(features.dtype).unsqueeze(-1)
+        pooled = (features * activator_float).sum(dim=1)
+        denominator = activator_mask.sum(dim=1, keepdim=True).clamp_min(1).to(features.dtype)
+        ordinary_mask = (attention_mask * (1 - activator_mask)).to(features.dtype).unsqueeze(-1)
+        ordinary_pooled = (features * ordinary_mask).sum(dim=1)
+        ordinary_denominator = ordinary_mask.sum(dim=1).clamp_min(1.0)
+        return features, pooled / denominator, ordinary_pooled / ordinary_denominator
+    return features
 
 
 def normalize_inline_helpers(helpers: Iterable[Mapping[str, Any]]) -> list[dict[str, str]]:

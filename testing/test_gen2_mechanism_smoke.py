@@ -77,7 +77,11 @@ class MechanismSmokeTest(unittest.TestCase):
                 ("soft_tokens", 1.0, 1.0, 1.0),
             ],
         )
-        self.assertTrue(process["train"]["phase_a"]["helper_margin"]["enabled"])
+        self.assertFalse(process["activator"]["trigger_local_adapter"]["enabled"])
+        self.assertEqual(process["activator"]["initialization"]["strategy"], "literal_trigger_resampled")
+        self.assertEqual(process["activator"]["tokens"], 24)
+        self.assertTrue(process["train"]["phase_a"]["calibration"]["enabled"])
+        self.assertEqual(process["train"]["phase_a"]["curriculum"]["effective_batch_size"], 4)
         self.assertTrue(process["sample"]["require_official_unconditional"])
         validate_gen2_config(process)
 

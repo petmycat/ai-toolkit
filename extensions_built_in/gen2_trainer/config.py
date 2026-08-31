@@ -89,9 +89,15 @@ def validate_gen2_config(raw: Mapping[str, Any]) -> Gen2RuntimeConfig:
     _require(activator.get("share_across_occurrences", True) is True, "V1 requires share_across_occurrences=true")
     _require(activator.get("occurrence_mode", "all_placeholders") == "all_placeholders", "V1 requires occurrence_mode=all_placeholders")
     initialization = activator.get("initialization") or {}
-    _require(initialization.get("strategy", "helper_centroid_resampled") == "helper_centroid_resampled", "unsupported activator initialization strategy")
-    _require(float(initialization.get("perturbation_std", 0.0)) == 0.0, "V1 currently requires activator.initialization.perturbation_std=0")
+    _require(initialization.get("strategy", "literal_trigger_resampled") == "literal_trigger_resampled", "unsupported activator initialization strategy")
+    _require(isinstance(initialization.get("literal", ""), str) and initialization.get("literal", "").strip(), "activator.initialization.literal is required")
+    _require(float(initialization.get("perturbation_std", 0.0)) == 0.0, "literal initialization must be deterministic")
     _require(int(activator.get("tokens", 8)) >= 1, "activator.tokens must be at least 1")
+    local_adapter = activator.get("trigger_local_adapter") or {}
+    _require(isinstance(local_adapter, Mapping), "activator.trigger_local_adapter must be a mapping")
+    _require(int(local_adapter.get("rank", 4)) >= 1, "trigger_local_adapter.rank must be positive")
+    _require(float(local_adapter.get("alpha", 4.0)) >= 0.0, "trigger_local_adapter.alpha must be non-negative")
+    _require(local_adapter.get("token_mask", "activator_positions") == "activator_positions", "trigger-local adapter must use activator_positions mask")
     if mode in {"phase_b_from_activator", "resume_phase_b"}:
         _require(bool(activator.get("artifact_path")), f"{mode} requires activator.artifact_path")
 
@@ -147,9 +153,23 @@ def validate_gen2_config(raw: Mapping[str, Any]) -> Gen2RuntimeConfig:
     for phase_name, phase in (("phase_a", phase_a), ("phase_b", phase_b)):
         _require(phase.get("timestep_sampling", "stratified_uniform") == "stratified_uniform", f"{phase_name}.timestep_sampling must be stratified_uniform")
         _require(int(phase.get("timestep_bins", 10)) >= 2, f"{phase_name}.timestep_bins must be at least 2")
-    margin = phase_a.get("helper_margin") or {}
-    _require(int(margin.get("every", 1)) >= 1, "phase_a.helper_margin.every must be at least 1")
-    _require(margin.get("mode", "absolute") in {"absolute", "relative"}, "phase_a.helper_margin.mode must be absolute or relative")
+    calibration = phase_a.get("calibration") or {}
+    _require(bool(calibration.get("enabled", True)), "phase_a.calibration.enabled must be true")
+    _require(int(calibration.get("probe_count", 8)) >= 1, "phase_a.calibration.probe_count must be positive")
+    _require(int(calibration.get("heldout_count", 4)) >= 0, "phase_a.calibration.heldout_count cannot be negative")
+    _require(float(calibration.get("temperature", 0.1)) > 0.0, "phase_a.calibration.temperature must be positive")
+    _require(0.0 <= float(calibration.get("min_positive_fraction", 0.6)) <= 1.0, "phase_a.calibration.min_positive_fraction must be in 0..1")
+    curriculum = phase_a.get("curriculum") or {}
+    effective_batch_size = int(curriculum.get("effective_batch_size", train.get("batch_size", 1)))
+    _require(effective_batch_size >= int(phase_a.get("batch_size", train.get("batch_size", 1))), "phase_a effective batch must cover the physical batch")
+    microbatch_size = int(curriculum.get("microbatch_size", phase_a.get("batch_size", train.get("batch_size", 1))))
+    _require(microbatch_size == int(phase_a.get("batch_size", train.get("batch_size", 1))), "phase_a.curriculum.microbatch_size must equal phase_a.batch_size in the current dataloader contract")
+    _require(effective_batch_size % microbatch_size == 0, "phase_a effective_batch_size must be divisible by microbatch_size")
+    for weight_name in ("semantic_weight", "dataset_weight", "content_preserve_weight", "disturbance_weight", "cross_content_weight", "trust_region_weight"):
+        _require(float(curriculum.get(weight_name, 0.0)) >= 0.0, f"phase_a.curriculum.{weight_name} must be non-negative")
+    _require(float(curriculum.get("release_threshold", 1.0)) > float(curriculum.get("decay_threshold", 0.25)), "phase_a curriculum release threshold must exceed decay threshold")
+    _require(int(curriculum.get("release_consecutive", 3)) >= 1, "phase_a curriculum release_consecutive must be positive")
+    _require(int(curriculum.get("independent_tail_steps", 0)) >= 0, "phase_a curriculum independent_tail_steps cannot be negative")
     diversity = phase_a.get("token_diversity") or {}
     _require(not diversity.get("enabled", False), "token_diversity is not implemented in Gen2 V1")
     _require(float(phase_b.get("temporal_mean_weight", 0.0)) == 0.0, "temporal_mean_weight is diagnostic-only and must be zero")
