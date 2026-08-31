@@ -15,12 +15,23 @@ class Gen2ArtifactTest(unittest.TestCase):
             save_tensor_artifact(
                 path,
                 {"A": expected},
-                {"artifact": "gen2_activator", "helpers": [{"id": "h", "replacement": "style"}]},
+                {
+                    "artifact": "gen2_activator",
+                    "schema_version": 2,
+                    "initializer": "literal_trigger_resampled",
+                    "placeholder": "[trigger]",
+                    "tokens": 3,
+                    "dimension": 4,
+                },
             )
             tensors, metadata = load_tensor_artifact(path)
         self.assertTrue(torch.equal(tensors["A"], expected))
         self.assertEqual(metadata["artifact"], "gen2_activator")
-        self.assertEqual(metadata["helpers"][0]["id"], "h")
+        self.assertEqual(metadata["schema_version"], 2)
+        self.assertEqual(metadata["initializer"], "literal_trigger_resampled")
+        self.assertEqual(metadata["placeholder"], "[trigger]")
+        self.assertEqual(metadata["tokens"], 3)
+        self.assertEqual(metadata["dimension"], 4)
 
 
 if __name__ == "__main__":

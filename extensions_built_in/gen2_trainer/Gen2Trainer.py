@@ -16,9 +16,9 @@ from .activator import (
     PlaceholderContract,
     SoftTokenBank,
     encode_qwen_inputs_embeds,
-    initialize_from_helper_embeddings,
     normalize_inline_helpers,
     replace_token_spans_with_soft_tokens,
+    resample_embedding_sequence,
 )
 from .artifacts import load_tensor_artifact, save_tensor_artifact
 from .checkpoint import load_phase_checkpoint, save_phase_checkpoint
@@ -124,26 +124,6 @@ class Gen2Trainer(BaseSDTrainProcess):
             "lr": self.train_config.lr,
         })
         return params
-
-    def hook_train_loop(self, batches):
-        batch_list = batches if isinstance(batches, list) else [batches]
-        self.optimizer.zero_grad(set_to_none=True)
-        total = torch.zeros((), device=self.device_torch)
-        for batch in batch_list:
-            noisy_latents, noise, timesteps, prompts, _ = self._prepare_real_batch(batch, "a")
-            activator_features = [self._encode_soft_prompt(prompt) for prompt in prompts]
-            conditioned = type(self.sd.get_prompt_embeds(prompts))(text_embeds=activator_features)
-            prediction = self.sd.get_noise_prediction(noisy_latents, timesteps, conditioned)
-            target = self.sd.get_loss_target(noise=noise, batch=batch)
-            loss = torch.nn.functional.mse_loss(prediction.float(), target.float()) / len(batch_list)
-            self.accelerator.backward(loss)
-            total = total + loss.detach()
-        if not self.is_grad_accumulation_step:
-            self.accelerator.clip_grad_norm_([self.soft_tokens.A], self.train_config.max_grad_norm)
-            self.optimizer.step()
-            self.optimizer.zero_grad(set_to_none=True)
-            self.lr_scheduler.step()
-        return OrderedDict(loss=total.item())
 
     def before_dataset_load(self):
         return None
@@ -288,7 +268,7 @@ class Gen2Trainer(BaseSDTrainProcess):
             return
         if self.data_loader is None:
             raise RuntimeError("Phase A requires the real dataset dataloader")
-        self._initialize_soft_tokens_from_helpers()
+        self._initialize_soft_tokens_from_literal_trigger()
         settings = self.gen2_config.phase_a
         optimizer = self.optimizer
         if optimizer is None:
@@ -353,9 +333,15 @@ class Gen2Trainer(BaseSDTrainProcess):
         save_tensor_artifact(
             self.phase_a_root / "activator.safetensors",
             {"A": self.soft_tokens.A},
-            {"artifact": "gen2_activator", "tokens": self.soft_tokens.tokens, "dimension": self.soft_tokens.dimension, "helpers": self.helpers},
+            {
+                "artifact": "gen2_activator",
+                "schema_version": 2,
+                "initializer": "literal_trigger_resampled",
+                "placeholder": self.placeholder_contract.placeholder,
+                "tokens": self.soft_tokens.tokens,
+                "dimension": self.soft_tokens.dimension,
+            },
         )
-        torch.save({"A": self.soft_tokens.A.detach().cpu(), "helpers": self.helpers}, self.phase_a_root / "activator.pt")
 
     def _install_phase_b_optimizer(self) -> None:
         if self._adapter_bank is None:
@@ -397,16 +383,26 @@ class Gen2Trainer(BaseSDTrainProcess):
             return
         if not artifact_path:
             raise ValueError(f"{self.gen2_config.mode} requires activator.artifact_path")
-        if Path(artifact_path).suffix == ".safetensors":
-            tensors, _ = load_tensor_artifact(artifact_path)
-            payload = {"A": tensors.get("A")}
-        else:
-            payload = torch.load(artifact_path, map_location="cpu", weights_only=False)
-        if payload.get("A") is None:
-            raise ValueError("activator artifact must contain A")
-        if tuple(payload["A"].shape) != tuple(self.soft_tokens.A.shape):
+        if Path(artifact_path).suffix != ".safetensors":
+            raise ValueError("Gen2 activator artifacts must use safetensors")
+        tensors, metadata = load_tensor_artifact(artifact_path)
+        artifact = metadata.get("artifact")
+        if artifact != "gen2_activator":
+            raise ValueError(f"unsupported activator artifact type: {artifact!r}")
+        if int(metadata.get("schema_version", -1)) != 2:
+            raise ValueError("activator artifact schema_version must be 2")
+        if metadata.get("initializer") != "literal_trigger_resampled":
+            raise ValueError("activator artifact was not initialized from the literal trigger")
+        if metadata.get("placeholder") != self.placeholder_contract.placeholder:
+            raise ValueError("activator artifact placeholder does not match the current contract")
+        activator = tensors.get("A")
+        if activator is None:
+            raise ValueError("activator artifact must contain tensor A")
+        if tuple(activator.shape) != tuple(self.soft_tokens.A.shape):
             raise ValueError("activator artifact shape does not match configured soft tokens")
-        self.soft_tokens.A.data.copy_(payload["A"].to(self.soft_tokens.A))
+        if int(metadata.get("tokens", -1)) != self.soft_tokens.tokens or int(metadata.get("dimension", -1)) != self.soft_tokens.dimension:
+            raise ValueError("activator artifact dimensions do not match the configured soft token bank")
+        self.soft_tokens.A.data.copy_(activator.to(self.soft_tokens.A))
 
     def _restore_phase_b_checkpoint(self, optimizer) -> int:
         if self.gen2_config.mode != "resume_phase_b":
@@ -686,18 +682,26 @@ class Gen2Trainer(BaseSDTrainProcess):
         tokens = int((self.config.get("activator") or {}).get("tokens", 8))
         self.soft_tokens = SoftTokenBank(tokens, dimension)
 
-    def _initialize_soft_tokens_from_helpers(self) -> None:
+    def _initialize_soft_tokens_from_literal_trigger(self) -> None:
         language_model = self.sd.text_encoder.language_model
-        embeddings = []
+        embedding_weight = language_model.embed_tokens.weight
+        if self.soft_tokens.dimension != embedding_weight.shape[-1]:
+            raise ValueError(
+                "activator dimension must match the loaded Qwen embedding dimension: "
+                f"configured={self.soft_tokens.dimension}, actual={embedding_weight.shape[-1]}"
+            )
+        encoded = self.sd.tokenizer(
+            self.placeholder_contract.placeholder,
+            add_special_tokens=False,
+            return_tensors="pt",
+        )
+        token_ids = encoded.get("input_ids")
+        if token_ids is None or token_ids.numel() == 0:
+            raise ValueError("literal activator placeholder produced no tokenizer tokens")
+        token_ids = token_ids.to(device=embedding_weight.device, dtype=torch.long)
         with torch.no_grad():
-            for helper in self.helpers:
-                ids = self.sd.tokenizer(
-                    helper["replacement"],
-                    add_special_tokens=False,
-                    return_tensors="pt",
-                )["input_ids"].to(language_model.embed_tokens.weight.device)
-                embeddings.append(language_model.embed_tokens(ids)[0].float())
-        initialization = initialize_from_helper_embeddings(embeddings, self.soft_tokens.tokens)
+            literal_embeddings = language_model.embed_tokens(token_ids)[0].float()
+            initialization = resample_embedding_sequence(literal_embeddings, self.soft_tokens.tokens)
         self.soft_tokens.A.data.copy_(initialization.to(self.soft_tokens.A.device, self.soft_tokens.A.dtype))
         self._soft_tokens_initial = self.soft_tokens.A.detach().clone()
 

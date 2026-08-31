@@ -118,13 +118,6 @@ def resample_embedding_sequence(embedding: torch.Tensor, tokens: int) -> torch.T
     return embedding[left] * (1 - weight) + embedding[right] * weight
 
 
-def initialize_from_helper_embeddings(helper_embeddings: list[torch.Tensor], tokens: int) -> torch.Tensor:
-    if not helper_embeddings:
-        raise ValueError("at least one helper embedding is required")
-    resampled = [resample_embedding_sequence(item, tokens) for item in helper_embeddings]
-    return torch.stack(resampled, dim=0).mean(dim=0)
-
-
 def replace_token_spans_with_soft_tokens(
     token_embeddings: torch.Tensor,
     spans: list[tuple[int, int]],
@@ -167,6 +160,20 @@ def pad_expanded_embeddings(sequences: list[torch.Tensor]) -> tuple[torch.Tensor
         padded[index, : item.shape[0]] = item
         mask[index, : item.shape[0]] = 1
     return padded, mask
+
+
+def pack_qwen_activation_features(
+    captured: Mapping[int, torch.Tensor],
+    activation_layers: tuple[int, ...],
+) -> torch.Tensor:
+    missing = set(activation_layers).difference(captured)
+    if missing:
+        raise RuntimeError(f"Qwen activation layers were not captured: {sorted(missing)}")
+    selected = [captured[index] for index in activation_layers]
+    stacked = torch.stack(selected, dim=0)
+    stacked = torch.permute(stacked, (1, 2, 3, 0))
+    batch_size, sequence_length = stacked.shape[:2]
+    return stacked.reshape(batch_size, sequence_length, -1)
 
 
 def encode_qwen_inputs_embeds(
@@ -214,10 +221,7 @@ def encode_qwen_inputs_embeds(
             hidden_states = hidden_states[0]
         if layer_index in tap_set:
             captured[layer_index] = hidden_states
-    missing = tap_set.difference(captured)
-    if missing:
-        raise RuntimeError(f"Qwen activation layers were not captured: {sorted(missing)}")
-    features = torch.cat([captured[index] for index in activation_layers], dim=-1)
+    features = pack_qwen_activation_features(captured, activation_layers)
     return features * attention_mask.to(features.dtype).unsqueeze(-1)
 
 

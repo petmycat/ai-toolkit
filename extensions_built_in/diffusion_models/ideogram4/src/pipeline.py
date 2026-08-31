@@ -16,6 +16,8 @@ from diffusers.utils.torch_utils import randn_tensor
 
 from transformers.masking_utils import create_causal_mask
 
+from extensions_built_in.gen2_trainer.activator import pack_qwen_activation_features
+
 from .transformer import (
     IMAGE_POSITION_OFFSET,
     LLM_TOKEN_INDICATOR,
@@ -132,6 +134,10 @@ def get_qwen3_vl_features(
         position_ids=text_position_ids,
     )
     position_embeddings = language_model.rotary_emb(inputs_embeds, mrope_position_ids)
+    if isinstance(position_embeddings, tuple):
+        position_embeddings = tuple(item.to(dtype=inputs_embeds.dtype) for item in position_embeddings)
+    else:
+        position_embeddings = position_embeddings.to(dtype=inputs_embeds.dtype)
 
     tap_set = set(QWEN3_VL_ACTIVATION_LAYERS)
     captured: dict[int, torch.Tensor] = {}
@@ -144,14 +150,12 @@ def get_qwen3_vl_features(
             past_key_values=None,
             position_embeddings=position_embeddings,
         )
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[0]
         if layer_idx in tap_set:
             captured[layer_idx] = hidden_states
 
-    selected = [captured[i] for i in QWEN3_VL_ACTIVATION_LAYERS]
-    batch_size, seq_len = token_ids.shape
-    stacked = torch.stack(selected, dim=0)  # (num_taps, B, L, H)
-    stacked = torch.permute(stacked, (1, 2, 3, 0))  # (B, L, H, num_taps)
-    stacked = stacked.reshape(batch_size, seq_len, -1)
+    stacked = pack_qwen_activation_features(captured, QWEN3_VL_ACTIVATION_LAYERS)
 
     text_mask = attention_mask.to(stacked.dtype).unsqueeze(-1)
     stacked = stacked * text_mask

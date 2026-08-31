@@ -5,6 +5,7 @@ import torch
 from extensions_built_in.gen2_trainer.activator import (
     PlaceholderContract,
     SoftTokenBank,
+    pack_qwen_activation_features,
     replace_token_spans_with_soft_tokens,
 )
 
@@ -18,6 +19,12 @@ class Gen2ActivatorTest(unittest.TestCase):
         replaced = contract.replace(raw, "style, with punctuation")
         self.assertNotIn("[trigger]", replaced)
         self.assertIn("style, with punctuation", replaced)
+
+    def test_activation_feature_packing_interleaves_layers_per_hidden_dimension(self):
+        first = torch.tensor([[[1.0, 2.0, 3.0]]])
+        second = torch.tensor([[[10.0, 20.0, 30.0]]])
+        packed = pack_qwen_activation_features({0: first, 1: second}, (0, 1))
+        self.assertTrue(torch.equal(packed, torch.tensor([[[1.0, 10.0, 2.0, 20.0, 3.0, 30.0]]])))
 
     def test_soft_token_span_length(self):
         bank = SoftTokenBank(3, 4, torch.ones(3, 4, dtype=torch.float32))
