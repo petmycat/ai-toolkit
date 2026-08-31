@@ -452,18 +452,31 @@ class Gen2Trainer(BaseSDTrainProcess):
             float(calibration.get("min_gain", 0.0)),
             float(calibration.get("min_positive_fraction", 0.6)),
         )
+        reliable_count = int(result.reliable_mask.sum().item())
+        calibration_status = "helper_supervision" if reliable_count else "dataset_only_fallback"
+        if self.accelerator.is_main_process:
+            print(f"Phase A helper calibration: {reliable_count}/{len(self.helpers)} reliable helpers; mode={calibration_status}")
+            for helper_index, helper in enumerate(self.helpers):
+                print(
+                    f"  - {helper['id']}: mean_gain={result.gains[helper_index].item():.6g}, "
+                    f"median_gain={result.median_gains[helper_index].item():.6g}, "
+                    f"positive_fraction={result.positive_fractions[helper_index].item():.3f}, "
+                    f"weight={result.weights[helper_index].item():.6g}"
+                )
         self._helper_calibration = {
             "weights": result.weights.detach(),
             "reliable_mask": result.reliable_mask.detach(),
             "median_gains": result.median_gains.detach(),
             "literal_losses": torch.stack(literal_losses),
             "helper_losses": torch.stack([torch.stack(losses) for losses in helper_losses]),
+            "reliable_count": reliable_count,
+            "status": calibration_status,
         }
         return result
 
     def _competence_probe(self, probes):
         reference = self._helper_calibration
-        if reference is None or not probes:
+        if reference is None or not probes or int(reference.get("reliable_count", 0)) == 0:
             return 0.0
         literal_losses = []
         helper_losses = [[] for _ in self.helpers]
@@ -505,6 +518,7 @@ class Gen2Trainer(BaseSDTrainProcess):
         self._phase_a_probes = probes[:probe_count]
         self._phase_a_heldout_probes = probes[probe_count:]
         calibration_result = self._run_helper_calibration(self._phase_a_probes)
+        helper_supervision_available = int(self._helper_calibration.get("reliable_count", 0)) > 0
         if self._phase_a_heldout_probes:
             self._heldout_competence = self._competence_probe(self._phase_a_heldout_probes)
         physical_batch = int(settings.get("batch_size", 1))
@@ -550,26 +564,27 @@ class Gen2Trainer(BaseSDTrainProcess):
                     activator_encoded = [self._encode_soft_prompt(prompt, return_pooled=True) for prompt in prompts]
                     activator_features = torch.stack([item[1].float() for item in activator_encoded])
                     activator_ordinary_features = torch.stack([item[2].float() for item in activator_encoded])
-                    semantic_loss = semantic_loss + semantic_direction_loss(activator_features - literal_features, weighted_helper_features - literal_features) / accumulation
+                    if int(self._helper_calibration.get("reliable_count", 0)) > 0:
+                        semantic_loss = semantic_loss + semantic_direction_loss(activator_features - literal_features, weighted_helper_features - literal_features) / accumulation
                     alpha, beta, valid = disturbance_projection(activator_prediction - literal_prediction, weighted_helper_prediction - literal_prediction)
-                    disturbance_loss = disturbance_loss + (beta[valid].mean() if torch.any(valid) else activator_prediction.sum() * 0.0) / accumulation
+                    disturbance_loss = disturbance_loss + (beta[valid].mean() if torch.any(valid) and int(self._helper_calibration.get("reliable_count", 0)) > 0 else activator_prediction.sum() * 0.0) / accumulation
                     delta = activator_features - literal_features.detach()
                     cross_content_deltas.append(delta)
                     literal_ordinary_features = self._native_ordinary_pooled(prompts, [((self.config.get("activator") or {}).get("initialization") or {}).get("literal", "") for _ in prompts])
                     preserve_loss = preserve_loss + (activator_ordinary_features - literal_ordinary_features.detach()).square().mean() / accumulation
                     trust_region_loss = trust_region_loss + (self.soft_tokens.A.float() - self._soft_tokens_initial.float()).square().mean() / accumulation
-                    if torch.any(valid):
+                    if torch.any(valid) and int(self._helper_calibration.get("reliable_count", 0)) > 0:
                         disturbance_alpha.append(alpha[valid].mean().detach())
                     if hasattr(batch, "cleanup"):
                         batch.cleanup()
                 evaluate_competence = (step + 1) % int(curriculum.get("competence_eval_every", 10)) == 0
                 competence = self._competence_probe(self._phase_a_probes) if evaluate_competence else 0.0
                 heldout_competence = self._competence_probe(self._phase_a_heldout_probes) if evaluate_competence and self._phase_a_heldout_probes else 0.0
-                if competence >= float(curriculum.get("release_threshold", 0.75)):
+                if helper_supervision_available and competence >= float(curriculum.get("release_threshold", 0.75)):
                     self._helper_release_streak += 1
-                elif competence != 0.0:
+                elif helper_supervision_available and competence != 0.0:
                     self._helper_release_streak = 0
-                if self._helper_release_streak >= int(curriculum.get("release_consecutive", 3)):
+                if helper_supervision_available and self._helper_release_streak >= int(curriculum.get("release_consecutive", 3)):
                     self._helper_latched = True
                 helper_weight = 0.0 if self._helper_latched else smooth_helper_weight(competence, float(curriculum.get("semantic_weight", 0.25)), float(curriculum.get("decay_threshold", 0.25)), float(curriculum.get("release_threshold", 0.75)))
                 if len(cross_content_deltas) > 1:

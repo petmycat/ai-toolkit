@@ -50,6 +50,17 @@ class PhaseAMathTest(unittest.TestCase):
         loss = semantic_direction_loss(torch.zeros(2, 4), torch.ones(2, 4))
         self.assertTrue(torch.isfinite(loss))
 
+    def test_calibration_allows_dataset_only_fallback_when_no_helper_wins(self):
+        result = calibrate_helper_losses(
+            torch.tensor([1.0, 1.0]),
+            torch.tensor([[1.1, 1.2], [1.3, 1.4]]),
+            temperature=0.1,
+            min_gain=0.0,
+            min_positive_fraction=0.5,
+        )
+        self.assertFalse(bool(result.reliable_mask.any()))
+        self.assertTrue(torch.equal(result.weights, torch.zeros(2)))
+
 
 if __name__ == "__main__":
     unittest.main()

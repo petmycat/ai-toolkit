@@ -33,12 +33,13 @@ def calibrate_helper_losses(
     median_gains = gains_by_probe.median(dim=1).values
     positive_fractions = (gains_by_probe > 0).float().mean(dim=1)
     reliable_mask = (median_gains > min_gain) & (positive_fractions >= min_positive_fraction)
-    if not torch.any(reliable_mask):
-        raise RuntimeError("no helper reliably outperforms the literal bootstrap on calibration probes")
     logits = torch.full_like(gains, float("-inf"))
-    logits[reliable_mask] = F.softplus(gains[reliable_mask] / temperature).log()
-    weights = torch.softmax(logits, dim=0)
-    weights = torch.where(reliable_mask, weights, torch.zeros_like(weights))
+    if torch.any(reliable_mask):
+        logits[reliable_mask] = F.softplus(gains[reliable_mask] / temperature).log()
+        weights = torch.softmax(logits, dim=0)
+        weights = torch.where(reliable_mask, weights, torch.zeros_like(weights))
+    else:
+        weights = torch.zeros_like(gains)
     return HelperCalibrationResult(gains, median_gains, positive_fractions, reliable_mask, weights)
 
 
