@@ -86,6 +86,10 @@ class MechanismSmokeTest(unittest.TestCase):
         self.assertEqual(process["train"]["phase_a"]["batch_size"], 1)
         self.assertEqual(process["train"]["phase_b"]["batch_size"], 2)
         self.assertNotEqual(process["train"]["phase_a"]["batch_size"], process["train"]["phase_b"]["batch_size"])
+        self.assertEqual(process["save"]["phase_a"]["save_every"], 4)
+        self.assertEqual(process["save"]["phase_b"]["save_every"], 4)
+        self.assertEqual(process["save"]["phase_a"]["max_step_saves_to_keep"], 4)
+        self.assertEqual(process["save"]["phase_b"]["max_step_saves_to_keep"], 4)
         self.assertTrue(process["sample"]["require_official_unconditional"])
         validate_gen2_config(process)
 

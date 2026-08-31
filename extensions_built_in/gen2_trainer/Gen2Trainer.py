@@ -331,7 +331,8 @@ class Gen2Trainer(BaseSDTrainProcess):
             "cursor": int(self._timestep_bin_cursors.get(phase_key, 0)),
         }
         save_phase_checkpoint(path, tensors, metadata, optimizer=optimizer, scheduler=scheduler)
-        keep = int((self.config.get("save") or {}).get("max_step_saves_to_keep", 0))
+        phase_save = ((self.config.get("save") or {}).get(f"phase_{phase}") or {})
+        keep = int(phase_save.get("max_step_saves_to_keep", 0))
         if keep > 0:
             checkpoints = sorted(
                 (item for item in root.iterdir() if item.is_dir() and item.name.startswith("step_")),
@@ -469,7 +470,7 @@ class Gen2Trainer(BaseSDTrainProcess):
             float(calibration.get("min_positive_fraction", 0.6)),
         )
         reliable_count = int(result.reliable_mask.sum().item())
-        calibration_status = "helper_supervision" if reliable_count else "dataset_only_fallback"
+        calibration_status = "helper_supervision" if reliable_count else ("prior_weighted_fallback" if self.helpers else "dataset_only_fallback")
         if self.accelerator.is_main_process:
             print(f"Phase A helper calibration: {reliable_count}/{len(self.helpers)} reliable helpers; mode={calibration_status}")
             for helper_index, helper in enumerate(self.helpers):
@@ -492,7 +493,7 @@ class Gen2Trainer(BaseSDTrainProcess):
 
     def _competence_probe(self, probes):
         reference = self._helper_calibration
-        if reference is None or not probes or int(reference.get("reliable_count", 0)) == 0:
+        if reference is None or not probes or not bool(self.helpers):
             return 0.0
         literal_losses = []
         helper_losses = [[] for _ in self.helpers]
@@ -507,7 +508,10 @@ class Gen2Trainer(BaseSDTrainProcess):
         literal = torch.stack(literal_losses)
         helpers = torch.stack([torch.stack(losses) for losses in helper_losses])
         weighted_helper = (helpers * reference["weights"].to(helpers.device).unsqueeze(1)).sum(dim=0)
-        competence, _ = robust_competence(literal, torch.stack(activator_losses), weighted_helper)
+        try:
+            competence, _ = robust_competence(literal, torch.stack(activator_losses), weighted_helper)
+        except RuntimeError:
+            return 0.0
         return float(competence.item())
 
     def _run_phase_a(self) -> None:
@@ -538,7 +542,7 @@ class Gen2Trainer(BaseSDTrainProcess):
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        helper_supervision_available = int(self._helper_calibration.get("reliable_count", 0)) > 0
+        helper_supervision_available = bool(self.helpers) and (int(self._helper_calibration.get("reliable_count", 0)) > 0 or self._helper_calibration.get("status") == "prior_weighted_fallback")
         if self._phase_a_heldout_probes:
             self._heldout_competence = self._competence_probe(self._phase_a_heldout_probes)
         physical_batch = int(settings.get("batch_size", 1))
@@ -584,16 +588,16 @@ class Gen2Trainer(BaseSDTrainProcess):
                     activator_encoded = [self._encode_soft_prompt(prompt, return_pooled=True) for prompt in prompts]
                     activator_features = torch.stack([item[1].float() for item in activator_encoded])
                     activator_ordinary_features = torch.stack([item[2].float() for item in activator_encoded])
-                    if int(self._helper_calibration.get("reliable_count", 0)) > 0:
+                    if helper_supervision_available:
                         semantic_loss = semantic_loss + semantic_direction_loss(activator_features - literal_features, weighted_helper_features - literal_features) / accumulation
                     alpha, beta, valid = disturbance_projection(activator_prediction - literal_prediction, weighted_helper_prediction - literal_prediction)
-                    disturbance_loss = disturbance_loss + (beta[valid].mean() if torch.any(valid) and int(self._helper_calibration.get("reliable_count", 0)) > 0 else activator_prediction.sum() * 0.0) / accumulation
+                    disturbance_loss = disturbance_loss + (beta[valid].mean() if torch.any(valid) and helper_supervision_available else activator_prediction.sum() * 0.0) / accumulation
                     delta = activator_features - literal_features.detach()
                     cross_content_deltas.append(delta)
                     literal_ordinary_features = self._native_ordinary_pooled(prompts, [((self.config.get("activator") or {}).get("initialization") or {}).get("literal", "") for _ in prompts])
                     preserve_loss = preserve_loss + (activator_ordinary_features - literal_ordinary_features.detach()).square().mean() / accumulation
                     trust_region_loss = trust_region_loss + (self.soft_tokens.A.float() - self._soft_tokens_initial.float()).square().mean() / accumulation
-                    if torch.any(valid) and int(self._helper_calibration.get("reliable_count", 0)) > 0:
+                    if torch.any(valid) and helper_supervision_available:
                         disturbance_alpha.append(alpha[valid].mean().detach())
                     if hasattr(batch, "cleanup"):
                         batch.cleanup()
@@ -653,7 +657,7 @@ class Gen2Trainer(BaseSDTrainProcess):
                 if self.accelerator.is_main_process:
                     self.logger.log({f"gen2/phase_a/{key}": value for key, value in self._last_phase_a_diagnostics.items()})
                     self.logger.commit()
-                save_every = int(self.config.get("save", {}).get("save_every", 0))
+                save_every = int(((self.config.get("save") or {}).get("phase_a") or {}).get("save_every", 0))
                 if save_every and current_step % save_every == 0:
                     tensors = {"A": self.soft_tokens.A.detach().cpu()}
                     if self.trigger_local_adapter is not None:
@@ -821,12 +825,16 @@ class Gen2Trainer(BaseSDTrainProcess):
                 optimizer.zero_grad(set_to_none=True)
                 batch_size = noisy_latents.shape[0]
                 style_gate = torch.ones(batch_size, device=self.device_torch, dtype=torch.float32)
+                training_context = AdapterRuntimeContext(timesteps.float() / 1000.0, style_gate, 1.0)
                 prediction = self.sd.get_noise_prediction(
                     noisy_latents,
                     timesteps,
                     embeds,
-                    adapter_context=AdapterRuntimeContext(timesteps.float() / 1000.0, style_gate, 1.0),
+                    adapter_context=training_context,
                 )
+                saved_training_context = getattr(self.sd.transformer, "_gen2_adapter_context", None)
+                if saved_training_context is None:
+                    raise RuntimeError("Phase B training forward did not retain adapter context for checkpoint recomputation")
                 if not prediction.requires_grad:
                     raise RuntimeError("Phase B prediction has no grad_fn; adapter parameters are not connected")
                 fm = torch.nn.functional.mse_loss(prediction.float(), target.float())
@@ -849,6 +857,7 @@ class Gen2Trainer(BaseSDTrainProcess):
                     probe_on_loss_std = torch.stack(probe_on_losses).std(unbiased=False)
                     probe_off_loss_std = torch.stack(probe_off_losses).std(unbiased=False)
                     probe_delta_norm = torch.stack(probe_delta_norms).mean()
+                self.sd.transformer._gen2_adapter_context = saved_training_context
                 smooth = time_smooth_regularizer(self._adapter_bank.temporal_fields())
                 loss = fm + float(settings.get("temporal_smooth_weight", 1e-4)) * smooth
                 self.accelerator.backward(loss)
@@ -897,7 +906,7 @@ class Gen2Trainer(BaseSDTrainProcess):
                 self._phase_b_history.append({"step": current_step, **phase_b_diagnostics})
                 if self.accelerator.is_main_process:
                     (self.phase_b_root / "diagnostics.json").write_text(json.dumps({"history": self._phase_b_history}, ensure_ascii=False, indent=2), encoding="utf-8")
-                save_every = int(self.config.get("save", {}).get("save_every", 0))
+                save_every = int(((self.config.get("save") or {}).get("phase_b") or {}).get("save_every", 0))
                 if save_every and current_step % save_every == 0:
                     self._phase_checkpoint(
                         "b",

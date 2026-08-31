@@ -59,7 +59,8 @@ class PhaseAMathTest(unittest.TestCase):
             min_positive_fraction=0.5,
         )
         self.assertFalse(bool(result.reliable_mask.any()))
-        self.assertTrue(torch.equal(result.weights, torch.zeros(2)))
+        self.assertAlmostEqual(float(result.weights.sum()), 1.0, places=6)
+        self.assertTrue(torch.all(result.weights > 0))
 
 
 if __name__ == "__main__":

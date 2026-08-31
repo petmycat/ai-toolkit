@@ -39,7 +39,9 @@ def calibrate_helper_losses(
         weights = torch.softmax(logits, dim=0)
         weights = torch.where(reliable_mask, weights, torch.zeros_like(weights))
     else:
-        weights = torch.zeros_like(gains)
+        prior = torch.full_like(gains, 1.0 / max(gains.numel(), 1))
+        ranked = torch.softmax(gains / temperature, dim=0) if gains.numel() else gains
+        weights = 0.5 * prior + 0.5 * ranked
     return HelperCalibrationResult(gains, median_gains, positive_fractions, reliable_mask, weights)
 
 

@@ -174,6 +174,11 @@ def validate_gen2_config(raw: Mapping[str, Any]) -> Gen2RuntimeConfig:
     diversity = phase_a.get("token_diversity") or {}
     _require(not diversity.get("enabled", False), "token_diversity is not implemented in Gen2 V1")
     _require(float(phase_b.get("temporal_mean_weight", 0.0)) == 0.0, "temporal_mean_weight is diagnostic-only and must be zero")
+    save = config.get("save") or {}
+    for phase_name in ("phase_a", "phase_b"):
+        phase_save = save.get(phase_name) or {}
+        _require(int(phase_save.get("save_every", 0)) >= 0, f"save.{phase_name}.save_every cannot be negative")
+        _require(int(phase_save.get("max_step_saves_to_keep", 0)) >= 0, f"save.{phase_name}.max_step_saves_to_keep cannot be negative")
     return Gen2RuntimeConfig(
         mode=mode,
         placeholder=placeholder,
