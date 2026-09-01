@@ -30,9 +30,11 @@ class TriggerLocalTEAdapter(nn.Module):
     def forward(self, hidden_states: torch.Tensor, activator_mask: torch.Tensor) -> torch.Tensor:
         if hidden_states.ndim != 3 or activator_mask.shape != hidden_states.shape[:2]:
             raise ValueError("trigger-local adapter expects hidden states and (batch, sequence) mask")
-        mask = activator_mask.to(device=hidden_states.device, dtype=hidden_states.dtype).unsqueeze(-1)
-        residual = self.up(self.down(hidden_states)) * (self.alpha / self.rank)
-        return residual * mask
+        parameter_dtype = self.down.weight.dtype
+        adapter_input = hidden_states.to(dtype=parameter_dtype)
+        residual = self.up(self.down(adapter_input)) * (self.alpha / self.rank)
+        mask = activator_mask.to(device=hidden_states.device, dtype=residual.dtype).unsqueeze(-1)
+        return (residual * mask).to(dtype=hidden_states.dtype)
 
 
 @dataclass(frozen=True)

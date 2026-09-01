@@ -154,6 +154,18 @@ class MechanismSmokeTest(unittest.TestCase):
         output.square().mean().backward()
         self.assertTrue(all(parameter.grad is not None for parameter in bank.parameters()))
 
+    def test_trigger_local_adapter_supports_bfloat16_hidden_states(self):
+        from extensions_built_in.gen2_trainer.activator import TriggerLocalTEAdapter
+
+        module = TriggerLocalTEAdapter(8, rank=2, alpha=4).to(dtype=torch.float32)
+        hidden = torch.randn(1, 4, 8, dtype=torch.bfloat16, requires_grad=True)
+        mask = torch.tensor([[1, 0, 1, 0]], dtype=torch.long)
+        output = module(hidden, mask)
+        self.assertEqual(output.dtype, hidden.dtype)
+        output.square().mean().backward()
+        self.assertIsNotNone(module.up.weight.grad)
+        self.assertIsNotNone(module.down.weight.grad)
+
     def test_image_only_mask_and_gate(self):
         module = TemporalRankFieldLoRA(4, 4, rank=2)
         module.up.data.fill_(1.0)
