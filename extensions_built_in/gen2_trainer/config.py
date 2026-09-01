@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -97,6 +98,12 @@ def validate_gen2_config(raw: Mapping[str, Any]) -> Gen2RuntimeConfig:
     _require(isinstance(local_adapter, Mapping), "activator.trigger_local_adapter must be a mapping")
     _require(int(local_adapter.get("rank", 4)) >= 1, "trigger_local_adapter.rank must be positive")
     _require(float(local_adapter.get("alpha", 4.0)) >= 0.0, "trigger_local_adapter.alpha must be non-negative")
+    _require("lr" in local_adapter, "trigger_local_adapter.lr must be explicitly configured")
+    _require(float(local_adapter["lr"]) > 0.0, "trigger_local_adapter.lr must be positive")
+    _require(math.isfinite(float(local_adapter["lr"])), "trigger_local_adapter.lr must be finite")
+    _require("weight_decay" in local_adapter, "trigger_local_adapter.weight_decay must be explicitly configured")
+    _require(float(local_adapter["weight_decay"]) >= 0.0, "trigger_local_adapter.weight_decay must be non-negative")
+    _require(bool(local_adapter.get("enabled", True)), "trigger_local_adapter.enabled must be true for the composite activator")
     _require(local_adapter.get("token_mask", "activator_positions") == "activator_positions", "trigger-local adapter must use activator_positions mask")
     if mode in {"phase_b_from_activator", "resume_phase_b"}:
         _require(bool(activator.get("artifact_path")), f"{mode} requires activator.artifact_path")
@@ -161,8 +168,6 @@ def validate_gen2_config(raw: Mapping[str, Any]) -> Gen2RuntimeConfig:
     curriculum = phase_a.get("curriculum") or {}
     effect_geometry = phase_a.get("effect_geometry") or {}
     _require(isinstance(effect_geometry, Mapping), "phase_a.effect_geometry must be a mapping")
-    _require(int(effect_geometry.get("rank", 0)) >= 0, "phase_a.effect_geometry.rank cannot be negative")
-    _require(0.0 < float(effect_geometry.get("energy_threshold", 0.99)) <= 1.0, "phase_a.effect_geometry.energy_threshold must be in (0, 1]")
     _require(int(effect_geometry.get("evaluation_every", 10)) >= 1, "phase_a.effect_geometry.evaluation_every must be positive")
     _require(int(effect_geometry.get("release_consecutive", 3)) >= 1, "phase_a.effect_geometry.release_consecutive must be positive")
     _require(0.0 <= float(effect_geometry.get("ema_decay", 0.8)) < 1.0, "phase_a.effect_geometry.ema_decay must be in [0, 1)")
@@ -171,7 +176,6 @@ def validate_gen2_config(raw: Mapping[str, Any]) -> Gen2RuntimeConfig:
     _require(0.0 < float(effect_geometry.get("min_magnitude_ratio", 0.1)) <= float(effect_geometry.get("target_magnitude_ratio", 0.5)) <= float(effect_geometry.get("max_magnitude_ratio", 2.0)), "phase_a.effect_geometry magnitude ratios are invalid")
     _require(float(effect_geometry.get("release_min_magnitude_ratio", 0.1)) > 0.0, "phase_a.effect_geometry.release_min_magnitude_ratio must be positive")
     _require(float(effect_geometry.get("release_max_magnitude_ratio", 2.0)) >= float(effect_geometry.get("release_min_magnitude_ratio", 0.1)), "phase_a.effect_geometry release magnitude range is invalid")
-    _require(float(effect_geometry.get("release_min_alignment", 0.5)) >= 0.0, "phase_a.effect_geometry.release_min_alignment must be non-negative")
     effective_batch_size = int(curriculum.get("effective_batch_size", train.get("batch_size", 1)))
     _require(effective_batch_size >= int(phase_a.get("batch_size", train.get("batch_size", 1))), "phase_a effective batch must cover the physical batch")
     microbatch_size = int(curriculum.get("microbatch_size", phase_a.get("batch_size", train.get("batch_size", 1))))
@@ -179,8 +183,8 @@ def validate_gen2_config(raw: Mapping[str, Any]) -> Gen2RuntimeConfig:
     _require(effective_batch_size % microbatch_size == 0, "phase_a effective_batch_size must be divisible by microbatch_size")
     for weight_name in ("dataset_weight", "teacher_weight", "content_preserve_weight", "cross_content_weight", "trust_region_weight"):
         _require(float(curriculum.get(weight_name, 0.0)) >= 0.0, f"phase_a.curriculum.{weight_name} must be non-negative")
-    _require(int(curriculum.get("independent_tail_steps", 0)) == 0, "phase_a independent dataset tail is disabled; Phase A is a private address")
-    _require(int(effect_geometry.get("cone_iterations", 24)) >= 1, "phase_a.effect_geometry.cone_iterations must be positive")
+    _require(int(effect_geometry.get("cone_iterations", 64)) >= 1, "phase_a.effect_geometry.cone_iterations must be positive")
+    _require(int((calibration.get("mixture_iterations", 128))) >= 1, "phase_a.calibration.mixture_iterations must be positive")
     diversity = phase_a.get("token_diversity") or {}
     _require(not diversity.get("enabled", False), "token_diversity is not implemented in Gen2 V1")
     _require(float(phase_b.get("temporal_mean_weight", 0.0)) == 0.0, "temporal_mean_weight is diagnostic-only and must be zero")

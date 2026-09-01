@@ -4,24 +4,80 @@ import torch
 import torch.nn.functional as F
 
 
+def _flatten_effects(helper_effects: torch.Tensor, target_effect: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    if helper_effects.ndim < 3 or target_effect.ndim < 2:
+        raise ValueError("helper effects must have shape (helpers, batch, ...) and target effect (batch, ...)")
+    if helper_effects.shape[1] != target_effect.shape[0]:
+        raise ValueError("helper and target batch dimensions must match")
+    helpers = helper_effects.float().permute(1, 0, *range(2, helper_effects.ndim)).flatten(2)
+    target = target_effect.float().flatten(1)
+    return helpers, target
+
+
+def positive_simplex_projection(values: torch.Tensor) -> torch.Tensor:
+    if values.ndim != 1 or values.numel() == 0:
+        raise ValueError("simplex projection expects a non-empty vector")
+    if not torch.isfinite(values).all():
+        raise ValueError("simplex projection inputs must be finite")
+    sorted_values, _ = torch.sort(values, descending=True)
+    cumulative = sorted_values.cumsum(0) - 1.0
+    indices = torch.arange(1, values.numel() + 1, device=values.device, dtype=values.dtype)
+    valid = sorted_values - cumulative / indices > 0
+    if not torch.any(valid):
+        raise RuntimeError("simplex projection found no positive support")
+    rho = int(torch.nonzero(valid, as_tuple=False)[-1].item())
+    threshold = cumulative[rho] / float(rho + 1)
+    return (values - threshold).clamp_min(0.0)
+
+
+def fit_shared_positive_helper_mixture(
+    helper_effects: torch.Tensor,
+    target_effect: torch.Tensor,
+    iterations: int = 128,
+    epsilon: float = 1e-8,
+) -> dict[str, torch.Tensor]:
+    """Fit one non-negative, sum-to-one helper mixture across all supplied contents."""
+    if iterations < 1:
+        raise ValueError("mixture fitting iterations must be positive")
+    helpers, target = _flatten_effects(helper_effects, target_effect)
+    helper_count = helpers.shape[1]
+    if helper_count < 1:
+        raise ValueError("at least one helper is required")
+    design = helpers.permute(1, 0, 2).reshape(helper_count, -1).T
+    response = target.reshape(-1)
+    if not torch.isfinite(design).all() or not torch.isfinite(response).all():
+        raise ValueError("helper mixture inputs must be finite")
+    gram = design.T @ design
+    rhs = design.T @ response
+    lipschitz = torch.linalg.matrix_norm(gram, ord=2).clamp_min(epsilon)
+    weights = torch.full((helper_count,), 1.0 / helper_count, device=design.device, dtype=design.dtype)
+    for _ in range(iterations):
+        weights = positive_simplex_projection(weights - (gram @ weights - rhs) / lipschitz)
+    prediction = torch.einsum("bhn,h->bn", helpers, weights)
+    residual = prediction - target
+    target_norm = target.norm(dim=1).mean().clamp_min(epsilon)
+    return {
+        "weights": weights,
+        "prediction": prediction,
+        "residual": residual,
+        "relative_fit": residual.norm(dim=1).mean() / target_norm,
+        "entropy": -(weights.clamp_min(epsilon) * weights.clamp_min(epsilon).log()).sum(),
+    }
+
+
 def positive_cone_projection(
     helper_effects: torch.Tensor,
     activator_effect: torch.Tensor,
-    iterations: int = 24,
+    iterations: int = 64,
     epsilon: float = 1e-8,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Project each activator effect onto the non-negative helper-effect cone."""
-    if helper_effects.ndim < 3 or activator_effect.ndim < 2:
-        raise ValueError("helper effects must have shape (helpers, batch, ...) and activator effect (batch, ...)")
-    if helper_effects.shape[1] != activator_effect.shape[0]:
-        raise ValueError("helper and activator batch dimensions must match")
     if iterations < 1:
         raise ValueError("cone projection iterations must be positive")
-    helpers = helper_effects.detach().float().permute(1, 0, *range(2, helper_effects.ndim)).flatten(2)
-    activator = activator_effect.float().flatten(1)
+    helpers, activator = _flatten_effects(helper_effects, activator_effect)
     gram = torch.bmm(helpers, helpers.transpose(1, 2))
     rhs = torch.bmm(helpers, activator.unsqueeze(2)).squeeze(2)
-    coefficients = torch.linalg.lstsq(gram, rhs.unsqueeze(2)).solution.squeeze(2).clamp_min(0.0)
+    coefficients = torch.zeros_like(rhs)
     lipschitz = gram.diagonal(dim1=1, dim2=2).sum(dim=1).clamp_min(epsilon)
     for _ in range(iterations):
         gradient = torch.bmm(gram, coefficients.unsqueeze(2)).squeeze(2) - rhs
@@ -33,7 +89,7 @@ def positive_cone_projection(
 def positive_cone_geometry(
     helper_effects: torch.Tensor,
     activator_effect: torch.Tensor,
-    iterations: int = 24,
+    iterations: int = 64,
     epsilon: float = 1e-8,
 ) -> dict[str, torch.Tensor]:
     projection, coefficients = positive_cone_projection(helper_effects, activator_effect, iterations, epsilon)
@@ -56,6 +112,13 @@ def positive_cone_geometry(
     }
 
 
+def effect_rms(effect: torch.Tensor, epsilon: float = 1e-8) -> torch.Tensor:
+    if effect.ndim < 2:
+        raise ValueError("effect must have a batch dimension")
+    rms = effect.float().flatten(1).square().mean(dim=1).sqrt()
+    return rms.clamp_min(epsilon)
+
+
 def normalized_teacher_distillation_loss(
     activator_prediction: torch.Tensor,
     teacher_prediction: torch.Tensor,
@@ -65,8 +128,8 @@ def normalized_teacher_distillation_loss(
     if activator_prediction.shape != teacher_prediction.shape:
         raise ValueError("activator and teacher predictions must have equal shapes")
     scale = torch.as_tensor(effect_scale, device=activator_prediction.device, dtype=torch.float32).clamp_min(epsilon)
-    error = (activator_prediction.float() - teacher_prediction.detach().float()).flatten(1).square().mean(dim=1)
-    return (error / scale.square()).mean()
+    error_rms = (activator_prediction.float() - teacher_prediction.detach().float()).flatten(1).square().mean(dim=1)
+    return (error_rms / scale.square()).mean()
 
 
 def effect_geometry_gate(

@@ -35,6 +35,8 @@ from .sampling import build_validation_matrix, make_flowmatch_noisy_latents, sam
 from .temporal_rank_field import time_smooth_regularizer, time_mean_diagnostic
 from .phase_a_math import (
     effect_geometry_gate,
+    effect_rms,
+    fit_shared_positive_helper_mixture,
     normalized_teacher_distillation_loss,
     positive_cone_geometry,
 )
@@ -134,7 +136,7 @@ class Gen2Trainer(BaseSDTrainProcess):
             self.soft_tokens.dimension,
             rank=int(local_config.get("rank", 4)),
             alpha=float(local_config.get("alpha", 4.0)),
-        ) if bool(local_config.get("enabled", False)) else None
+        ) if bool(local_config.get("enabled", True)) else None
         if self.trigger_local_adapter is not None:
             self.trigger_local_adapter.to(self.device_torch)
         network = self.config.get("network") or {}
@@ -193,7 +195,7 @@ class Gen2Trainer(BaseSDTrainProcess):
             local_config = ((self.config.get("activator") or {}).get("trigger_local_adapter") or {})
             params.append({
                 "params": list(self.trigger_local_adapter.parameters()),
-                "lr": float(local_config.get("lr", self.train_config.lr * 0.25)),
+                "lr": float(local_config["lr"]),
                 "weight_decay": float(local_config.get("weight_decay", 0.0)),
             })
         return params
@@ -432,6 +434,7 @@ class Gen2Trainer(BaseSDTrainProcess):
         features = [self._encode_soft_prompt(prompt) for prompt in prompts]
         embeds = type(base_embeds)(text_embeds=features)
         prediction = self.sd.get_noise_prediction(noisy_latents, timesteps, embeds)
+        clear_adapter_context(self.sd.transformer)
         if target is None:
             return prediction
         return torch.nn.functional.mse_loss(prediction.float(), target.float(), reduction="none").flatten(1).mean(1)
@@ -455,51 +458,80 @@ class Gen2Trainer(BaseSDTrainProcess):
         return self.placeholder_contract.replace(prompt, literal)
 
     def _run_helper_calibration(self, probes):
-        geometry = self._calibrate_helper_effect_geometry(probes)
-        valid_fraction = float(geometry.get("valid_fraction", 0.0))
-        if valid_fraction < 1.0:
-            raise RuntimeError(f"Phase A helper-effect calibration found degenerate teacher probes: valid_fraction={valid_fraction:.3f}")
-        status = "teacher_bank_geometry" if valid_fraction > 0.0 else "dataset_only_fallback"
-        effect_norms = torch.as_tensor(geometry.get("effect_norms", []), dtype=torch.float32)
-        helper_scales = effect_norms.median(dim=0).values if effect_norms.numel() else torch.ones(len(self.helpers))
-        self._helper_calibration = {
-            "status": status,
-            "valid_fraction": valid_fraction,
-            "effect_geometry": geometry,
-            "helper_scales": helper_scales,
-        }
+        if not probes or not self.helpers:
+            raise RuntimeError("Phase A helper calibration requires probes and at least one helper")
+        calibration = self._calibrate_helper_effect_geometry(probes)
+        if calibration["valid_fraction"] < 1.0:
+            raise RuntimeError(
+                "Phase A helper-effect calibration found degenerate teacher probes: "
+                f"valid_fraction={calibration['valid_fraction']:.3f}"
+            )
+        self._helper_calibration = calibration
         if self.accelerator.is_main_process:
-            print(f"Phase A helper-effect calibration: {status}; valid_fraction={valid_fraction:.3f}")
-        return geometry
+            weights = calibration["mixture_weights"]
+            print(
+                "Phase A helper calibration: shared positive mixture; "
+                f"valid_fraction={calibration['valid_fraction']:.3f}; "
+                f"weights={[round(value, 4) for value in weights]}"
+            )
+        return calibration
 
     def _calibrate_helper_effect_geometry(self, probes):
-        if not probes or not self.helpers:
-            return {"valid_fraction": 0.0, "effect_norms": [], "pairwise_cosine": [], "gram_spectrum": []}
+        helper_effect_batches = []
+        target_effect_batches = []
         norms = []
-        pairwise = []
-        spectra = []
+        timestep_values = []
         valid_probes = []
         with torch.no_grad():
-            for noisy, timesteps, _target, prompt in probes:
+            for noisy, timesteps, target, prompt in probes:
                 literal = self._prompt_prediction([self._literal_prompt(prompt)], noisy, timesteps)
                 effects = []
                 for helper in self.helpers:
                     helper_prompt = self.placeholder_contract.replace(prompt, helper["replacement"])
                     effects.append(self._prompt_prediction([helper_prompt], noisy, timesteps) - literal)
-                stacked = torch.stack(effects).flatten(1)
-                effect_norms = stacked.norm(dim=1)
-                valid_probe = bool(torch.isfinite(stacked).all() and torch.all(effect_norms > 1e-8))
-                valid_probes.append(valid_probe)
-                norms.append(effect_norms.cpu())
-                normalized = F.normalize(stacked, dim=1)
-                pairwise.append((normalized @ normalized.T).cpu())
-                gram_eigenvalues = torch.linalg.eigvalsh(stacked @ stacked.T).clamp_min(0.0).flip(0)
-                spectra.append(gram_eigenvalues.cpu())
+                stacked = torch.stack(effects)
+                target_effect = target - literal
+                effect_norm = stacked.float().flatten(2).norm(dim=2)
+                valid = bool(torch.isfinite(stacked).all() and torch.isfinite(target_effect).all() and torch.all(effect_norm > 1e-8))
+                valid_probes.append(valid)
+                if valid:
+                    helper_effect_batches.append(stacked)
+                    target_effect_batches.append(target_effect)
+                    norms.append(effect_norm.cpu())
+                    timestep_values.append(timesteps.detach().float().cpu())
+        valid_fraction = float(sum(valid_probes) / max(len(valid_probes), 1))
+        if not helper_effect_batches:
+            raise RuntimeError("Phase A helper calibration produced no finite, non-degenerate probes")
+        helper_effects = torch.cat(helper_effect_batches, dim=1)
+        target_effects = torch.cat(target_effect_batches, dim=0)
+        mixture = fit_shared_positive_helper_mixture(
+            helper_effects,
+            target_effects,
+            iterations=int((self.gen2_config.phase_a.get("calibration") or {}).get("mixture_iterations", 128)),
+        )
+        effect_norm_tensor = torch.cat(norms, dim=1)
+        common_rms = effect_rms(helper_effects.mean(dim=0))
+        timestep_tensor = torch.cat(timestep_values)
+        bins = int(self.gen2_config.phase_a.get("timestep_bins", 10))
+        bin_ids = torch.clamp((timestep_tensor / 1000.0 * bins).long(), max=bins - 1)
+        bin_scales = []
+        for bin_index in range(bins):
+            selected = common_rms[bin_ids == bin_index]
+            bin_scales.append(float(torch.quantile(selected, 0.5).item()) if selected.numel() else float(common_rms.median().item()))
+        normalized = F.normalize(effect_norm_tensor, dim=1)
+        pairwise = normalized @ normalized.T
         return {
-            "valid_fraction": float(sum(valid_probes) / max(len(valid_probes), 1)),
-            "effect_norms": torch.stack(norms).tolist(),
-            "pairwise_cosine": torch.stack(pairwise).tolist(),
-            "gram_spectrum": torch.stack(spectra).tolist(),
+            "status": "dataset_selected_shared_positive_mixture",
+            "valid_fraction": valid_fraction,
+            "mixture_weights": mixture["weights"].cpu().tolist(),
+            "mixture_weight_entropy": float(mixture["entropy"].item()),
+            "mixture_fit_residual_norm": float(mixture["residual"].float().flatten(1).norm(dim=1).mean().item()),
+            "mixture_fit_relative_residual": float(mixture["relative_fit"].item()),
+            "effect_norms": effect_norm_tensor.T.tolist(),
+            "helper_scales": torch.quantile(effect_norm_tensor, 0.5, dim=1).tolist(),
+            "timestep_bin_scales": bin_scales,
+            "timestep_bins": bins,
+            "pairwise_cosine": pairwise.cpu().tolist(),
         }
 
     def _evaluate_effect_geometry(self, probes):
@@ -522,7 +554,7 @@ class Gen2Trainer(BaseSDTrainProcess):
                 geometry = positive_cone_geometry(
                     helper_effects,
                     activator_prediction - literal_prediction,
-                    iterations=int(self.gen2_config.phase_a.get("effect_geometry", {}).get("cone_iterations", 24)),
+                    iterations=int(self.gen2_config.phase_a.get("effect_geometry", {}).get("cone_iterations", 64)),
                 )
                 valid = geometry["valid"]
                 activator_norm = geometry["activator_norm"]
@@ -608,7 +640,16 @@ class Gen2Trainer(BaseSDTrainProcess):
                 optimizer.zero_grad(set_to_none=True)
                 dataset_loss = torch.zeros((), device=self.device_torch)
                 teacher_loss = torch.zeros_like(dataset_loss)
-                selected_helper_index = step % max(len(self.helpers), 1)
+                calibration = self._helper_calibration or {}
+                mixture_weights = torch.as_tensor(
+                    calibration.get("mixture_weights", [1.0 / len(self.helpers)] * len(self.helpers)),
+                    device=self.device_torch,
+                    dtype=torch.float32,
+                )
+                if mixture_weights.numel() != len(self.helpers) or not torch.isfinite(mixture_weights).all() or mixture_weights.sum() <= 0:
+                    raise RuntimeError("Phase A calibration has invalid shared helper mixture weights")
+                mixture_weights = mixture_weights / mixture_weights.sum()
+                selected_helper_index = int(torch.multinomial(mixture_weights, 1).item())
                 preserve_loss = torch.zeros_like(dataset_loss)
                 trust_region_loss = torch.zeros_like(dataset_loss)
                 cross_content_deltas = []
@@ -625,12 +666,16 @@ class Gen2Trainer(BaseSDTrainProcess):
                     with torch.no_grad():
                         helper_prediction = self._prompt_prediction(helper_prompts, noisy, timesteps)
                         literal_ordinary_features = self._native_ordinary_pooled(prompts, literal_texts)
-                    helper_scales = torch.as_tensor(
-                        (self._helper_calibration or {}).get("helper_scales", [1.0] * len(self.helpers)),
+                    timestep_bins = int(calibration.get("timestep_bins", settings.get("timestep_bins", 10)))
+                    bin_index = torch.clamp((timesteps.float() / 1000.0 * timestep_bins).long(), max=timestep_bins - 1)
+                    bin_scales = torch.as_tensor(
+                        calibration.get("timestep_bin_scales", [1.0] * timestep_bins),
                         device=helper_prediction.device,
-                        dtype=helper_prediction.dtype,
+                        dtype=torch.float32,
                     )
-                    teacher_scale = helper_scales[selected_helper_index]
+                    if bin_scales.numel() != timestep_bins or not torch.isfinite(bin_scales).all():
+                        raise RuntimeError("Phase A calibration has invalid timestep-bin RMS scales")
+                    teacher_scale = bin_scales[bin_index].to(dtype=helper_prediction.dtype)
                     current_teacher_loss = normalized_teacher_distillation_loss(activator_prediction, helper_prediction, teacher_scale)
                     teacher_loss = teacher_loss + current_teacher_loss / accumulation
                     teacher_effect_norms.append((helper_prediction - activator_prediction.detach()).float().flatten(1).norm(dim=1).mean())
@@ -677,11 +722,18 @@ class Gen2Trainer(BaseSDTrainProcess):
                     "dataset_loss": float(dataset_loss.detach().item()),
                     "teacher_loss": float(teacher_loss.detach().item()),
                     "teacher_effect_norm": float(torch.stack(teacher_effect_norms).mean().item()) if teacher_effect_norms else 0.0,
+                    "mixture_weights": list(calibration.get("mixture_weights", [])),
+                    "mixture_weight_entropy": float(calibration.get("mixture_weight_entropy", 0.0)),
+                    "mixture_fit_residual_norm": float(calibration.get("mixture_fit_residual_norm", 0.0)),
+                    "teacher_prediction_gap_norm": float(torch.stack(teacher_effect_norms).mean().item()) if teacher_effect_norms else 0.0,
                     "content_preserve_loss": float(preserve_loss.detach().item()),
                     "cross_content_loss": float(cross_content_loss.detach().item()),
                     "selected_helper_index": selected_helper_index,
                     "selected_helper_id": self.helpers[selected_helper_index]["id"] if self.helpers else None,
                     "trust_region_loss": float(trust_region_loss.detach().item()),
+                    "activator_gradient_norm": float(phase_a_gradient_norm.item()),
+                    "embedding_gradient_norm": float(self.soft_tokens.A.grad.detach().float().norm().item()) if self.soft_tokens.A.grad is not None else 0.0,
+                    "adapter_gradient_norm": float(torch.stack([parameter.grad.detach().float().norm() for parameter in self.trigger_local_adapter.parameters() if parameter.grad is not None]).norm().item()) if self.trigger_local_adapter is not None and any(parameter.grad is not None for parameter in self.trigger_local_adapter.parameters()) else 0.0,
                     "helper_latched": float(self._helper_latched),
                     "helper_release_streak": float(self._helper_release_streak),
                     "effect_gate_checks": dict(self._last_effect_gate_checks),
@@ -716,6 +768,10 @@ class Gen2Trainer(BaseSDTrainProcess):
                 trainable = [self.soft_tokens.A]
                 if self.trigger_local_adapter is not None:
                     trainable.extend(self.trigger_local_adapter.parameters())
+                gradient_norms = [parameter.grad.detach().float().norm() for parameter in trainable if parameter.grad is not None]
+                if not gradient_norms:
+                    raise RuntimeError("Phase A backward produced no activator gradients")
+                phase_a_gradient_norm = torch.stack(gradient_norms).norm()
                 torch.nn.utils.clip_grad_norm_(trainable, self.train_config.max_grad_norm)
                 optimizer.step()
                 if self.lr_scheduler is not None:
@@ -732,33 +788,7 @@ class Gen2Trainer(BaseSDTrainProcess):
                     self._phase_checkpoint("a", current_step, tensors, {"phase": "a", "step": current_step, "helper_latched": self._helper_latched, "effect_gate_reason": self._phase_a_release_reason, "effect_gate_passed": self._last_effect_gate_passed, "effect_gate_checks": self._last_effect_gate_checks, "diagnostics": self._last_phase_a_diagnostics, "history_length": len(self._phase_a_history)}, optimizer)
                 progress.set_postfix(step=current_step, total=steps, dataset=f"{dataset_loss.item():.4g}", teacher=f"{teacher_loss.item():.4g}", latch=int(self._helper_latched))
                 progress.update(1)
-        tail_steps = 0
-        if int(curriculum.get("independent_tail_steps", 0)) > 0:
-            self._phase_a_release_reason = "tail_disabled_by_private_address_design"
-        with ToolkitProgressBar(total=tail_steps, desc="Phase A dataset-only tail") as tail_progress:
-            for _ in range(tail_steps):
-                optimizer.zero_grad(set_to_none=True)
-                tail_loss = torch.zeros((), device=self.device_torch)
-                last_batch = None
-                for _ in range(accumulation):
-                    batch, iterator = self._next_batch(iterator, self.data_loader)
-                    last_batch = batch
-                    noisy, noise, timesteps, prompts, _ = self._prepare_real_batch(batch, "a")
-                    target = self.sd.get_loss_target(noise=noise, batch=batch)
-                    tail_loss = tail_loss + self._activator_prediction(prompts, noisy, timesteps, target).mean() / accumulation
-                    if hasattr(batch, "cleanup"):
-                        batch.cleanup()
-                self.accelerator.backward(tail_loss)
-                trainable = [self.soft_tokens.A]
-                if self.trigger_local_adapter is not None:
-                    trainable.extend(self.trigger_local_adapter.parameters())
-                torch.nn.utils.clip_grad_norm_(trainable, self.train_config.max_grad_norm)
-                optimizer.step()
-                if self.lr_scheduler is not None:
-                    self.lr_scheduler.step()
-                tail_progress.set_postfix(loss=f"{tail_loss.item():.4g}")
-                tail_progress.update(1)
-        tensors = {"A": self.soft_tokens.A}
+        tensors = {"A": self.soft_tokens.A.detach().cpu()}
         metadata = {"artifact": "gen2_activator", "schema_version": 3, "initializer": "literal_trigger_resampled", "literal": ((self.config.get("activator") or {}).get("initialization") or {}).get("literal"), "placeholder": self.placeholder_contract.placeholder, "tokens": self.soft_tokens.tokens, "dimension": self.soft_tokens.dimension, "trigger_local_adapter": self.trigger_local_adapter is not None, "trigger_local_adapter_rank": self.trigger_local_adapter.rank if self.trigger_local_adapter is not None else 0, "trigger_local_adapter_alpha": self.trigger_local_adapter.alpha if self.trigger_local_adapter is not None else 0.0, "helper_latched": self._helper_latched, "helper_release_streak": self._helper_release_streak, "effect_gate_reason": self._phase_a_release_reason, "effect_gate_passed": self._last_effect_gate_passed, "effect_gate_checks": self._last_effect_gate_checks, "phase_a_diagnostics": self._last_phase_a_diagnostics}
         if self._helper_calibration is not None:
             metadata["helper_calibration"] = {key: value.detach().cpu().tolist() if torch.is_tensor(value) else value for key, value in self._helper_calibration.items()}
@@ -1187,7 +1217,7 @@ class Gen2Trainer(BaseSDTrainProcess):
     def _initialize_soft_tokens(self) -> None:
         model = self.config.get("model") or {}
         dimension = int(model.get("qwen_hidden_size", 4096))
-        tokens = int((self.config.get("activator") or {}).get("tokens", 8))
+        tokens = int((self.config.get("activator") or {}).get("tokens", 24))
         self.soft_tokens = SoftTokenBank(tokens, dimension)
 
     def _initialize_soft_tokens_from_literal_trigger(self) -> None:

@@ -4,6 +4,7 @@ import torch
 
 from extensions_built_in.gen2_trainer.phase_a_math import (
     effect_geometry_gate,
+    fit_shared_positive_helper_mixture,
     normalized_teacher_distillation_loss,
     positive_cone_geometry,
     positive_cone_projection,
@@ -11,6 +12,17 @@ from extensions_built_in.gen2_trainer.phase_a_math import (
 
 
 class PhaseAMathTest(unittest.TestCase):
+    def test_shared_positive_mixture_is_normalized_and_cross_content(self):
+        helpers = torch.tensor([
+            [[1.0, 0.0], [2.0, 0.0]],
+            [[0.0, 1.0], [0.0, 2.0]],
+        ])
+        target = torch.tensor([[1.0, 0.5], [2.0, 1.0]])
+        result = fit_shared_positive_helper_mixture(helpers, target)
+        self.assertTrue(torch.all(result["weights"] >= 0))
+        self.assertAlmostEqual(float(result["weights"].sum()), 1.0, places=5)
+        self.assertTrue(torch.isfinite(result["relative_fit"]))
+
     def test_positive_cone_rejects_opposite_direction(self):
         helpers = torch.tensor([[[1.0, 0.0]], [[0.0, 1.0]]])
         projection, coefficients = positive_cone_projection(helpers, torch.tensor([[-1.0, 0.0]]))
