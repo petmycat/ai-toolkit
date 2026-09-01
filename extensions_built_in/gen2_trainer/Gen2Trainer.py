@@ -732,9 +732,6 @@ class Gen2Trainer(BaseSDTrainProcess):
                     "selected_helper_index": selected_helper_index,
                     "selected_helper_id": self.helpers[selected_helper_index]["id"] if self.helpers else None,
                     "trust_region_loss": float(trust_region_loss.detach().item()),
-                    "activator_gradient_norm": float(phase_a_gradient_norm.item()),
-                    "embedding_gradient_norm": float(self.soft_tokens.A.grad.detach().float().norm().item()) if self.soft_tokens.A.grad is not None else 0.0,
-                    "adapter_gradient_norm": float(torch.stack([parameter.grad.detach().float().norm() for parameter in self.trigger_local_adapter.parameters() if parameter.grad is not None]).norm().item()) if self.trigger_local_adapter is not None and any(parameter.grad is not None for parameter in self.trigger_local_adapter.parameters()) else 0.0,
                     "helper_latched": float(self._helper_latched),
                     "helper_release_streak": float(self._helper_release_streak),
                     "effect_gate_checks": dict(self._last_effect_gate_checks),
@@ -752,12 +749,6 @@ class Gen2Trainer(BaseSDTrainProcess):
                     self._last_phase_a_diagnostics["heldout_effect_geometry"] = heldout_geometry
                 if self._phase_a_heldout_geometry_ema is not None:
                     self._last_phase_a_diagnostics["heldout_effect_geometry_ema"] = self._phase_a_heldout_geometry_ema
-                self._phase_a_history.append({"step": step + 1, **self._last_phase_a_diagnostics})
-                calibration_snapshot = None
-                if self._helper_calibration is not None:
-                    calibration_snapshot = {key: value.detach().cpu().tolist() if torch.is_tensor(value) else value for key, value in self._helper_calibration.items()}
-                if self.accelerator.is_main_process:
-                    (self.phase_a_root / "diagnostics.json").write_text(json.dumps({"calibration": calibration_snapshot, "history": self._phase_a_history}, ensure_ascii=False, indent=2), encoding="utf-8")
                 total_loss = (
                     float(curriculum.get("dataset_weight", 0.1)) * dataset_loss
                     + float(curriculum.get("teacher_weight", 1.0)) * teacher_loss
@@ -773,11 +764,25 @@ class Gen2Trainer(BaseSDTrainProcess):
                 if not gradient_norms:
                     raise RuntimeError("Phase A backward produced no activator gradients")
                 phase_a_gradient_norm = torch.stack(gradient_norms).norm()
+                embedding_gradient_norm = self.soft_tokens.A.grad.detach().float().norm() if self.soft_tokens.A.grad is not None else torch.zeros((), device=self.device_torch)
+                adapter_gradients = [parameter.grad.detach().float().norm() for parameter in self.trigger_local_adapter.parameters() if parameter.grad is not None] if self.trigger_local_adapter is not None else []
+                adapter_gradient_norm = torch.stack(adapter_gradients).norm() if adapter_gradients else torch.zeros((), device=self.device_torch)
+                self._last_phase_a_diagnostics.update({
+                    "activator_gradient_norm": float(phase_a_gradient_norm.item()),
+                    "embedding_gradient_norm": float(embedding_gradient_norm.item()),
+                    "adapter_gradient_norm": float(adapter_gradient_norm.item()),
+                })
                 torch.nn.utils.clip_grad_norm_(trainable, self.train_config.max_grad_norm)
                 optimizer.step()
                 if self.lr_scheduler is not None:
                     self.lr_scheduler.step()
                 current_step = step + 1
+                self._phase_a_history.append({"step": current_step, **self._last_phase_a_diagnostics})
+                calibration_snapshot = None
+                if self._helper_calibration is not None:
+                    calibration_snapshot = {key: value.detach().cpu().tolist() if torch.is_tensor(value) else value for key, value in self._helper_calibration.items()}
+                if self.accelerator.is_main_process:
+                    (self.phase_a_root / "diagnostics.json").write_text(json.dumps({"calibration": calibration_snapshot, "history": self._phase_a_history}, ensure_ascii=False, indent=2), encoding="utf-8")
                 if self.accelerator.is_main_process:
                     self.logger.log({f"gen2/phase_a/{key}": value for key, value in self._last_phase_a_diagnostics.items()})
                     self.logger.commit()
