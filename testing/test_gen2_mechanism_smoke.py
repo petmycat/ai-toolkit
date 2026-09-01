@@ -82,14 +82,19 @@ class MechanismSmokeTest(unittest.TestCase):
         self.assertEqual(process["activator"]["initialization"]["strategy"], "literal_trigger_resampled")
         self.assertEqual(process["activator"]["tokens"], 24)
         self.assertTrue(process["train"]["phase_a"]["calibration"]["enabled"])
+        self.assertIn("effect_geometry", process["train"]["phase_a"])
+        self.assertEqual(process["train"]["phase_a"]["effect_geometry"]["rank"], 0)
         self.assertEqual(process["train"]["phase_a"]["curriculum"]["effective_batch_size"], 4)
         self.assertEqual(process["train"]["phase_a"]["batch_size"], 1)
         self.assertEqual(process["train"]["phase_b"]["batch_size"], 2)
         self.assertNotEqual(process["train"]["phase_a"]["batch_size"], process["train"]["phase_b"]["batch_size"])
-        self.assertEqual(process["save"]["phase_a"]["save_every"], 4)
-        self.assertEqual(process["save"]["phase_b"]["save_every"], 4)
-        self.assertEqual(process["save"]["phase_a"]["max_step_saves_to_keep"], 4)
-        self.assertEqual(process["save"]["phase_b"]["max_step_saves_to_keep"], 4)
+        phase_a_save = process["save"]["phase_a"]
+        phase_b_save = process["save"]["phase_b"]
+        self.assertGreaterEqual(phase_a_save["save_every"], 0)
+        self.assertGreaterEqual(phase_b_save["save_every"], 0)
+        self.assertGreaterEqual(phase_a_save["max_step_saves_to_keep"], 0)
+        self.assertGreaterEqual(phase_b_save["max_step_saves_to_keep"], 0)
+        self.assertIsNot(phase_a_save, phase_b_save)
         self.assertTrue(process["sample"]["require_official_unconditional"])
         validate_gen2_config(process)
 

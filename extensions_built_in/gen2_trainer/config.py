@@ -158,18 +158,27 @@ def validate_gen2_config(raw: Mapping[str, Any]) -> Gen2RuntimeConfig:
     _require(bool(calibration.get("enabled", True)), "phase_a.calibration.enabled must be true")
     _require(int(calibration.get("probe_count", 8)) >= 1, "phase_a.calibration.probe_count must be positive")
     _require(int(calibration.get("heldout_count", 4)) >= 0, "phase_a.calibration.heldout_count cannot be negative")
-    _require(float(calibration.get("temperature", 0.1)) > 0.0, "phase_a.calibration.temperature must be positive")
-    _require(0.0 <= float(calibration.get("min_positive_fraction", 0.6)) <= 1.0, "phase_a.calibration.min_positive_fraction must be in 0..1")
     curriculum = phase_a.get("curriculum") or {}
+    effect_geometry = phase_a.get("effect_geometry") or {}
+    _require(isinstance(effect_geometry, Mapping), "phase_a.effect_geometry must be a mapping")
+    _require(int(effect_geometry.get("rank", 0)) >= 0, "phase_a.effect_geometry.rank cannot be negative")
+    _require(0.0 < float(effect_geometry.get("energy_threshold", 0.99)) <= 1.0, "phase_a.effect_geometry.energy_threshold must be in (0, 1]")
+    _require(int(effect_geometry.get("evaluation_every", 10)) >= 1, "phase_a.effect_geometry.evaluation_every must be positive")
+    _require(int(effect_geometry.get("release_consecutive", 3)) >= 1, "phase_a.effect_geometry.release_consecutive must be positive")
+    _require(0.0 <= float(effect_geometry.get("ema_decay", 0.8)) < 1.0, "phase_a.effect_geometry.ema_decay must be in [0, 1)")
+    _require(0.0 <= float(effect_geometry.get("release_min_alignment", 0.5)) <= 1.0, "phase_a.effect_geometry.release_min_alignment must be in 0..1")
+    _require(0.0 <= float(effect_geometry.get("release_max_orthogonal_fraction", 0.5)) <= 1.0, "phase_a.effect_geometry.release_max_orthogonal_fraction must be in 0..1")
+    _require(0.0 < float(effect_geometry.get("min_magnitude_ratio", 0.1)) <= float(effect_geometry.get("target_magnitude_ratio", 0.5)) <= float(effect_geometry.get("max_magnitude_ratio", 2.0)), "phase_a.effect_geometry magnitude ratios are invalid")
+    _require(float(effect_geometry.get("release_min_magnitude_ratio", 0.1)) > 0.0, "phase_a.effect_geometry.release_min_magnitude_ratio must be positive")
+    _require(float(effect_geometry.get("release_max_magnitude_ratio", 2.0)) >= float(effect_geometry.get("release_min_magnitude_ratio", 0.1)), "phase_a.effect_geometry release magnitude range is invalid")
+    _require(float(effect_geometry.get("release_min_alignment", 0.5)) >= 0.0, "phase_a.effect_geometry.release_min_alignment must be non-negative")
     effective_batch_size = int(curriculum.get("effective_batch_size", train.get("batch_size", 1)))
     _require(effective_batch_size >= int(phase_a.get("batch_size", train.get("batch_size", 1))), "phase_a effective batch must cover the physical batch")
     microbatch_size = int(curriculum.get("microbatch_size", phase_a.get("batch_size", train.get("batch_size", 1))))
     _require(microbatch_size == int(phase_a.get("batch_size", train.get("batch_size", 1))), "phase_a.curriculum.microbatch_size must equal phase_a.batch_size in the current dataloader contract")
     _require(effective_batch_size % microbatch_size == 0, "phase_a effective_batch_size must be divisible by microbatch_size")
-    for weight_name in ("semantic_weight", "dataset_weight", "content_preserve_weight", "disturbance_weight", "cross_content_weight", "trust_region_weight"):
+    for weight_name in ("dataset_weight", "effect_alignment_weight", "effect_orthogonal_weight", "effect_magnitude_weight", "content_preserve_weight", "cross_content_weight", "trust_region_weight"):
         _require(float(curriculum.get(weight_name, 0.0)) >= 0.0, f"phase_a.curriculum.{weight_name} must be non-negative")
-    _require(float(curriculum.get("release_threshold", 1.0)) > float(curriculum.get("decay_threshold", 0.25)), "phase_a curriculum release threshold must exceed decay threshold")
-    _require(int(curriculum.get("release_consecutive", 3)) >= 1, "phase_a curriculum release_consecutive must be positive")
     _require(int(curriculum.get("independent_tail_steps", 0)) >= 0, "phase_a curriculum independent_tail_steps cannot be negative")
     diversity = phase_a.get("token_diversity") or {}
     _require(not diversity.get("enabled", False), "token_diversity is not implemented in Gen2 V1")

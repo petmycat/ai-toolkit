@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from jobs.process.BaseSDTrainProcess import BaseSDTrainProcess
@@ -32,7 +33,13 @@ from toolkit.scheduler import get_lr_scheduler
 from .registry import AdapterRuntimeContext, enable_adapter_training, install_ideogram_adapters
 from .sampling import build_validation_matrix, make_flowmatch_noisy_latents, sample_stratified_timesteps
 from .temporal_rank_field import time_smooth_regularizer, time_mean_diagnostic
-from .phase_a_math import calibrate_helper_losses, disturbance_projection, robust_competence, semantic_direction_loss, smooth_helper_weight
+from .phase_a_math import (
+    effect_geometry_gate,
+    effect_magnitude_loss as effect_magnitude_penalty,
+    geometric_alignment_loss,
+    geometric_orthogonal_loss,
+    helper_effect_geometry,
+)
 
 
 class Gen2Trainer(BaseSDTrainProcess):
@@ -51,10 +58,16 @@ class Gen2Trainer(BaseSDTrainProcess):
         self._helper_calibration: dict[str, Any] | None = None
         self._helper_latched = False
         self._helper_release_streak = 0
-        self._heldout_competence: float | None = None
         self._last_phase_a_diagnostics: dict[str, float] = {}
         self._phase_a_history: list[dict[str, Any]] = []
         self._phase_b_history: list[dict[str, Any]] = []
+        self._phase_a_geometry: dict[str, Any] | None = None
+        self._phase_a_heldout_geometry: dict[str, Any] | None = None
+        self._phase_a_geometry_ema: dict[str, Any] | None = None
+        self._phase_a_heldout_geometry_ema: dict[str, Any] | None = None
+        self._phase_a_release_reason = "not_evaluated"
+        self._last_effect_gate_checks: dict[str, bool] = {}
+        self._last_effect_gate_passed = False
         self._phase_a_probes: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, str]] = []
         self._phase_a_heldout_probes: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, str]] = []
         self._phase_b_probes: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, str]] = []
@@ -444,75 +457,108 @@ class Gen2Trainer(BaseSDTrainProcess):
         return self.placeholder_contract.replace(prompt, literal)
 
     def _run_helper_calibration(self, probes):
-        calibration = self.gen2_config.phase_a.get("calibration") or {}
-        literal_losses = []
-        helper_losses = [[] for _ in self.helpers]
-        evaluations_per_probe = 1 + len(self.helpers)
-        total_evaluations = len(probes) * evaluations_per_probe
-        with ToolkitProgressBar(total=total_evaluations, desc="Phase A helper calibration") as progress:
-            with torch.no_grad():
-                for probe_index, (noisy, timesteps, target, prompt) in enumerate(probes, start=1):
-                    literal_prompt = self._literal_prompt(prompt)
-                    literal = self._prompt_prediction([literal_prompt], noisy, timesteps, target).detach()[0]
-                    literal_losses.append(literal)
-                    progress.update(1)
-                    progress.set_postfix(probe=f"{probe_index}/{len(probes)}", evaluation="literal")
-                    for helper_index, helper in enumerate(self.helpers, start=1):
-                        helper_prompt = self.placeholder_contract.replace(prompt, helper["replacement"])
-                        helper_losses[helper_index - 1].append(self._prompt_prediction([helper_prompt], noisy, timesteps, target).detach()[0])
-                        progress.update(1)
-                        progress.set_postfix(probe=f"{probe_index}/{len(probes)}", evaluation=f"helper {helper_index}/{len(self.helpers)}")
-        result = calibrate_helper_losses(
-            torch.stack(literal_losses),
-            torch.stack([torch.stack(losses) for losses in helper_losses]),
-            float(calibration.get("temperature", 0.1)),
-            float(calibration.get("min_gain", 0.0)),
-            float(calibration.get("min_positive_fraction", 0.6)),
-        )
-        reliable_count = int(result.reliable_mask.sum().item())
-        calibration_status = "helper_supervision" if reliable_count else ("prior_weighted_fallback" if self.helpers else "dataset_only_fallback")
-        if self.accelerator.is_main_process:
-            print(f"Phase A helper calibration: {reliable_count}/{len(self.helpers)} reliable helpers; mode={calibration_status}")
-            for helper_index, helper in enumerate(self.helpers):
-                print(
-                    f"  - {helper['id']}: mean_gain={result.gains[helper_index].item():.6g}, "
-                    f"median_gain={result.median_gains[helper_index].item():.6g}, "
-                    f"positive_fraction={result.positive_fractions[helper_index].item():.3f}, "
-                    f"weight={result.weights[helper_index].item():.6g}"
-                )
+        geometry = self._calibrate_helper_effect_geometry(probes)
+        valid_fraction = float(geometry.get("valid_fraction", 0.0))
+        if valid_fraction < 1.0:
+            raise RuntimeError(f"Phase A helper-effect calibration found degenerate teacher probes: valid_fraction={valid_fraction:.3f}")
+        status = "teacher_bank_geometry" if valid_fraction > 0.0 else "dataset_only_fallback"
         self._helper_calibration = {
-            "weights": result.weights.detach(),
-            "reliable_mask": result.reliable_mask.detach(),
-            "median_gains": result.median_gains.detach(),
-            "literal_losses": torch.stack(literal_losses),
-            "helper_losses": torch.stack([torch.stack(losses) for losses in helper_losses]),
-            "reliable_count": reliable_count,
-            "status": calibration_status,
+            "status": status,
+            "valid_fraction": valid_fraction,
+            "effect_geometry": geometry,
         }
-        return result
+        if self.accelerator.is_main_process:
+            print(f"Phase A helper-effect calibration: {status}; valid_fraction={valid_fraction:.3f}")
+        return geometry
 
-    def _competence_probe(self, probes):
-        reference = self._helper_calibration
-        if reference is None or not probes or not bool(self.helpers):
-            return 0.0
-        literal_losses = []
-        helper_losses = [[] for _ in self.helpers]
-        activator_losses = []
-        for noisy, timesteps, target, prompt in probes:
-            with torch.no_grad():
-                literal_losses.append(self._prompt_prediction([self._literal_prompt(prompt)], noisy, timesteps, target)[0])
-                activator_losses.append(self._activator_prediction([prompt], noisy, timesteps, target)[0])
-                for helper_index, helper in enumerate(self.helpers):
+    def _calibrate_helper_effect_geometry(self, probes):
+        if not probes or not self.helpers:
+            return {"valid_fraction": 0.0, "effect_norms": [], "pairwise_cosine": [], "gram_spectrum": []}
+        norms = []
+        pairwise = []
+        spectra = []
+        valid_probes = []
+        with torch.no_grad():
+            for noisy, timesteps, _target, prompt in probes:
+                literal = self._prompt_prediction([self._literal_prompt(prompt)], noisy, timesteps)
+                effects = []
+                for helper in self.helpers:
                     helper_prompt = self.placeholder_contract.replace(prompt, helper["replacement"])
-                    helper_losses[helper_index].append(self._prompt_prediction([helper_prompt], noisy, timesteps, target)[0])
-        literal = torch.stack(literal_losses)
-        helpers = torch.stack([torch.stack(losses) for losses in helper_losses])
-        weighted_helper = (helpers * reference["weights"].to(helpers.device).unsqueeze(1)).sum(dim=0)
-        try:
-            competence, _ = robust_competence(literal, torch.stack(activator_losses), weighted_helper)
-        except RuntimeError:
-            return 0.0
-        return float(competence.item())
+                    effects.append(self._prompt_prediction([helper_prompt], noisy, timesteps) - literal)
+                stacked = torch.stack(effects).flatten(1)
+                effect_norms = stacked.norm(dim=1)
+                valid_probe = bool(torch.isfinite(stacked).all() and torch.all(effect_norms > 1e-8))
+                valid_probes.append(valid_probe)
+                norms.append(effect_norms.cpu())
+                normalized = F.normalize(stacked, dim=1)
+                pairwise.append((normalized @ normalized.T).cpu())
+                gram_eigenvalues = torch.linalg.eigvalsh(stacked @ stacked.T).clamp_min(0.0).flip(0)
+                spectra.append(gram_eigenvalues.cpu())
+        return {
+            "valid_fraction": float(sum(valid_probes) / max(len(valid_probes), 1)),
+            "effect_norms": torch.stack(norms).tolist(),
+            "pairwise_cosine": torch.stack(pairwise).tolist(),
+            "gram_spectrum": torch.stack(spectra).tolist(),
+        }
+
+    def _evaluate_effect_geometry(self, probes):
+        if not probes or not self.helpers:
+            return {"alignment": 0.0, "orthogonal_fraction": 1.0, "magnitude_ratio": 0.0, "valid_fraction": 0.0, "rank": 0.0}
+        alignments = []
+        orthogonal_fractions = []
+        magnitude_ratios = []
+        valid_fractions = []
+        ranks = []
+        with torch.no_grad():
+            for noisy, timesteps, target, prompt in probes:
+                literal_prediction = self._prompt_prediction([self._literal_prompt(prompt)], noisy, timesteps)
+                helper_predictions = []
+                for helper in self.helpers:
+                    helper_prompt = self.placeholder_contract.replace(prompt, helper["replacement"])
+                    helper_predictions.append(self._prompt_prediction([helper_prompt], noisy, timesteps))
+                helper_effects = torch.stack(helper_predictions) - literal_prediction.unsqueeze(0)
+                activator_prediction = self._activator_prediction([prompt], noisy, timesteps)
+                geometry = helper_effect_geometry(
+                    helper_effects,
+                    activator_prediction - literal_prediction,
+                    rank=int(self.gen2_config.phase_a.get("effect_geometry", {}).get("rank", 0)),
+                    energy_threshold=float(self.gen2_config.phase_a.get("effect_geometry", {}).get("energy_threshold", 0.99)),
+                )
+                valid = geometry.valid
+                alignments.append(geometry.alignment[valid].mean() if torch.any(valid) else torch.zeros((), device=noisy.device))
+                orthogonal_fractions.append(geometry.orthogonal_fraction[valid].mean() if torch.any(valid) else torch.ones((), device=noisy.device))
+                magnitude_ratios.append(geometry.magnitude_ratio[valid].mean() if torch.any(valid) else torch.zeros((), device=noisy.device))
+                valid_fractions.append(valid.float().mean())
+                ranks.append(geometry.rank.float().mean())
+        return {
+            "alignment": float(torch.stack(alignments).mean().item()),
+            "orthogonal_fraction": float(torch.stack(orthogonal_fractions).mean().item()),
+            "magnitude_ratio": float(torch.stack(magnitude_ratios).mean().item()),
+            "valid_fraction": float(torch.stack(valid_fractions).mean().item()),
+            "rank": float(torch.stack(ranks).mean().item()),
+        }
+
+    def _update_geometry_ema(self, previous, current, decay: float):
+        if previous is None:
+            return dict(current)
+        return {
+            key: float(previous.get(key, value)) * decay + float(value) * (1.0 - decay)
+            for key, value in current.items()
+        }
+
+    def _effect_release_gate(self, train_geometry, heldout_geometry, geometry_config):
+        min_alignment = float(geometry_config.get("release_min_alignment", 0.5))
+        max_orthogonal = float(geometry_config.get("release_max_orthogonal_fraction", 0.5))
+        min_magnitude = float(geometry_config.get("release_min_magnitude_ratio", 0.1))
+        max_magnitude = float(geometry_config.get("release_max_magnitude_ratio", 2.0))
+        return effect_geometry_gate(
+            train_geometry,
+            heldout_geometry,
+            min_alignment=min_alignment,
+            max_orthogonal_fraction=max_orthogonal,
+            min_magnitude_ratio=min_magnitude,
+            max_magnitude_ratio=max_magnitude,
+        )
 
     def _run_phase_a(self) -> None:
         steps = self._phase_steps("a")
@@ -524,6 +570,7 @@ class Gen2Trainer(BaseSDTrainProcess):
         self._initialize_soft_tokens_from_literal_trigger()
         settings = self.gen2_config.phase_a
         curriculum = settings.get("curriculum") or {}
+        geometry_config = settings.get("effect_geometry") or {}
         optimizer = self.optimizer
         if optimizer is None:
             raise RuntimeError("Phase A optimizer was not prepared")
@@ -538,13 +585,11 @@ class Gen2Trainer(BaseSDTrainProcess):
         probes, iterator = self._collect_phase_a_probes(probe_count + heldout_count, iterator)
         self._phase_a_probes = probes[:probe_count]
         self._phase_a_heldout_probes = probes[probe_count:]
-        calibration_result = self._run_helper_calibration(self._phase_a_probes)
+        self._run_helper_calibration(self._phase_a_probes)
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        helper_supervision_available = bool(self.helpers) and (int(self._helper_calibration.get("reliable_count", 0)) > 0 or self._helper_calibration.get("status") == "prior_weighted_fallback")
-        if self._phase_a_heldout_probes:
-            self._heldout_competence = self._competence_probe(self._phase_a_heldout_probes)
+        helper_supervision_available = bool(self.helpers) and float(self._helper_calibration.get("valid_fraction", 0.0)) == 1.0
         physical_batch = int(settings.get("batch_size", 1))
         microbatch_size = int(curriculum.get("microbatch_size", physical_batch))
         effective_batch = int(curriculum.get("effective_batch_size", physical_batch))
@@ -559,12 +604,15 @@ class Gen2Trainer(BaseSDTrainProcess):
                 self._assert_qwen_frozen()
                 optimizer.zero_grad(set_to_none=True)
                 dataset_loss = torch.zeros((), device=self.device_torch)
-                semantic_loss = torch.zeros_like(dataset_loss)
-                disturbance_loss = torch.zeros_like(dataset_loss)
+                effect_alignment_loss = torch.zeros_like(dataset_loss)
+                effect_orthogonal_loss = torch.zeros_like(dataset_loss)
+                effect_magnitude_loss = torch.zeros_like(dataset_loss)
                 preserve_loss = torch.zeros_like(dataset_loss)
                 trust_region_loss = torch.zeros_like(dataset_loss)
                 cross_content_deltas = []
-                disturbance_alpha = []
+                geometry_alignments = []
+                geometry_orthogonal_fractions = []
+                geometry_magnitude_ratios = []
                 for _ in range(accumulation):
                     batch, iterator = self._next_batch(iterator, self.data_loader)
                     noisy, noise, timesteps, prompts, _ = self._prepare_real_batch(batch, "a")
@@ -575,42 +623,69 @@ class Gen2Trainer(BaseSDTrainProcess):
                         literal_prompts = [self._literal_prompt(prompt) for prompt in prompts]
                         literal_prediction = self._prompt_prediction(literal_prompts, noisy, timesteps)
                         helper_predictions = []
-                        helper_features = []
                         for helper in self.helpers:
                             helper_prompts = [self.placeholder_contract.replace(prompt, helper["replacement"]) for prompt in prompts]
                             helper_predictions.append(self._prompt_prediction(helper_prompts, noisy, timesteps))
-                            helper_features.append(self._native_span_pooled(prompts, [helper["replacement"] for _ in prompts]))
-                        helper_prediction = torch.stack(helper_predictions)
-                        weights = self._helper_calibration["weights"].to(helper_prediction.device, helper_prediction.dtype)
-                        weighted_helper_prediction = (helper_prediction * weights.view(-1, 1, 1, 1, 1)).sum(dim=0)
-                        literal_features = self._native_span_pooled(prompts, [((self.config.get("activator") or {}).get("initialization") or {}).get("literal", "") for _ in prompts])
-                        weighted_helper_features = (torch.stack(helper_features) * weights.view(-1, 1, 1)).sum(dim=0)
+                        helper_effects = torch.stack(helper_predictions) - literal_prediction.unsqueeze(0)
+                        literal_features = self._native_span_pooled(
+                            prompts,
+                            [((self.config.get("activator") or {}).get("initialization") or {}).get("literal", "") for _ in prompts],
+                        )
+                        literal_ordinary_features = self._native_ordinary_pooled(
+                            prompts,
+                            [((self.config.get("activator") or {}).get("initialization") or {}).get("literal", "") for _ in prompts],
+                        )
+                    effect_geometry = helper_effect_geometry(
+                        helper_effects,
+                        activator_prediction - literal_prediction,
+                        rank=int(geometry_config.get("rank", 0)),
+                        energy_threshold=float(geometry_config.get("energy_threshold", 0.99)),
+                    )
+                    geometry_alignment = geometric_alignment_loss(activator_prediction - literal_prediction, effect_geometry.projection)
+                    geometry_orthogonal = geometric_orthogonal_loss(effect_geometry.orthogonal, effect_geometry.activator_norm)
+                    geometry_magnitude = effect_magnitude_penalty(
+                        effect_geometry.projection_norm,
+                        effect_geometry.helper_norm_median,
+                        target_ratio=float(geometry_config.get("target_magnitude_ratio", 0.5)),
+                        min_ratio=float(geometry_config.get("min_magnitude_ratio", 0.1)),
+                        max_ratio=float(geometry_config.get("max_magnitude_ratio", 2.0)),
+                    )
+                    effect_alignment_loss = effect_alignment_loss + geometry_alignment / accumulation
+                    effect_orthogonal_loss = effect_orthogonal_loss + geometry_orthogonal / accumulation
+                    effect_magnitude_loss = effect_magnitude_loss + geometry_magnitude / accumulation
+                    geometry_alignments.append(effect_geometry.alignment.detach().mean())
+                    geometry_orthogonal_fractions.append(effect_geometry.orthogonal_fraction.detach().mean())
+                    geometry_magnitude_ratios.append(effect_geometry.magnitude_ratio.detach().mean())
                     activator_encoded = [self._encode_soft_prompt(prompt, return_pooled=True) for prompt in prompts]
                     activator_features = torch.stack([item[1].float() for item in activator_encoded])
                     activator_ordinary_features = torch.stack([item[2].float() for item in activator_encoded])
-                    if helper_supervision_available:
-                        semantic_loss = semantic_loss + semantic_direction_loss(activator_features - literal_features, weighted_helper_features - literal_features) / accumulation
-                    alpha, beta, valid = disturbance_projection(activator_prediction - literal_prediction, weighted_helper_prediction - literal_prediction)
-                    disturbance_loss = disturbance_loss + (beta[valid].mean() if torch.any(valid) and helper_supervision_available else activator_prediction.sum() * 0.0) / accumulation
-                    delta = activator_features - literal_features.detach()
-                    cross_content_deltas.append(delta)
-                    literal_ordinary_features = self._native_ordinary_pooled(prompts, [((self.config.get("activator") or {}).get("initialization") or {}).get("literal", "") for _ in prompts])
+                    cross_content_deltas.append((activator_prediction - literal_prediction).float().flatten(1))
                     preserve_loss = preserve_loss + (activator_ordinary_features - literal_ordinary_features.detach()).square().mean() / accumulation
                     trust_region_loss = trust_region_loss + (self.soft_tokens.A.float() - self._soft_tokens_initial.float()).square().mean() / accumulation
-                    if torch.any(valid) and helper_supervision_available:
-                        disturbance_alpha.append(alpha[valid].mean().detach())
                     if hasattr(batch, "cleanup"):
                         batch.cleanup()
-                evaluate_competence = (step + 1) % int(curriculum.get("competence_eval_every", 10)) == 0
-                competence = self._competence_probe(self._phase_a_probes) if evaluate_competence else 0.0
-                heldout_competence = self._competence_probe(self._phase_a_heldout_probes) if evaluate_competence and self._phase_a_heldout_probes else 0.0
-                if helper_supervision_available and competence >= float(curriculum.get("release_threshold", 0.75)):
-                    self._helper_release_streak += 1
-                elif helper_supervision_available and competence != 0.0:
-                    self._helper_release_streak = 0
-                if helper_supervision_available and self._helper_release_streak >= int(curriculum.get("release_consecutive", 3)):
-                    self._helper_latched = True
-                helper_weight = 0.0 if self._helper_latched else smooth_helper_weight(competence, float(curriculum.get("semantic_weight", 0.25)), float(curriculum.get("decay_threshold", 0.25)), float(curriculum.get("release_threshold", 0.75)))
+                evaluation_every = int(geometry_config.get("evaluation_every", 10))
+                evaluate_geometry = (step + 1) % evaluation_every == 0
+                train_geometry = self._evaluate_effect_geometry(self._phase_a_probes) if evaluate_geometry else self._phase_a_geometry or {"alignment": 0.0, "orthogonal_fraction": 1.0, "magnitude_ratio": 0.0, "valid_fraction": 0.0, "rank": 0.0}
+                heldout_geometry = self._evaluate_effect_geometry(self._phase_a_heldout_probes) if evaluate_geometry and self._phase_a_heldout_probes else {"alignment": 0.0, "orthogonal_fraction": 1.0, "magnitude_ratio": 0.0, "valid_fraction": 0.0, "rank": 0.0}
+                if evaluate_geometry:
+                    self._phase_a_geometry = train_geometry
+                    self._phase_a_heldout_geometry = heldout_geometry
+                    ema_decay = float(geometry_config.get("ema_decay", 0.8))
+                    self._phase_a_geometry_ema = self._update_geometry_ema(self._phase_a_geometry_ema, train_geometry, ema_decay)
+                    self._phase_a_heldout_geometry_ema = self._update_geometry_ema(self._phase_a_heldout_geometry_ema, heldout_geometry, ema_decay)
+                    gate_passed, gate_checks = self._effect_release_gate(self._phase_a_geometry_ema, self._phase_a_heldout_geometry_ema, geometry_config)
+                    self._last_effect_gate_passed = gate_passed
+                    if gate_passed:
+                        self._helper_release_streak += 1
+                    else:
+                        self._helper_release_streak = 0
+                        self._phase_a_release_reason = "geometry_gate_failed"
+                    release_streak = int(geometry_config.get("release_consecutive", 3))
+                    if self._helper_release_streak >= release_streak:
+                        self._helper_latched = True
+                        self._phase_a_release_reason = "geometry_gate_passed"
+                self._last_effect_gate_checks = gate_checks if evaluate_geometry else getattr(self, "_last_effect_gate_checks", {})
                 if len(cross_content_deltas) > 1:
                     stacked_deltas = torch.cat(cross_content_deltas, dim=0)
                     mean_delta = stacked_deltas.mean(dim=0, keepdim=True)
@@ -619,28 +694,40 @@ class Gen2Trainer(BaseSDTrainProcess):
                     cross_content_loss = dataset_loss * 0.0
                 self._last_phase_a_diagnostics = {
                     "dataset_loss": float(dataset_loss.detach().item()),
-                    "semantic_loss": float(semantic_loss.detach().item()),
-                    "disturbance_loss": float(disturbance_loss.detach().item()),
+                    "effect_alignment_loss": float(effect_alignment_loss.detach().item()),
+                    "effect_orthogonal_loss": float(effect_orthogonal_loss.detach().item()),
+                    "effect_magnitude_loss": float(effect_magnitude_loss.detach().item()),
+                    "effect_alignment": float(torch.stack(geometry_alignments).mean().item()) if geometry_alignments else 0.0,
+                    "effect_orthogonal_fraction": float(torch.stack(geometry_orthogonal_fractions).mean().item()) if geometry_orthogonal_fractions else 0.0,
+                    "effect_magnitude_ratio": float(torch.stack(geometry_magnitude_ratios).mean().item()) if geometry_magnitude_ratios else 0.0,
                     "content_preserve_loss": float(preserve_loss.detach().item()),
                     "cross_content_loss": float(cross_content_loss.detach().item()),
                     "trust_region_loss": float(trust_region_loss.detach().item()),
-                    "disturbance_alpha": float(torch.stack(disturbance_alpha).mean().item()) if disturbance_alpha else 0.0,
-                    "competence": float(competence),
-                    "helper_weight": float(helper_weight),
                     "helper_latched": float(self._helper_latched),
                     "helper_release_streak": float(self._helper_release_streak),
+                    "effect_gate_checks": dict(self._last_effect_gate_checks),
+                    "effect_gate_passed": bool(self._last_effect_gate_passed),
+                    "effect_gate_reason": self._phase_a_release_reason,
+                    "effect_geometry_ema": self._phase_a_geometry_ema,
+                    "heldout_effect_geometry_ema": self._phase_a_heldout_geometry_ema,
                 }
-                self._last_phase_a_diagnostics["heldout_competence"] = float(heldout_competence)
+                self._last_phase_a_diagnostics["effect_gate"] = dict(self._last_effect_gate_checks)
+                self._last_phase_a_diagnostics["effect_gate_reason"] = self._phase_a_release_reason
+                if self._phase_a_geometry is not None:
+                    self._last_phase_a_diagnostics["heldout_effect_geometry"] = heldout_geometry
+                if self._phase_a_heldout_geometry_ema is not None:
+                    self._last_phase_a_diagnostics["heldout_effect_geometry_ema"] = self._phase_a_heldout_geometry_ema
                 self._phase_a_history.append({"step": step + 1, **self._last_phase_a_diagnostics})
                 calibration_snapshot = None
                 if self._helper_calibration is not None:
                     calibration_snapshot = {key: value.detach().cpu().tolist() if torch.is_tensor(value) else value for key, value in self._helper_calibration.items()}
                 if self.accelerator.is_main_process:
-                    (self.phase_a_root / "diagnostics.json").write_text(json.dumps({"calibration": calibration_snapshot, "heldout_competence": self._heldout_competence, "history": self._phase_a_history}, ensure_ascii=False, indent=2), encoding="utf-8")
+                    (self.phase_a_root / "diagnostics.json").write_text(json.dumps({"calibration": calibration_snapshot, "history": self._phase_a_history}, ensure_ascii=False, indent=2), encoding="utf-8")
                 total_loss = (
                     float(curriculum.get("dataset_weight", 1.0)) * dataset_loss
-                    + helper_weight * semantic_loss
-                    + float(curriculum.get("disturbance_weight", 0.01)) * disturbance_loss
+                    + float(curriculum.get("effect_alignment_weight", 1.0)) * effect_alignment_loss
+                    + float(curriculum.get("effect_orthogonal_weight", 1.0)) * effect_orthogonal_loss
+                    + float(curriculum.get("effect_magnitude_weight", 0.25)) * effect_magnitude_loss
                     + float(curriculum.get("content_preserve_weight", 0.05)) * preserve_loss
                     + float(curriculum.get("cross_content_weight", 0.01)) * cross_content_loss
                     + float(curriculum.get("trust_region_weight", 0.001)) * trust_region_loss
@@ -662,10 +749,12 @@ class Gen2Trainer(BaseSDTrainProcess):
                     tensors = {"A": self.soft_tokens.A.detach().cpu()}
                     if self.trigger_local_adapter is not None:
                         tensors.update({f"te_adapter.{key}": value.detach().cpu() for key, value in self.trigger_local_adapter.state_dict().items()})
-                    self._phase_checkpoint("a", current_step, tensors, {"phase": "a", "step": current_step, "helper_latched": self._helper_latched, "competence": competence, "heldout_competence": heldout_competence, "diagnostics": self._last_phase_a_diagnostics, "history_length": len(self._phase_a_history)}, optimizer)
-                progress.set_postfix(step=current_step, total=steps, dataset=f"{dataset_loss.item():.4g}", semantic=f"{semantic_loss.item():.4g}", disturbance=f"{disturbance_loss.item():.4g}", competence=f"{competence:.3f}", latch=int(self._helper_latched))
+                    self._phase_checkpoint("a", current_step, tensors, {"phase": "a", "step": current_step, "helper_latched": self._helper_latched, "effect_gate_reason": self._phase_a_release_reason, "effect_gate_passed": self._last_effect_gate_passed, "effect_gate_checks": self._last_effect_gate_checks, "diagnostics": self._last_phase_a_diagnostics, "history_length": len(self._phase_a_history)}, optimizer)
+                progress.set_postfix(step=current_step, total=steps, dataset=f"{dataset_loss.item():.4g}", effect=f"{effect_alignment_loss.item():.4g}", orth=f"{self._last_phase_a_diagnostics['effect_orthogonal_fraction']:.3f}", latch=int(self._helper_latched))
                 progress.update(1)
-        tail_steps = int(curriculum.get("independent_tail_steps", 0)) if self._helper_latched else 0
+        tail_steps = int(curriculum.get("independent_tail_steps", 0)) if self._helper_latched and self._phase_a_release_reason == "geometry_gate_passed" else 0
+        if int(curriculum.get("independent_tail_steps", 0)) > 0 and tail_steps == 0:
+            self._phase_a_release_reason = "release_not_reached"
         with ToolkitProgressBar(total=tail_steps, desc="Phase A dataset-only tail") as tail_progress:
             for _ in range(tail_steps):
                 optimizer.zero_grad(set_to_none=True)
@@ -690,12 +779,12 @@ class Gen2Trainer(BaseSDTrainProcess):
                 tail_progress.set_postfix(loss=f"{tail_loss.item():.4g}")
                 tail_progress.update(1)
         tensors = {"A": self.soft_tokens.A}
-        metadata = {"artifact": "gen2_activator", "schema_version": 3, "initializer": "literal_trigger_resampled", "literal": ((self.config.get("activator") or {}).get("initialization") or {}).get("literal"), "placeholder": self.placeholder_contract.placeholder, "tokens": self.soft_tokens.tokens, "dimension": self.soft_tokens.dimension, "trigger_local_adapter": self.trigger_local_adapter is not None, "trigger_local_adapter_rank": self.trigger_local_adapter.rank if self.trigger_local_adapter is not None else 0, "trigger_local_adapter_alpha": self.trigger_local_adapter.alpha if self.trigger_local_adapter is not None else 0.0, "helper_latched": self._helper_latched, "helper_release_streak": self._helper_release_streak, "heldout_competence": self._heldout_competence, "phase_a_diagnostics": self._last_phase_a_diagnostics}
+        metadata = {"artifact": "gen2_activator", "schema_version": 3, "initializer": "literal_trigger_resampled", "literal": ((self.config.get("activator") or {}).get("initialization") or {}).get("literal"), "placeholder": self.placeholder_contract.placeholder, "tokens": self.soft_tokens.tokens, "dimension": self.soft_tokens.dimension, "trigger_local_adapter": self.trigger_local_adapter is not None, "trigger_local_adapter_rank": self.trigger_local_adapter.rank if self.trigger_local_adapter is not None else 0, "trigger_local_adapter_alpha": self.trigger_local_adapter.alpha if self.trigger_local_adapter is not None else 0.0, "helper_latched": self._helper_latched, "helper_release_streak": self._helper_release_streak, "effect_gate_reason": self._phase_a_release_reason, "effect_gate_passed": self._last_effect_gate_passed, "effect_gate_checks": self._last_effect_gate_checks, "phase_a_diagnostics": self._last_phase_a_diagnostics}
         if self._helper_calibration is not None:
             metadata["helper_calibration"] = {key: value.detach().cpu().tolist() if torch.is_tensor(value) else value for key, value in self._helper_calibration.items()}
         if self.trigger_local_adapter is not None:
             tensors.update({f"te_adapter.{key}": value for key, value in self.trigger_local_adapter.state_dict().items()})
-        (self.phase_a_root / "diagnostics.json").write_text(json.dumps({"calibration": metadata.get("helper_calibration"), "heldout_competence": self._heldout_competence, "history": self._phase_a_history}, ensure_ascii=False, indent=2), encoding="utf-8")
+        (self.phase_a_root / "diagnostics.json").write_text(json.dumps({"calibration": metadata.get("helper_calibration"), "history": self._phase_a_history}, ensure_ascii=False, indent=2), encoding="utf-8")
         save_tensor_artifact(self.phase_a_root / "activator.safetensors", tensors, metadata)
 
     def _install_phase_b_optimizer(self) -> None:
