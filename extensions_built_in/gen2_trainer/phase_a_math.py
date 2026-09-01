@@ -1,109 +1,72 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
 import torch.nn.functional as F
 
 
-@dataclass(frozen=True)
-class HelperEffectGeometry:
-    projection: torch.Tensor
-    orthogonal: torch.Tensor
-    activator_norm: torch.Tensor
-    projection_norm: torch.Tensor
-    helper_norm_median: torch.Tensor
-    alignment: torch.Tensor
-    orthogonal_fraction: torch.Tensor
-    magnitude_ratio: torch.Tensor
-    valid: torch.Tensor
-    rank: torch.Tensor
-
-
-def helper_effect_geometry(
+def positive_cone_projection(
     helper_effects: torch.Tensor,
     activator_effect: torch.Tensor,
-    rank: int = 0,
-    energy_threshold: float = 0.99,
+    iterations: int = 24,
     epsilon: float = 1e-8,
-) -> HelperEffectGeometry:
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Project each activator effect onto the non-negative helper-effect cone."""
     if helper_effects.ndim < 3 or activator_effect.ndim < 2:
         raise ValueError("helper effects must have shape (helpers, batch, ...) and activator effect (batch, ...)")
     if helper_effects.shape[1] != activator_effect.shape[0]:
         raise ValueError("helper and activator batch dimensions must match")
-    if rank < 0:
-        raise ValueError("helper effect rank cannot be negative")
-    if not 0.0 < energy_threshold <= 1.0:
-        raise ValueError("helper effect energy threshold must be in (0, 1]")
+    if iterations < 1:
+        raise ValueError("cone projection iterations must be positive")
     helpers = helper_effects.detach().float().permute(1, 0, *range(2, helper_effects.ndim)).flatten(2)
     activator = activator_effect.float().flatten(1)
-    batch_size, helper_count, feature_count = helpers.shape
-    helper_norms = helpers.norm(dim=2)
     gram = torch.bmm(helpers, helpers.transpose(1, 2))
-    eigenvalues, eigenvectors = torch.linalg.eigh(gram)
-    eigenvalues = eigenvalues.clamp_min(0.0)
-    descending = torch.argsort(eigenvalues, dim=1, descending=True)
-    eigenvalues = torch.gather(eigenvalues, 1, descending)
-    eigenvectors = torch.gather(eigenvectors, 2, descending.unsqueeze(1).expand(-1, helper_count, -1))
-    cumulative = eigenvalues.cumsum(dim=1)
-    total_energy = cumulative[:, -1:].clamp_min(epsilon)
-    needed = (cumulative / total_energy >= energy_threshold).to(torch.long).argmax(dim=1) + 1
-    positive_rank = (eigenvalues > epsilon).sum(dim=1)
-    max_rank = helper_count if rank == 0 else min(rank, helper_count)
-    selected_rank = needed.clamp_max(max_rank).minimum(positive_rank)
-    components = torch.bmm(helpers.transpose(1, 2), eigenvectors)
-    components = components / eigenvalues.clamp_min(epsilon).sqrt().unsqueeze(1)
-    component_mask = torch.arange(helper_count, device=helpers.device).view(1, -1) < selected_rank.view(-1, 1)
-    basis = components * component_mask.unsqueeze(1).to(components.dtype)
-    coefficients = torch.bmm(basis.transpose(1, 2), activator.unsqueeze(2)).squeeze(2)
-    projection_flat = torch.bmm(basis, coefficients.unsqueeze(2)).squeeze(2)
-    projection = projection_flat.view_as(activator_effect)
-    activator_flat = activator_effect.float().flatten(1)
-    orthogonal_flat = activator_flat - projection_flat
-    orthogonal = orthogonal_flat.view_as(activator_effect)
-    activator_norm = activator_flat.norm(dim=1)
-    projection_norm = projection_flat.norm(dim=1)
-    helper_norm_median = helper_norms.median(dim=1).values
-    alignment = (activator_flat * projection_flat).sum(dim=1) / (activator_norm * projection_norm).clamp_min(epsilon)
-    orthogonal_fraction = orthogonal_flat.norm(dim=1) / activator_norm.clamp_min(epsilon)
-    magnitude_ratio = projection_norm / helper_norm_median.clamp_min(epsilon)
-    valid = (selected_rank > 0) & (helper_norm_median > epsilon)
-    alignment = torch.where(valid, alignment.clamp(-1.0, 1.0), torch.zeros_like(alignment))
-    orthogonal_fraction = torch.where(activator_norm > epsilon, orthogonal_fraction, torch.zeros_like(orthogonal_fraction))
-    magnitude_ratio = torch.where(valid, magnitude_ratio, torch.zeros_like(magnitude_ratio))
-    return HelperEffectGeometry(
-        projection=projection.view_as(activator_effect),
-        orthogonal=orthogonal,
-        activator_norm=activator_norm,
-        projection_norm=projection_norm,
-        helper_norm_median=helper_norm_median,
-        alignment=alignment,
-        orthogonal_fraction=orthogonal_fraction,
-        magnitude_ratio=magnitude_ratio,
-        valid=valid,
-        rank=selected_rank,
-    )
+    rhs = torch.bmm(helpers, activator.unsqueeze(2)).squeeze(2)
+    coefficients = torch.linalg.lstsq(gram, rhs.unsqueeze(2)).solution.squeeze(2).clamp_min(0.0)
+    lipschitz = gram.diagonal(dim1=1, dim2=2).sum(dim=1).clamp_min(epsilon)
+    for _ in range(iterations):
+        gradient = torch.bmm(gram, coefficients.unsqueeze(2)).squeeze(2) - rhs
+        coefficients = (coefficients - gradient / lipschitz.unsqueeze(1)).clamp_min(0.0)
+    projection_flat = torch.bmm(helpers.transpose(1, 2), coefficients.unsqueeze(2)).squeeze(2)
+    return projection_flat.view_as(activator_effect), coefficients
 
 
-def effect_magnitude_loss(
-    projection_norm: torch.Tensor,
-    helper_norm: torch.Tensor,
-    target_ratio: float = 0.5,
-    min_ratio: float = 0.1,
-    max_ratio: float = 2.0,
+def positive_cone_geometry(
+    helper_effects: torch.Tensor,
+    activator_effect: torch.Tensor,
+    iterations: int = 24,
+    epsilon: float = 1e-8,
+) -> dict[str, torch.Tensor]:
+    projection, coefficients = positive_cone_projection(helper_effects, activator_effect, iterations, epsilon)
+    activator = activator_effect.float().flatten(1)
+    projected = projection.float().flatten(1)
+    residual = activator - projected
+    activator_norm = activator.norm(dim=1)
+    projection_norm = projected.norm(dim=1)
+    alignment = (activator * projected).sum(dim=1) / (activator_norm * projection_norm).clamp_min(epsilon)
+    orthogonal_fraction = residual.norm(dim=1) / activator_norm.clamp_min(epsilon)
+    valid = (activator_norm > epsilon) & (projection_norm > epsilon) & (coefficients.sum(dim=1) > epsilon)
+    return {
+        "projection": projection,
+        "coefficients": coefficients,
+        "alignment": torch.where(valid, alignment.clamp(-1.0, 1.0), torch.zeros_like(alignment)),
+        "orthogonal_fraction": torch.where(activator_norm > epsilon, orthogonal_fraction, torch.zeros_like(orthogonal_fraction)),
+        "activator_norm": activator_norm,
+        "projection_norm": projection_norm,
+        "valid": valid,
+    }
+
+
+def normalized_teacher_distillation_loss(
+    activator_prediction: torch.Tensor,
+    teacher_prediction: torch.Tensor,
+    effect_scale: torch.Tensor | float = 1.0,
     epsilon: float = 1e-8,
 ) -> torch.Tensor:
-    if projection_norm.shape != helper_norm.shape:
-        raise ValueError("projection and helper norms must have equal shapes")
-    if not 0.0 < min_ratio <= target_ratio <= max_ratio:
-        raise ValueError("magnitude ratios must satisfy 0 < min_ratio <= target_ratio <= max_ratio")
-    ratio = projection_norm / helper_norm.clamp_min(epsilon)
-    target = torch.as_tensor(target_ratio, device=ratio.device, dtype=ratio.dtype)
-    log_ratio = torch.log(ratio.clamp_min(epsilon))
-    target_error = (log_ratio - torch.log(target)).square()
-    lower_error = F.softplus(min_ratio - ratio).square()
-    upper_error = F.softplus(ratio - max_ratio).square()
-    return (target_error + lower_error + upper_error).mean()
+    if activator_prediction.shape != teacher_prediction.shape:
+        raise ValueError("activator and teacher predictions must have equal shapes")
+    scale = torch.as_tensor(effect_scale, device=activator_prediction.device, dtype=torch.float32).clamp_min(epsilon)
+    error = (activator_prediction.float() - teacher_prediction.detach().float()).flatten(1).square().mean(dim=1)
+    return (error / scale.square()).mean()
 
 
 def effect_geometry_gate(
@@ -131,25 +94,3 @@ def effect_geometry_gate(
         "heldout_valid": heldout_geometry.get("valid_fraction", 0.0) > 0.0,
     }
     return all(checks.values()), checks
-
-
-def geometric_alignment_loss(activator_effect: torch.Tensor, projection: torch.Tensor, epsilon: float = 1e-8) -> torch.Tensor:
-    if activator_effect.shape != projection.shape:
-        raise ValueError("activator effect and projection must have equal shapes")
-    activator = activator_effect.float().flatten(1)
-    projected = projection.float().flatten(1)
-    valid = (activator.norm(dim=1) > epsilon) & (projected.norm(dim=1) > epsilon)
-    if not torch.any(valid):
-        return activator_effect.sum() * 0.0
-    return (1.0 - F.cosine_similarity(activator[valid], projected[valid], dim=-1)).mean()
-
-
-def geometric_orthogonal_loss(orthogonal: torch.Tensor, activator_norm: torch.Tensor, epsilon: float = 1e-8) -> torch.Tensor:
-    if orthogonal.ndim < 2 or activator_norm.ndim != 1 or orthogonal.shape[0] != activator_norm.shape[0]:
-        raise ValueError("orthogonal effect and activator norm shapes are incompatible")
-    fraction = orthogonal.float().flatten(1).norm(dim=1) / activator_norm.float().clamp_min(epsilon)
-    valid = activator_norm.float() > epsilon
-    if not torch.any(valid):
-        return orthogonal.sum() * 0.0
-    return fraction[valid].mean()
-

@@ -35,10 +35,8 @@ from .sampling import build_validation_matrix, make_flowmatch_noisy_latents, sam
 from .temporal_rank_field import time_smooth_regularizer, time_mean_diagnostic
 from .phase_a_math import (
     effect_geometry_gate,
-    effect_magnitude_loss as effect_magnitude_penalty,
-    geometric_alignment_loss,
-    geometric_orthogonal_loss,
-    helper_effect_geometry,
+    normalized_teacher_distillation_loss,
+    positive_cone_geometry,
 )
 
 
@@ -462,10 +460,13 @@ class Gen2Trainer(BaseSDTrainProcess):
         if valid_fraction < 1.0:
             raise RuntimeError(f"Phase A helper-effect calibration found degenerate teacher probes: valid_fraction={valid_fraction:.3f}")
         status = "teacher_bank_geometry" if valid_fraction > 0.0 else "dataset_only_fallback"
+        effect_norms = torch.as_tensor(geometry.get("effect_norms", []), dtype=torch.float32)
+        helper_scales = effect_norms.median(dim=0).values if effect_norms.numel() else torch.ones(len(self.helpers))
         self._helper_calibration = {
             "status": status,
             "valid_fraction": valid_fraction,
             "effect_geometry": geometry,
+            "helper_scales": helper_scales,
         }
         if self.accelerator.is_main_process:
             print(f"Phase A helper-effect calibration: {status}; valid_fraction={valid_fraction:.3f}")
@@ -518,18 +519,20 @@ class Gen2Trainer(BaseSDTrainProcess):
                     helper_predictions.append(self._prompt_prediction([helper_prompt], noisy, timesteps))
                 helper_effects = torch.stack(helper_predictions) - literal_prediction.unsqueeze(0)
                 activator_prediction = self._activator_prediction([prompt], noisy, timesteps)
-                geometry = helper_effect_geometry(
+                geometry = positive_cone_geometry(
                     helper_effects,
                     activator_prediction - literal_prediction,
-                    rank=int(self.gen2_config.phase_a.get("effect_geometry", {}).get("rank", 0)),
-                    energy_threshold=float(self.gen2_config.phase_a.get("effect_geometry", {}).get("energy_threshold", 0.99)),
+                    iterations=int(self.gen2_config.phase_a.get("effect_geometry", {}).get("cone_iterations", 24)),
                 )
-                valid = geometry.valid
-                alignments.append(geometry.alignment[valid].mean() if torch.any(valid) else torch.zeros((), device=noisy.device))
-                orthogonal_fractions.append(geometry.orthogonal_fraction[valid].mean() if torch.any(valid) else torch.ones((), device=noisy.device))
-                magnitude_ratios.append(geometry.magnitude_ratio[valid].mean() if torch.any(valid) else torch.zeros((), device=noisy.device))
+                valid = geometry["valid"]
+                activator_norm = geometry["activator_norm"]
+                helper_norms = helper_effects.float().flatten(2).norm(dim=2).median(dim=0).values
+                magnitude_ratio = geometry["projection_norm"] / helper_norms.clamp_min(1e-8)
+                alignments.append(geometry["alignment"][valid].mean() if torch.any(valid) else torch.zeros((), device=noisy.device))
+                orthogonal_fractions.append(geometry["orthogonal_fraction"][valid].mean() if torch.any(valid) else torch.ones((), device=noisy.device))
+                magnitude_ratios.append(magnitude_ratio[valid].mean() if torch.any(valid) else torch.zeros((), device=noisy.device))
                 valid_fractions.append(valid.float().mean())
-                ranks.append(geometry.rank.float().mean())
+                ranks.append((geometry["coefficients"] > 1e-8).float().sum(dim=1).mean())
         return {
             "alignment": float(torch.stack(alignments).mean().item()),
             "orthogonal_fraction": float(torch.stack(orthogonal_fractions).mean().item()),
@@ -604,63 +607,37 @@ class Gen2Trainer(BaseSDTrainProcess):
                 self._assert_qwen_frozen()
                 optimizer.zero_grad(set_to_none=True)
                 dataset_loss = torch.zeros((), device=self.device_torch)
-                effect_alignment_loss = torch.zeros_like(dataset_loss)
-                effect_orthogonal_loss = torch.zeros_like(dataset_loss)
-                effect_magnitude_loss = torch.zeros_like(dataset_loss)
+                teacher_loss = torch.zeros_like(dataset_loss)
+                selected_helper_index = step % max(len(self.helpers), 1)
                 preserve_loss = torch.zeros_like(dataset_loss)
                 trust_region_loss = torch.zeros_like(dataset_loss)
                 cross_content_deltas = []
-                geometry_alignments = []
-                geometry_orthogonal_fractions = []
-                geometry_magnitude_ratios = []
+                teacher_effect_norms = []
                 for _ in range(accumulation):
                     batch, iterator = self._next_batch(iterator, self.data_loader)
                     noisy, noise, timesteps, prompts, _ = self._prepare_real_batch(batch, "a")
                     target = self.sd.get_loss_target(noise=noise, batch=batch)
                     activator_prediction = self._activator_prediction(prompts, noisy, timesteps)
                     dataset_loss = dataset_loss + torch.nn.functional.mse_loss(activator_prediction.float(), target.float()) / accumulation
+                    selected_helper = self.helpers[selected_helper_index]
+                    helper_prompts = [self.placeholder_contract.replace(prompt, selected_helper["replacement"]) for prompt in prompts]
+                    literal_texts = [((self.config.get("activator") or {}).get("initialization") or {}).get("literal", "") for _ in prompts]
                     with torch.no_grad():
-                        literal_prompts = [self._literal_prompt(prompt) for prompt in prompts]
-                        literal_prediction = self._prompt_prediction(literal_prompts, noisy, timesteps)
-                        helper_predictions = []
-                        for helper in self.helpers:
-                            helper_prompts = [self.placeholder_contract.replace(prompt, helper["replacement"]) for prompt in prompts]
-                            helper_predictions.append(self._prompt_prediction(helper_prompts, noisy, timesteps))
-                        helper_effects = torch.stack(helper_predictions) - literal_prediction.unsqueeze(0)
-                        literal_features = self._native_span_pooled(
-                            prompts,
-                            [((self.config.get("activator") or {}).get("initialization") or {}).get("literal", "") for _ in prompts],
-                        )
-                        literal_ordinary_features = self._native_ordinary_pooled(
-                            prompts,
-                            [((self.config.get("activator") or {}).get("initialization") or {}).get("literal", "") for _ in prompts],
-                        )
-                    effect_geometry = helper_effect_geometry(
-                        helper_effects,
-                        activator_prediction - literal_prediction,
-                        rank=int(geometry_config.get("rank", 0)),
-                        energy_threshold=float(geometry_config.get("energy_threshold", 0.99)),
+                        helper_prediction = self._prompt_prediction(helper_prompts, noisy, timesteps)
+                        literal_ordinary_features = self._native_ordinary_pooled(prompts, literal_texts)
+                    helper_scales = torch.as_tensor(
+                        (self._helper_calibration or {}).get("helper_scales", [1.0] * len(self.helpers)),
+                        device=helper_prediction.device,
+                        dtype=helper_prediction.dtype,
                     )
-                    geometry_alignment = geometric_alignment_loss(activator_prediction - literal_prediction, effect_geometry.projection)
-                    geometry_orthogonal = geometric_orthogonal_loss(effect_geometry.orthogonal, effect_geometry.activator_norm)
-                    geometry_magnitude = effect_magnitude_penalty(
-                        effect_geometry.projection_norm,
-                        effect_geometry.helper_norm_median,
-                        target_ratio=float(geometry_config.get("target_magnitude_ratio", 0.5)),
-                        min_ratio=float(geometry_config.get("min_magnitude_ratio", 0.1)),
-                        max_ratio=float(geometry_config.get("max_magnitude_ratio", 2.0)),
-                    )
-                    effect_alignment_loss = effect_alignment_loss + geometry_alignment / accumulation
-                    effect_orthogonal_loss = effect_orthogonal_loss + geometry_orthogonal / accumulation
-                    effect_magnitude_loss = effect_magnitude_loss + geometry_magnitude / accumulation
-                    geometry_alignments.append(effect_geometry.alignment.detach().mean())
-                    geometry_orthogonal_fractions.append(effect_geometry.orthogonal_fraction.detach().mean())
-                    geometry_magnitude_ratios.append(effect_geometry.magnitude_ratio.detach().mean())
+                    teacher_scale = helper_scales[selected_helper_index]
+                    current_teacher_loss = normalized_teacher_distillation_loss(activator_prediction, helper_prediction, teacher_scale)
+                    teacher_loss = teacher_loss + current_teacher_loss / accumulation
+                    teacher_effect_norms.append((helper_prediction - activator_prediction.detach()).float().flatten(1).norm(dim=1).mean())
+                    residual_signature = (activator_prediction - helper_prediction).float()
+                    cross_content_deltas.append(residual_signature.mean(dim=tuple(range(2, residual_signature.ndim))))
                     activator_encoded = [self._encode_soft_prompt(prompt, return_pooled=True) for prompt in prompts]
-                    activator_features = torch.stack([item[1].float() for item in activator_encoded])
                     activator_ordinary_features = torch.stack([item[2].float() for item in activator_encoded])
-                    effect_delta = (activator_prediction - literal_prediction).float()
-                    cross_content_deltas.append(effect_delta.mean(dim=tuple(range(2, effect_delta.ndim))))
                     preserve_loss = preserve_loss + (activator_ordinary_features - literal_ordinary_features.detach()).square().mean() / accumulation
                     trust_region_loss = trust_region_loss + (self.soft_tokens.A.float() - self._soft_tokens_initial.float()).square().mean() / accumulation
                     if hasattr(batch, "cleanup"):
@@ -687,6 +664,9 @@ class Gen2Trainer(BaseSDTrainProcess):
                         self._helper_latched = True
                         self._phase_a_release_reason = "geometry_gate_passed"
                 self._last_effect_gate_checks = gate_checks if evaluate_geometry else getattr(self, "_last_effect_gate_checks", {})
+                if not evaluate_geometry:
+                    train_geometry = self._phase_a_geometry or {"alignment": 0.0, "orthogonal_fraction": 1.0, "magnitude_ratio": 0.0, "valid_fraction": 0.0, "rank": 0.0}
+                    heldout_geometry = self._phase_a_heldout_geometry or {"alignment": 0.0, "orthogonal_fraction": 1.0, "magnitude_ratio": 0.0, "valid_fraction": 0.0, "rank": 0.0}
                 if len(cross_content_deltas) > 1:
                     stacked_deltas = torch.cat(cross_content_deltas, dim=0)
                     mean_delta = stacked_deltas.mean(dim=0, keepdim=True)
@@ -695,14 +675,12 @@ class Gen2Trainer(BaseSDTrainProcess):
                     cross_content_loss = dataset_loss * 0.0
                 self._last_phase_a_diagnostics = {
                     "dataset_loss": float(dataset_loss.detach().item()),
-                    "effect_alignment_loss": float(effect_alignment_loss.detach().item()),
-                    "effect_orthogonal_loss": float(effect_orthogonal_loss.detach().item()),
-                    "effect_magnitude_loss": float(effect_magnitude_loss.detach().item()),
-                    "effect_alignment": float(torch.stack(geometry_alignments).mean().item()) if geometry_alignments else 0.0,
-                    "effect_orthogonal_fraction": float(torch.stack(geometry_orthogonal_fractions).mean().item()) if geometry_orthogonal_fractions else 0.0,
-                    "effect_magnitude_ratio": float(torch.stack(geometry_magnitude_ratios).mean().item()) if geometry_magnitude_ratios else 0.0,
+                    "teacher_loss": float(teacher_loss.detach().item()),
+                    "teacher_effect_norm": float(torch.stack(teacher_effect_norms).mean().item()) if teacher_effect_norms else 0.0,
                     "content_preserve_loss": float(preserve_loss.detach().item()),
                     "cross_content_loss": float(cross_content_loss.detach().item()),
+                    "selected_helper_index": selected_helper_index,
+                    "selected_helper_id": self.helpers[selected_helper_index]["id"] if self.helpers else None,
                     "trust_region_loss": float(trust_region_loss.detach().item()),
                     "helper_latched": float(self._helper_latched),
                     "helper_release_streak": float(self._helper_release_streak),
@@ -711,6 +689,9 @@ class Gen2Trainer(BaseSDTrainProcess):
                     "effect_gate_reason": self._phase_a_release_reason,
                     "effect_geometry_ema": self._phase_a_geometry_ema,
                     "heldout_effect_geometry_ema": self._phase_a_heldout_geometry_ema,
+                    "geometry_evaluated": bool(evaluate_geometry),
+                    "helper_count": len(self.helpers),
+                    "microbatch_accumulation": accumulation,
                 }
                 self._last_phase_a_diagnostics["effect_gate"] = dict(self._last_effect_gate_checks)
                 self._last_phase_a_diagnostics["effect_gate_reason"] = self._phase_a_release_reason
@@ -725,10 +706,8 @@ class Gen2Trainer(BaseSDTrainProcess):
                 if self.accelerator.is_main_process:
                     (self.phase_a_root / "diagnostics.json").write_text(json.dumps({"calibration": calibration_snapshot, "history": self._phase_a_history}, ensure_ascii=False, indent=2), encoding="utf-8")
                 total_loss = (
-                    float(curriculum.get("dataset_weight", 1.0)) * dataset_loss
-                    + float(curriculum.get("effect_alignment_weight", 1.0)) * effect_alignment_loss
-                    + float(curriculum.get("effect_orthogonal_weight", 1.0)) * effect_orthogonal_loss
-                    + float(curriculum.get("effect_magnitude_weight", 0.25)) * effect_magnitude_loss
+                    float(curriculum.get("dataset_weight", 0.1)) * dataset_loss
+                    + float(curriculum.get("teacher_weight", 1.0)) * teacher_loss
                     + float(curriculum.get("content_preserve_weight", 0.05)) * preserve_loss
                     + float(curriculum.get("cross_content_weight", 0.01)) * cross_content_loss
                     + float(curriculum.get("trust_region_weight", 0.001)) * trust_region_loss
@@ -751,11 +730,11 @@ class Gen2Trainer(BaseSDTrainProcess):
                     if self.trigger_local_adapter is not None:
                         tensors.update({f"te_adapter.{key}": value.detach().cpu() for key, value in self.trigger_local_adapter.state_dict().items()})
                     self._phase_checkpoint("a", current_step, tensors, {"phase": "a", "step": current_step, "helper_latched": self._helper_latched, "effect_gate_reason": self._phase_a_release_reason, "effect_gate_passed": self._last_effect_gate_passed, "effect_gate_checks": self._last_effect_gate_checks, "diagnostics": self._last_phase_a_diagnostics, "history_length": len(self._phase_a_history)}, optimizer)
-                progress.set_postfix(step=current_step, total=steps, dataset=f"{dataset_loss.item():.4g}", effect=f"{effect_alignment_loss.item():.4g}", orth=f"{self._last_phase_a_diagnostics['effect_orthogonal_fraction']:.3f}", latch=int(self._helper_latched))
+                progress.set_postfix(step=current_step, total=steps, dataset=f"{dataset_loss.item():.4g}", teacher=f"{teacher_loss.item():.4g}", latch=int(self._helper_latched))
                 progress.update(1)
-        tail_steps = int(curriculum.get("independent_tail_steps", 0)) if self._helper_latched and self._phase_a_release_reason == "geometry_gate_passed" else 0
-        if int(curriculum.get("independent_tail_steps", 0)) > 0 and tail_steps == 0:
-            self._phase_a_release_reason = "release_not_reached"
+        tail_steps = 0
+        if int(curriculum.get("independent_tail_steps", 0)) > 0:
+            self._phase_a_release_reason = "tail_disabled_by_private_address_design"
         with ToolkitProgressBar(total=tail_steps, desc="Phase A dataset-only tail") as tail_progress:
             for _ in range(tail_steps):
                 optimizer.zero_grad(set_to_none=True)

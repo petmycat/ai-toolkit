@@ -177,9 +177,10 @@ def validate_gen2_config(raw: Mapping[str, Any]) -> Gen2RuntimeConfig:
     microbatch_size = int(curriculum.get("microbatch_size", phase_a.get("batch_size", train.get("batch_size", 1))))
     _require(microbatch_size == int(phase_a.get("batch_size", train.get("batch_size", 1))), "phase_a.curriculum.microbatch_size must equal phase_a.batch_size in the current dataloader contract")
     _require(effective_batch_size % microbatch_size == 0, "phase_a effective_batch_size must be divisible by microbatch_size")
-    for weight_name in ("dataset_weight", "effect_alignment_weight", "effect_orthogonal_weight", "effect_magnitude_weight", "content_preserve_weight", "cross_content_weight", "trust_region_weight"):
+    for weight_name in ("dataset_weight", "teacher_weight", "content_preserve_weight", "cross_content_weight", "trust_region_weight"):
         _require(float(curriculum.get(weight_name, 0.0)) >= 0.0, f"phase_a.curriculum.{weight_name} must be non-negative")
-    _require(int(curriculum.get("independent_tail_steps", 0)) >= 0, "phase_a curriculum independent_tail_steps cannot be negative")
+    _require(int(curriculum.get("independent_tail_steps", 0)) == 0, "phase_a independent dataset tail is disabled; Phase A is a private address")
+    _require(int(effect_geometry.get("cone_iterations", 24)) >= 1, "phase_a.effect_geometry.cone_iterations must be positive")
     diversity = phase_a.get("token_diversity") or {}
     _require(not diversity.get("enabled", False), "token_diversity is not implemented in Gen2 V1")
     _require(float(phase_b.get("temporal_mean_weight", 0.0)) == 0.0, "temporal_mean_weight is diagnostic-only and must be zero")
