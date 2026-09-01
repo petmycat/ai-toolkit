@@ -56,14 +56,16 @@ def helper_effect_geometry(
     component_mask = torch.arange(helper_count, device=helpers.device).view(1, -1) < selected_rank.view(-1, 1)
     basis = components * component_mask.unsqueeze(1).to(components.dtype)
     coefficients = torch.bmm(basis.transpose(1, 2), activator.unsqueeze(2)).squeeze(2)
-    projection = torch.bmm(basis, coefficients.unsqueeze(2)).squeeze(2).view_as(activator_effect)
-    orthogonal = activator_effect.float() - projection.view_as(activator_effect)
-    activator_norm = activator.norm(dim=1)
-    projection_flat = projection
+    projection_flat = torch.bmm(basis, coefficients.unsqueeze(2)).squeeze(2)
+    projection = projection_flat.view_as(activator_effect)
+    activator_flat = activator_effect.float().flatten(1)
+    orthogonal_flat = activator_flat - projection_flat
+    orthogonal = orthogonal_flat.view_as(activator_effect)
+    activator_norm = activator_flat.norm(dim=1)
     projection_norm = projection_flat.norm(dim=1)
     helper_norm_median = helper_norms.median(dim=1).values
-    alignment = (activator * projection_flat).sum(dim=1) / (activator_norm * projection_norm).clamp_min(epsilon)
-    orthogonal_fraction = orthogonal.flatten(1).norm(dim=1) / activator_norm.clamp_min(epsilon)
+    alignment = (activator_flat * projection_flat).sum(dim=1) / (activator_norm * projection_norm).clamp_min(epsilon)
+    orthogonal_fraction = orthogonal_flat.norm(dim=1) / activator_norm.clamp_min(epsilon)
     magnitude_ratio = projection_norm / helper_norm_median.clamp_min(epsilon)
     valid = (selected_rank > 0) & (helper_norm_median > epsilon)
     alignment = torch.where(valid, alignment.clamp(-1.0, 1.0), torch.zeros_like(alignment))

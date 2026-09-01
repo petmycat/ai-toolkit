@@ -30,6 +30,15 @@ class PhaseAMathTest(unittest.TestCase):
         self.assertTrue(bool(geometry.valid[0]))
         self.assertTrue(torch.isfinite(effect_magnitude_loss(geometry.projection_norm, geometry.helper_norm_median)))
 
+    def test_helper_effect_geometry_supports_dit_tensor_shapes(self):
+        helpers = torch.randn(3, 2, 4, 5, 6)
+        activator = torch.randn(2, 4, 5, 6, requires_grad=True)
+        geometry = helper_effect_geometry(helpers, activator)
+        self.assertEqual(geometry.projection.shape, activator.shape)
+        self.assertEqual(geometry.orthogonal.shape, activator.shape)
+        self.assertEqual(geometry.alignment.shape, torch.Size([2]))
+        self.assertTrue(torch.isfinite(geometry.alignment).all())
+
     def test_geometric_losses_are_finite_for_orthogonal_effect(self):
         helpers = torch.tensor([[[1.0, 0.0]], [[0.0, 1.0]]])
         activator = torch.tensor([[0.0, 2.0]])
