@@ -659,7 +659,8 @@ class Gen2Trainer(BaseSDTrainProcess):
                     activator_encoded = [self._encode_soft_prompt(prompt, return_pooled=True) for prompt in prompts]
                     activator_features = torch.stack([item[1].float() for item in activator_encoded])
                     activator_ordinary_features = torch.stack([item[2].float() for item in activator_encoded])
-                    cross_content_deltas.append((activator_prediction - literal_prediction).float().flatten(1))
+                    effect_delta = (activator_prediction - literal_prediction).float()
+                    cross_content_deltas.append(effect_delta.mean(dim=tuple(range(2, effect_delta.ndim))))
                     preserve_loss = preserve_loss + (activator_ordinary_features - literal_ordinary_features.detach()).square().mean() / accumulation
                     trust_region_loss = trust_region_loss + (self.soft_tokens.A.float() - self._soft_tokens_initial.float()).square().mean() / accumulation
                     if hasattr(batch, "cleanup"):
