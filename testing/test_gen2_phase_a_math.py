@@ -8,10 +8,18 @@ from extensions_built_in.gen2_trainer.phase_a_math import (
     normalized_teacher_distillation_loss,
     positive_cone_geometry,
     positive_cone_projection,
+    response_field_signature,
 )
 
 
 class PhaseAMathTest(unittest.TestCase):
+    def test_response_signature_handles_variable_resolution_fields(self):
+        first = response_field_signature(torch.ones(1, 2, 3, 4))
+        second = response_field_signature(torch.ones(1, 5, 7, 8))
+        self.assertEqual(first.shape, (1, 2))
+        self.assertEqual(second.shape, (1, 2))
+        self.assertTrue(torch.isfinite(torch.cat((first, second), dim=0)).all())
+
     def test_shared_positive_mixture_is_normalized_and_cross_content(self):
         helpers = torch.tensor([
             [[1.0, 0.0], [2.0, 0.0]],

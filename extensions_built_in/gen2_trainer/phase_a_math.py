@@ -112,6 +112,18 @@ def positive_cone_geometry(
     }
 
 
+def response_field_signature(effect: torch.Tensor, epsilon: float = 1e-8) -> torch.Tensor:
+    """Pool variable-resolution response fields into a fixed two-statistic signature."""
+    if effect.ndim < 2:
+        raise ValueError("response field must have a batch dimension")
+    values = effect.float().flatten(1)
+    if not torch.isfinite(values).all():
+        raise ValueError("response field must be finite")
+    mean = values.mean(dim=1)
+    rms = values.square().mean(dim=1).sqrt().clamp_min(epsilon)
+    return torch.stack((mean, rms), dim=1)
+
+
 def effect_rms(effect: torch.Tensor, epsilon: float = 1e-8) -> torch.Tensor:
     if effect.ndim < 2:
         raise ValueError("effect must have a batch dimension")

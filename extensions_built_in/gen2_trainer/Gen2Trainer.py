@@ -39,6 +39,7 @@ from .phase_a_math import (
     fit_shared_positive_helper_mixture,
     normalized_teacher_distillation_loss,
     positive_cone_geometry,
+    response_field_signature,
 )
 
 
@@ -495,8 +496,8 @@ class Gen2Trainer(BaseSDTrainProcess):
                 valid = bool(torch.isfinite(stacked).all() and torch.isfinite(target_effect).all() and torch.all(effect_norm > 1e-8))
                 valid_probes.append(valid)
                 if valid:
-                    helper_effect_batches.append(stacked)
-                    target_effect_batches.append(target_effect)
+                    helper_effect_batches.append(torch.stack([response_field_signature(effect).squeeze(0) for effect in effects], dim=0).unsqueeze(1))
+                    target_effect_batches.append(response_field_signature(target_effect))
                     norms.append(effect_norm.cpu())
                     timestep_values.append(timesteps.detach().float().cpu())
         valid_fraction = float(sum(valid_probes) / max(len(valid_probes), 1))
