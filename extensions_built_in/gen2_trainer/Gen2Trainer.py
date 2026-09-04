@@ -9,6 +9,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from torch.utils.data import ConcatDataset
 
 from jobs.process.BaseSDTrainProcess import BaseSDTrainProcess
 from toolkit.progress_bar import ToolkitProgressBar
@@ -98,8 +99,8 @@ class Gen2Trainer(BaseSDTrainProcess):
         batch_size = int(settings.get("batch_size", self.train_config.batch_size))
         if batch_size < 1:
             raise ValueError(f"phase_{phase}.batch_size must be positive")
-        if self._gen2_split is not None and hasattr(self, "_gen2_train_dataset"):
-            self.data_loader = self._make_gen2_loader(self._gen2_train_dataset, batch_size)
+        if self._gen2_split is not None and hasattr(self, "_gen2_train_datasets"):
+            self.data_loader = self._make_gen2_loader(self._gen2_train_datasets, batch_size)
         elif self.data_loader is not None:
             self.data_loader = get_dataloader_from_datasets(get_dataloader_datasets(self.data_loader), batch_size, self.sd)
         if self.datasets_reg is not None:
@@ -507,11 +508,35 @@ class Gen2Trainer(BaseSDTrainProcess):
         if self.data_loader is None:
             raise ValueError("Gen2 requires the real dataloader before split preflight")
         datasets = get_dataloader_datasets(self.data_loader)
-        if len(datasets) != 1:
-            raise ValueError("Gen2 frozen plan requires exactly one actual dataset")
-        dataset = datasets[0]
+        if not datasets:
+            raise ValueError("Gen2 requires a non-empty actual dataset")
+        configured_datasets = self.config.get("datasets") or []
+        if len(configured_datasets) != 1:
+            raise ValueError("Gen2 frozen plan requires exactly one configured dataset")
+        configured_dataset = (self.config.get("datasets") or [])[0]
+        if len(datasets) > 1:
+            roots = {str(getattr(source, "dataset_path", None) or getattr(getattr(source, "dataset_config", None), "folder_path", None)) for source in datasets}
+            if len(roots) != 1:
+                raise ValueError("Gen2 requires resolution-split datasets to share one source folder")
+            datasets = sorted(datasets, key=lambda source: int(getattr(getattr(source, "dataset_config", None), "resolution", 0)))
+            canonical = datasets[0]
+            canonical_pairs = {_item_pair_hash(item, canonical) for item in canonical.file_list}
+            if not canonical_pairs:
+                raise ValueError("Gen2 canonical dataset shard is empty")
+            for source in datasets[1:]:
+                shard_pairs = {_item_pair_hash(item, source) for item in source.file_list}
+                if shard_pairs != canonical_pairs:
+                    raise ValueError("Gen2 resolution shards do not contain identical image-caption pairs")
+            dataset = canonical
+            if self.accelerator.is_main_process:
+                resolutions = [int(getattr(source.dataset_config, "resolution", 0)) for source in datasets]
+                print(f"Gen2 using canonical split across resolution shards: {resolutions}")
+        else:
+            dataset = datasets[0]
         self._gen2_dataset = dataset
         self._gen2_source_dataset = dataset
+        self._gen2_source_datasets = datasets
+        self._gen2_configured_dataset = configured_dataset
         split_settings = self.gen2_config.dataset_split
         heldout_count = int(split_settings.get("heldout_count", 1))
         seed = int(split_settings.get("seed", 0))
@@ -520,19 +545,30 @@ class Gen2Trainer(BaseSDTrainProcess):
             split_path = self.gen2_root.parent / split_path
         self._gen2_split = ensure_split(split_path, dataset, heldout_count, seed)
         # Zero-heldout is an explicit full-train mode; it is not an error.
-        self._gen2_train_dataset = make_train_dataset_view(dataset, self._gen2_split)
+        self._gen2_train_datasets = [make_train_dataset_view(source, self._gen2_split) for source in self._gen2_source_datasets]
+        self._gen2_train_dataset = self._gen2_train_datasets[0]
         self._prepare_validation_prompts()
-        self.data_loader = self._make_gen2_loader(self._gen2_train_dataset, int(self.gen2_config.phase_a.get("batch_size", self.train_config.batch_size)))
+        self.data_loader = self._make_gen2_loader(self._gen2_train_datasets, int(self.gen2_config.phase_a.get("batch_size", self.train_config.batch_size)))
 
     def _make_gen2_loader(self, dataset, batch_size: int):
-        """Rebuild a loader from the actual train-only dataset, never config objects."""
-        if getattr(dataset.dataset_config, "buckets", False):
-            dataset.batch_size = batch_size
-            dataset.buckets = {}
-            dataset.batch_indices = []
-            dataset.setup_buckets(quiet=True)
-            return DataLoader(dataset, batch_size=None, shuffle=True, drop_last=False, collate_fn=dto_collation, num_workers=0)
-        return DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=False, collate_fn=dto_collation, num_workers=0)
+        """Rebuild a loader from one or more train-only dataset views."""
+        datasets = list(dataset) if isinstance(dataset, (list, tuple)) else [dataset]
+        if not datasets or any(not getattr(item, "file_list", None) for item in datasets):
+            raise ValueError("Gen2 train-only loader requires non-empty dataset views")
+        bucketed = [bool(getattr(item.dataset_config, "buckets", False)) for item in datasets]
+        if any(bucketed) and not all(bucketed):
+            raise ValueError("Gen2 resolution shards must agree on bucket mode")
+        if all(bucketed):
+            for item in datasets:
+                item.batch_size = batch_size
+                item.buckets = {}
+                item.batch_indices = []
+                item.epoch_num = 0
+                item.setup_buckets(quiet=True)
+            combined = ConcatDataset(datasets) if len(datasets) > 1 else datasets[0]
+            return DataLoader(combined, batch_size=None, shuffle=True, drop_last=False, collate_fn=dto_collation, num_workers=0)
+        combined = ConcatDataset(datasets) if len(datasets) > 1 else datasets[0]
+        return DataLoader(combined, batch_size=batch_size, shuffle=True, drop_last=False, collate_fn=dto_collation, num_workers=0)
 
     def _load_gen2_fixed_probes(self) -> None:
         settings = self.gen2_config.phase_a.get("probes") or {}
