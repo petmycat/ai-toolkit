@@ -666,7 +666,7 @@ class Gen2Trainer(BaseSDTrainProcess):
                             noisy_one = self._make_flowmatch_noisy_latents(clean_one, noise_one, timestep_tensor)
                             target_one = (noise_one - clean_one).detach()
                             probes.append({"region": region, "split_label": split_label, "pair_fingerprint": pair, "ordinal": ordinal, "fingerprint": probe_fingerprint(seed, pair, region, ordinal, split_label), "prompt": prompt, "noise_seed": noise_seed, "noisy_latent": noisy_one.detach().cpu().float(), "target": target_one.cpu().float(), "timestep": timestep_tensor.detach().cpu()})
-                    pending.pop(pair)
+                    pending.remove(pair)
                 if hasattr(batch, "cleanup"):
                     batch.cleanup()
         for region, metadata in regions.items():
