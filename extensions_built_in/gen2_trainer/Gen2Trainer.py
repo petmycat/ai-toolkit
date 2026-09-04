@@ -503,6 +503,18 @@ class Gen2Trainer(BaseSDTrainProcess):
         self._validation_prompts = tuple(merged)
 
     def _prepare_gen2_split(self) -> None:
+        if self._gen2_split is not None and hasattr(self, "_gen2_source_datasets") and hasattr(self, "_gen2_train_datasets"):
+            split_settings = self.gen2_config.dataset_split
+            heldout_count = int(split_settings.get("heldout_count", 1))
+            seed = int(split_settings.get("seed", 0))
+            split_path = Path(split_settings.get("artifact_path", self.gen2_root / "dataset_split.json"))
+            if not split_path.is_absolute():
+                split_path = self.gen2_root.parent / split_path
+            canonical = self._gen2_source_datasets[0]
+            validated = ensure_split(split_path, canonical, heldout_count, seed)
+            if validated.dataset_fingerprint != self._gen2_split.dataset_fingerprint:
+                raise ValueError("Gen2 in-memory split no longer matches the immutable split artifact")
+            return
         if self.datasets_reg is not None:
             raise ValueError("Gen2 forbids datasets_reg")
         if self.data_loader is None:
