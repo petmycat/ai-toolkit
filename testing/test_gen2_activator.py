@@ -1,13 +1,17 @@
 import unittest
 
 import torch
+from torch import nn
 
 from extensions_built_in.gen2_trainer.activator import (
     PlaceholderContract,
     SoftTokenBank,
-    TriggerLocalTEAdapter,
+    discover_qwen_down_proj_modules,
+    install_qwen_down_proj_lora,
+    load_qwen_down_proj_lora,
     pack_qwen_activation_features,
     replace_token_spans_with_soft_tokens,
+    trigger_mask_context,
 )
 
 
@@ -27,14 +31,56 @@ class Gen2ActivatorTest(unittest.TestCase):
         packed = pack_qwen_activation_features({0: first, 1: second}, (0, 1))
         self.assertTrue(torch.equal(packed, torch.tensor([[[1.0, 10.0, 2.0, 20.0, 3.0, 30.0]]])))
 
-    def test_trigger_local_adapter_masks_only_activator_rows(self):
-        adapter = TriggerLocalTEAdapter(4, rank=2, alpha=2)
-        adapter.up.weight.data.fill_(1.0)
-        hidden = torch.randn(1, 4, 4)
-        mask = torch.tensor([[0, 1, 1, 0]])
-        residual = adapter(hidden, mask)
-        self.assertTrue(torch.equal(residual[:, [0, 3]], torch.zeros(1, 2, 4)))
-        self.assertTrue(torch.count_nonzero(residual[:, [1, 2]]) > 0)
+    def test_qwen_module_lora_discovers_and_installs_independent_layer_adapters(self):
+        class MLP(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.down_proj = nn.Linear(4, 4, bias=False)
+
+            def forward(self, x):
+                return self.down_proj(x)
+
+        class Layer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mlp = MLP()
+
+            def forward(self, x):
+                return self.mlp(x)
+
+        class Encoder(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.language_model = nn.Module()
+                self.language_model.layers = nn.ModuleList([Layer(), Layer()])
+
+        encoder = Encoder()
+        modules = discover_qwen_down_proj_modules(encoder)
+        bank = install_qwen_down_proj_lora(encoder, rank=2, alpha=2)
+        self.assertEqual(set(modules), {0, 1})
+        self.assertIsNot(bank.adapters["0"], bank.adapters["1"])
+        bank.adapters["0"].up.weight.data.fill_(1.0)
+        bank.adapters["1"].up.weight.data.zero_()
+        hidden = torch.ones(1, 3, 4)
+        with trigger_mask_context(torch.tensor([[1, 0, 1]])):
+            output = encoder.language_model.layers[0].mlp.down_proj(hidden)
+        self.assertTrue(torch.equal(output[:, 1], encoder.language_model.layers[0].mlp.down_proj(hidden)[:, 1]))
+        self.assertTrue(torch.count_nonzero(output[:, [0, 2]] - hidden[:, [0, 2]]) > 0)
+        bank.remove()
+
+    def test_qwen_module_lora_disabled_is_strict_noop_and_rejects_load(self):
+        class Layer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mlp = nn.Module()
+                self.mlp.down_proj = nn.Linear(4, 4, bias=False)
+
+        encoder = nn.Module()
+        encoder.language_model = nn.Module()
+        encoder.language_model.layers = nn.ModuleList([Layer()])
+        self.assertIsNone(install_qwen_down_proj_lora(encoder, enabled=False))
+        with self.assertRaises(RuntimeError):
+            load_qwen_down_proj_lora(None, {"unexpected": torch.ones(1)})
 
     def test_soft_token_span_length(self):
         bank = SoftTokenBank(3, 4, torch.ones(3, 4, dtype=torch.float32))

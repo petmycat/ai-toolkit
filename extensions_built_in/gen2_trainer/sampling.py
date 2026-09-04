@@ -13,12 +13,23 @@ from .unconditional import official_asymmetric_cfg
 class ValidationCase:
     prompt_index: int
     seed: int
+    conditioning_mode: str
     style_gate: float
-    helper_off: bool
     eta_c: float
     eta_u: float
-    conditioning_mode: str = "soft_tokens"
     helper_index: int = 0
+
+    @property
+    def helper_off(self) -> bool:
+        return self.conditioning_mode == "helper" and self.style_gate == 0.0
+
+
+def validation_condition_names() -> tuple[str, ...]:
+    return (
+        "helper_b_off", "helper_b_on", "activator_b_off",
+        "activator_b_on_eta_u_0", "activator_b_on_eta_u_sweep_1",
+        "activator_b_on_eta_u_sweep_2", "literal_e0_b_off", "literal_e0_b_on",
+    )
 
 
 def build_validation_matrix(
@@ -26,24 +37,36 @@ def build_validation_matrix(
     seeds: Iterable[int],
     eta_u_values: Iterable[float],
     include_sweep: bool = True,
+    designated_helper_index: int = 0,
 ) -> list[ValidationCase]:
-    cases = []
+    """Build exactly eight frozen conditions per prompt/seed."""
+    sweep = [float(value) for value in eta_u_values if float(value) != 0.0]
+    if include_sweep and len(sweep) != 2:
+        raise ValueError("validation requires exactly two non-zero eta_u sweep values")
+    if not include_sweep:
+        sweep = []
+    if not isinstance(designated_helper_index, int) or designated_helper_index < 0:
+        raise ValueError("designated helper index must be a non-negative integer")
+    cases: list[ValidationCase] = []
     for prompt_index in range(prompt_count):
         for seed in seeds:
             seed = int(seed)
-            cases.extend(
-                [
-                    ValidationCase(prompt_index, seed, 0.0, True, 0.0, 0.0, "native_helper"),
-                    ValidationCase(prompt_index, seed, 0.0, False, 0.0, 0.0, "soft_tokens"),
-                    ValidationCase(prompt_index, seed, 1.0, True, 1.0, 0.0, "native_helper"),
-                    ValidationCase(prompt_index, seed, 1.0, False, 1.0, 0.0, "soft_tokens"),
-                ]
-            )
+            base_cases = [
+                ValidationCase(prompt_index, seed, "helper", 0.0, 0.0, 0.0, designated_helper_index),
+                ValidationCase(prompt_index, seed, "helper", 1.0, 1.0, 0.0, designated_helper_index),
+                ValidationCase(prompt_index, seed, "activator", 0.0, 0.0, 0.0),
+                ValidationCase(prompt_index, seed, "activator", 1.0, 1.0, 0.0),
+            ]
             if include_sweep:
-                for eta_u in eta_u_values:
-                    eta_u = float(eta_u)
-                    if eta_u != 0.0:
-                        cases.append(ValidationCase(prompt_index, seed, 1.0, False, 1.0, eta_u, "soft_tokens"))
+                base_cases.extend([
+                    ValidationCase(prompt_index, seed, "activator", 1.0, 1.0, sweep[0]),
+                    ValidationCase(prompt_index, seed, "activator", 1.0, 1.0, sweep[1]),
+                ])
+            base_cases.extend([
+                ValidationCase(prompt_index, seed, "literal_e0", 0.0, 0.0, 0.0),
+                ValidationCase(prompt_index, seed, "literal_e0", 1.0, 1.0, 0.0),
+            ])
+            cases.extend(base_cases)
     return cases
 
 

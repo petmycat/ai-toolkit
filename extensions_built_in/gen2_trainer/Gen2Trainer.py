@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import gc
 import json
 import shutil
 from collections import OrderedDict
@@ -9,7 +8,6 @@ from pathlib import Path
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from jobs.process.BaseSDTrainProcess import BaseSDTrainProcess
@@ -17,9 +15,11 @@ from toolkit.progress_bar import ToolkitProgressBar
 
 from .activator import (
     PlaceholderContract,
+    QwenModuleLoRABank,
     SoftTokenBank,
-    TriggerLocalTEAdapter,
+    adapter_enabled_context,
     encode_qwen_inputs_embeds,
+    install_qwen_module_lora,
     normalize_inline_helpers,
     replace_token_spans_with_soft_tokens,
     resample_embedding_sequence,
@@ -27,6 +27,19 @@ from .activator import (
 from .artifacts import load_tensor_artifact, save_tensor_artifact
 from .checkpoint import load_phase_checkpoint, save_phase_checkpoint
 from .config import Gen2RuntimeConfig, validate_gen2_config
+from .controller import AdaptiveJointController, isolated_gradient_cosine
+from .probes import (
+    deterministic_probe_noise,
+    deterministic_probe_noise_seed,
+    deterministic_probe_timestep,
+    load_fixed_probes,
+    probe_fingerprint,
+    save_fixed_probes,
+    select_probe_pairs,
+    validate_regions,
+)
+from .split import _item_pair_hash, ensure_split, make_dataset_view, make_train_dataset_view
+from toolkit.data_loader import DataLoader, dto_collation, get_dataloader_datasets
 from toolkit.data_loader import get_dataloader_from_datasets
 from toolkit.optimizer import get_optimizer
 from toolkit.scheduler import get_lr_scheduler
@@ -34,12 +47,12 @@ from .registry import AdapterRuntimeContext, enable_adapter_training, install_id
 from .sampling import build_validation_matrix, make_flowmatch_noisy_latents, sample_stratified_timesteps
 from .temporal_rank_field import time_smooth_regularizer, time_mean_diagnostic
 from .phase_a_math import (
-    effect_geometry_gate,
-    effect_rms,
-    fit_shared_positive_helper_mixture,
-    normalized_teacher_distillation_loss,
-    positive_cone_geometry,
-    response_field_signature,
+    dataset_mse,
+    detached_ema_prototype,
+    helper_subset_direction_loss,
+    prototype_consistency_loss,
+    spatial_response,
+    timestep_region_masks,
 )
 
 
@@ -54,46 +67,43 @@ class Gen2Trainer(BaseSDTrainProcess):
         self.phase_a_root = self.gen2_root / "phase_a"
         self.phase_b_root = self.gen2_root / "phase_b"
         self.soft_tokens: SoftTokenBank | None = None
-        self._soft_tokens_initial: torch.Tensor | None = None
-        self.trigger_local_adapter: TriggerLocalTEAdapter | None = None
-        self._helper_calibration: dict[str, Any] | None = None
-        self._helper_latched = False
-        self._helper_release_streak = 0
+        self.frozen_e0: torch.Tensor | None = None
+        self.qwen_module_lora: QwenModuleLoRABank | None = None
+        self._phase_a_prototype: dict[str, torch.Tensor] | None = None
+        self._gen2_split = None
         self._last_phase_a_diagnostics: dict[str, float] = {}
         self._phase_a_history: list[dict[str, Any]] = []
         self._phase_b_history: list[dict[str, Any]] = []
-        self._phase_a_geometry: dict[str, Any] | None = None
-        self._phase_a_heldout_geometry: dict[str, Any] | None = None
-        self._phase_a_geometry_ema: dict[str, Any] | None = None
-        self._phase_a_heldout_geometry_ema: dict[str, Any] | None = None
-        self._phase_a_release_reason = "not_evaluated"
-        self._last_effect_gate_checks: dict[str, bool] = {}
-        self._last_effect_gate_passed = False
-        self._phase_a_probes: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, str]] = []
-        self._phase_a_heldout_probes: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, str]] = []
-        self._phase_b_probes: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, str]] = []
-        self.adapter = torch.nn.ModuleDict()
+        self._phase_a_probes: list[dict[str, Any]] = []
+        self._phase_a_heldout_probes: list[dict[str, Any]] = []
+        self._phase_b_probes: list[dict[str, Any]] = []
+        self._gen2_fixed_probe_metadata: dict[str, Any] = {}
         self.official_unconditional = None
         self.helpers = normalize_inline_helpers(self.gen2_config.helpers)
-        self._prepared = False
         self._adapter_bank = None
         self._timestep_bin_orders: dict[str, torch.Tensor] = {}
         self._timestep_bin_cursors: dict[str, int] = {"a": 0, "b": 0}
+        self._validation_prompts: tuple[str, ...] = self.gen2_config.validation_prompts
+        self._designated_helper_id = str((self.config.get("sample") or {}).get("designated_helper_id", ""))
 
     def _assert_qwen_frozen(self) -> None:
-        trainable = [name for name, parameter in self.sd.text_encoder.named_parameters() if parameter.requires_grad]
+        allowed = set()
+        if self.qwen_module_lora is not None:
+            allowed.update(id(parameter) for parameter in self.qwen_module_lora.parameters())
+        trainable = [name for name, parameter in self.sd.text_encoder.named_parameters() if parameter.requires_grad and id(parameter) not in allowed]
         if trainable:
             raise RuntimeError(f"Gen2 requires frozen Qwen parameters, but these are trainable: {trainable[:8]}")
-
     def _rebuild_dataloader_for_phase(self, phase: str) -> None:
         settings = self.gen2_config.phase_a if phase == "a" else self.gen2_config.phase_b
         batch_size = int(settings.get("batch_size", self.train_config.batch_size))
         if batch_size < 1:
             raise ValueError(f"phase_{phase}.batch_size must be positive")
-        if self.datasets is not None:
-            self.data_loader = get_dataloader_from_datasets(self.datasets, batch_size, self.sd)
+        if self._gen2_split is not None and hasattr(self, "_gen2_train_dataset"):
+            self.data_loader = self._make_gen2_loader(self._gen2_train_dataset, batch_size)
+        elif self.data_loader is not None:
+            self.data_loader = get_dataloader_from_datasets(get_dataloader_datasets(self.data_loader), batch_size, self.sd)
         if self.datasets_reg is not None:
-            self.data_loader_reg = get_dataloader_from_datasets(self.datasets_reg, batch_size, self.sd)
+            raise ValueError("Gen2 forbids datasets_reg and regularization loaders")
         self.train_config.batch_size = batch_size
         if self.accelerator.is_main_process:
             print(f"Gen2 Phase {phase.upper()} dataloader batch_size={batch_size}")
@@ -129,17 +139,18 @@ class Gen2Trainer(BaseSDTrainProcess):
             raise ValueError("Gen2 only supports the Ideogram 4 model")
         self.sd.model.requires_grad_(False)
         self.sd.text_encoder.requires_grad_(False)
-        self._assert_qwen_frozen()
         self.sd.vae.requires_grad_(False)
-        activator_config = self.config.get("activator") or {}
-        local_config = activator_config.get("trigger_local_adapter") or {}
-        self.trigger_local_adapter = TriggerLocalTEAdapter(
-            self.soft_tokens.dimension,
-            rank=int(local_config.get("rank", 4)),
-            alpha=float(local_config.get("alpha", 4.0)),
-        ) if bool(local_config.get("enabled", True)) else None
-        if self.trigger_local_adapter is not None:
-            self.trigger_local_adapter.to(self.device_torch)
+        qwen_config = self.gen2_config.qwen.get("per_layer_adapter") or {}
+        self.qwen_module_lora = install_qwen_module_lora(
+            self.sd.text_encoder,
+            rank=int(qwen_config.get("rank", 4)),
+            alpha=float(qwen_config.get("alpha", 4.0)),
+            enabled=bool(qwen_config.get("enabled", True)),
+            layers=qwen_config.get("layers", "all"),
+        )
+        if self.qwen_module_lora is not None:
+            self.qwen_module_lora.to(self.device_torch)
+        self._assert_qwen_frozen()
         network = self.config.get("network") or {}
         temporal = network.get("temporal") or {}
         self._adapter_bank = install_ideogram_adapters(
@@ -152,11 +163,13 @@ class Gen2Trainer(BaseSDTrainProcess):
         self.sd.transformer = self.sd.model
         self.soft_tokens.to(self.device_torch)
         self.modules_being_trained = [self.soft_tokens]
-        if self.trigger_local_adapter is not None:
-            self.modules_being_trained.append(self.trigger_local_adapter)
+        if self.qwen_module_lora is not None:
+            self.modules_being_trained.append(self.qwen_module_lora)
 
     def hook_before_train_loop(self):
         self._preflight_loaded_datasets()
+        # The immutable split must exist before any phase loader is rebuilt.
+        self._prepare_gen2_split()
         if self.accelerator.is_main_process:
             self.logger.start()
         self.prepare_accelerator()
@@ -166,19 +179,22 @@ class Gen2Trainer(BaseSDTrainProcess):
         self.sd.vae = self.accelerator.prepare(self.sd.vae)
         self.sd.unet = self.accelerator.prepare(self.sd.unet)
         modules = [self.soft_tokens]
-        if self.trigger_local_adapter is not None:
-            modules.append(self.trigger_local_adapter)
+        if self.qwen_module_lora is not None:
+            modules.append(self.qwen_module_lora)
         prepared = self.accelerator.prepare(*modules, self.optimizer)
-        if self.trigger_local_adapter is not None:
-            self.soft_tokens, self.trigger_local_adapter, self.optimizer = prepared
-        else:
-            self.soft_tokens, self.optimizer = prepared
-        self._prepared = True
+        index = 0
+        self.soft_tokens = prepared[index]
+        index += 1
+        if self.qwen_module_lora is not None:
+            self.qwen_module_lora = prepared[index]
+            index += 1
+        self.optimizer = prepared[index]
         if self.lr_scheduler is not None:
             self.lr_scheduler = self.accelerator.prepare(self.lr_scheduler)
         self.modules_being_trained = [self.soft_tokens]
-        if self.trigger_local_adapter is not None:
-            self.modules_being_trained.append(self.trigger_local_adapter)
+        if self.qwen_module_lora is not None:
+            self.modules_being_trained.append(self.qwen_module_lora)
+        self._assert_qwen_frozen()
 
     def hook_add_extra_train_params(self, params):
         params.clear()
@@ -192,12 +208,12 @@ class Gen2Trainer(BaseSDTrainProcess):
             "params": [self.soft_tokens.A],
             "lr": self.train_config.lr,
         })
-        if self.trigger_local_adapter is not None:
-            local_config = ((self.config.get("activator") or {}).get("trigger_local_adapter") or {})
+        if self.qwen_module_lora is not None:
+            qwen_config = self.gen2_config.qwen.get("per_layer_adapter") or {}
             params.append({
-                "params": list(self.trigger_local_adapter.parameters()),
-                "lr": float(local_config["lr"]),
-                "weight_decay": float(local_config.get("weight_decay", 0.0)),
+                "params": list(self.qwen_module_lora.parameters()),
+                "lr": float(qwen_config["lr"]),
+                "weight_decay": float(qwen_config.get("weight_decay", 0.0)),
             })
         return params
 
@@ -256,7 +272,7 @@ class Gen2Trainer(BaseSDTrainProcess):
     def _make_flowmatch_noisy_latents(self, clean: torch.Tensor, noise: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
         return make_flowmatch_noisy_latents(clean, noise, timestep)
 
-    def _encode_soft_prompt(self, raw_caption: str, diagnostics: dict[str, Any] | None = None, return_pooled: bool = False):
+    def _encode_soft_prompt(self, raw_caption: str, diagnostics: dict[str, Any] | None = None, return_pooled: bool = False, token_bank: SoftTokenBank | None = None, adapter_enabled: bool = True):
         from extensions_built_in.diffusion_models.ideogram4.src.pipeline import QWEN3_VL_ACTIVATION_LAYERS
         from toolkit.ideogram_caption import digest_caption_string
 
@@ -288,13 +304,16 @@ class Gen2Trainer(BaseSDTrainProcess):
             cursor = end
         token_ids = torch.tensor(encoded["input_ids"], device=self.sd.text_encoder.device, dtype=torch.long)
         ordinary = self.sd.text_encoder.language_model.embed_tokens(token_ids)
-        expanded, expanded_spans = replace_token_spans_with_soft_tokens(ordinary, spans, self.soft_tokens)
+        active_bank = token_bank or self.soft_tokens
+        if active_bank is None:
+            raise RuntimeError("Gen2 soft-token bank is not initialized")
+        expanded, expanded_spans = replace_token_spans_with_soft_tokens(ordinary, spans, active_bank)
         activator_mask = torch.zeros(expanded.shape[0], device=expanded.device, dtype=torch.long)
         for start, end in expanded_spans:
             activator_mask[start:end] = 1
         if diagnostics is not None:
             ordinary_norm = ordinary.float().norm(dim=-1)
-            soft_norm = self.soft_tokens.A.float().norm(dim=-1)
+            soft_norm = active_bank.A.float().norm(dim=-1)
             diagnostics.update(
                 {
                     "raw_token_length": int(ordinary.shape[0]),
@@ -313,17 +332,17 @@ class Gen2Trainer(BaseSDTrainProcess):
         expanded = expanded.unsqueeze(0)
         attention_mask = torch.ones(expanded.shape[:2], device=expanded.device, dtype=torch.long)
         pos_2d = (attention_mask.cumsum(dim=-1) - 1).clamp(min=0)
-        encoded = encode_qwen_inputs_embeds(
-            self.sd.text_encoder,
-            expanded,
-            attention_mask,
-            pos_2d,
-            QWEN3_VL_ACTIVATION_LAYERS,
-            activator_mask=activator_mask.unsqueeze(0),
-            trigger_local_adapter=self.trigger_local_adapter,
-            return_details=diagnostics is not None or return_pooled,
-            gradient_checkpointing=bool(self.gen2_config.phase_a.get("gradient_checkpointing", self.config.get("train", {}).get("gradient_checkpointing", False))),
-        )
+        with adapter_enabled_context(adapter_enabled):
+            encoded = encode_qwen_inputs_embeds(
+                self.sd.text_encoder,
+                expanded,
+                attention_mask,
+                pos_2d,
+                QWEN3_VL_ACTIVATION_LAYERS,
+                activator_mask=activator_mask.unsqueeze(0),
+                return_details=diagnostics is not None or return_pooled,
+                gradient_checkpointing=bool(self.gen2_config.phase_a.get("gradient_checkpointing", self.config.get("train", {}).get("gradient_checkpointing", False))),
+            )
         if diagnostics is not None or return_pooled:
             features, pooled, ordinary_pooled = encoded
             if diagnostics is not None:
@@ -334,8 +353,59 @@ class Gen2Trainer(BaseSDTrainProcess):
             return features[0].to(self.sd.torch_dtype)
         return encoded[0].to(self.sd.torch_dtype)
 
+    def _encode_frozen_e0_prompt(self, raw_caption: str, diagnostics: dict[str, Any] | None = None):
+        """Encode E0 with identical expansion geometry and all adapters disabled."""
+        if self.frozen_e0 is None:
+            raise RuntimeError("immutable E0 is not initialized")
+        bank = SoftTokenBank(self.soft_tokens.tokens, self.soft_tokens.dimension, self.frozen_e0.detach())
+        with torch.no_grad():
+            return self._encode_soft_prompt(
+                raw_caption,
+                diagnostics=diagnostics,
+                token_bank=bank,
+                adapter_enabled=False,
+            )
+
+    def _qwen_adapter_tensors(self) -> dict[str, torch.Tensor]:
+        if self.qwen_module_lora is None:
+            return {}
+        return {f"qwen_adapter.{key}": value.detach().cpu() for key, value in self.qwen_module_lora.state_dict().items()}
+
+    def _qwen_adapter_metadata(self) -> dict[str, Any]:
+        config = self.gen2_config.qwen.get("per_layer_adapter") or {}
+        return {
+            "qwen_per_layer_adapter": self.qwen_module_lora is not None,
+            "qwen_per_layer_adapter_layers": list(self.qwen_module_lora.layer_indices) if self.qwen_module_lora is not None else [],
+            "qwen_per_layer_adapter_rank": int(config.get("rank", 4)),
+            "qwen_per_layer_adapter_alpha": float(config.get("alpha", 4.0)),
+        }
+
+    def _load_qwen_adapter_state(self, tensors: dict[str, torch.Tensor], metadata: dict[str, Any]) -> None:
+        expected = self.qwen_module_lora is not None
+        if bool(metadata.get("qwen_per_layer_adapter", False)) != expected:
+            raise ValueError("artifact/checkpoint Qwen per-layer adapter setting does not match current configuration")
+        state = {key.removeprefix("qwen_adapter."): value for key, value in tensors.items() if key.startswith("qwen_adapter.")}
+        if expected:
+            if not state:
+                raise ValueError("artifact/checkpoint is missing Qwen per-layer adapter state")
+            expected_layers = list(self.qwen_module_lora.layer_indices)
+            if list(metadata.get("qwen_per_layer_adapter_layers", [])) != expected_layers:
+                raise ValueError("artifact/checkpoint Qwen adapter layer metadata does not match")
+            config = self.gen2_config.qwen.get("per_layer_adapter") or {}
+            if int(metadata.get("qwen_per_layer_adapter_rank", -1)) != int(config.get("rank", 4)):
+                raise ValueError("artifact/checkpoint Qwen adapter rank metadata does not match")
+            if float(metadata.get("qwen_per_layer_adapter_alpha", -1.0)) != float(config.get("alpha", 4.0)):
+                raise ValueError("artifact/checkpoint Qwen adapter alpha metadata does not match")
+            self.qwen_module_lora.load_state_dict(state, strict=True)
+        elif state:
+            raise ValueError("artifact/checkpoint contains Qwen adapter state but adapter is disabled")
+
     def _phase_checkpoint(self, phase: str, step: int, tensors: dict[str, torch.Tensor], metadata: dict[str, Any], optimizer, scheduler=None) -> None:
         root = self.phase_a_root if phase == "a" else self.phase_b_root
+        tensors = dict(tensors)
+        tensors.update(self._qwen_adapter_tensors())
+        metadata = dict(metadata)
+        metadata.update(self._qwen_adapter_metadata())
         path = root / f"step_{step:06d}"
         phase_key = phase.lower()
         order = self._timestep_bin_orders.get(phase_key)
@@ -355,67 +425,6 @@ class Gen2Trainer(BaseSDTrainProcess):
             for old_checkpoint in checkpoints[:-keep]:
                 shutil.rmtree(old_checkpoint)
 
-    def _native_ordinary_pooled(self, prompts, replacements):
-        from toolkit.ideogram_caption import digest_caption_string
-
-        pooled = []
-        for prompt, replacement in zip(prompts, replacements):
-            materialized = self.placeholder_contract.replace(prompt, replacement)
-            normalized = digest_caption_string(materialized)
-            messages = [{"role": "user", "content": [{"type": "text", "text": normalized}]}]
-            text = self.sd.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-            encoded = self.sd.tokenizer(text, add_special_tokens=False, return_offsets_mapping=True, truncation=True, max_length=self.sd.max_text_length)
-            offsets = encoded.get("offset_mapping")
-            features = self.sd.get_prompt_embeds([materialized]).text_embeds[0].float()
-            if offsets is None:
-                pooled.append(features.mean(dim=0))
-                continue
-            replacement_indices = set()
-            cursor = 0
-            while True:
-                start = text.find(replacement, cursor)
-                if start < 0:
-                    break
-                end = start + len(replacement)
-                replacement_indices.update(index for index, (left, right) in enumerate(offsets) if right > start and left < end)
-                cursor = end
-            keep = [index for index in range(features.shape[0]) if index not in replacement_indices]
-            pooled.append(features[keep].mean(dim=0) if keep else features.mean(dim=0))
-        return torch.stack(pooled)
-
-    def _native_span_pooled(self, prompts, replacements):
-        from toolkit.ideogram_caption import digest_caption_string
-
-        pooled = []
-        for prompt, replacement in zip(prompts, replacements):
-            materialized = self.placeholder_contract.replace(prompt, replacement)
-            normalized = digest_caption_string(materialized)
-            messages = [{"role": "user", "content": [{"type": "text", "text": normalized}]}]
-            text = self.sd.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-            encoded = self.sd.tokenizer(text, add_special_tokens=False, return_offsets_mapping=True, truncation=True, max_length=self.sd.max_text_length)
-            offsets = encoded.get("offset_mapping")
-            features = self.sd.get_prompt_embeds([materialized]).text_embeds[0].float()
-            if offsets is None:
-                pooled.append(features.mean(dim=0))
-                continue
-            spans = []
-            cursor = 0
-            while True:
-                start = text.find(replacement, cursor)
-                if start < 0:
-                    break
-                end = start + len(replacement)
-                indices = [index for index, (left, right) in enumerate(offsets) if right > start and left < end]
-                if indices:
-                    spans.append((indices[0], indices[-1] + 1))
-                cursor = end
-            if not spans:
-                pooled.append(features.mean(dim=0))
-                continue
-            pieces = [features[start:min(end, features.shape[0])] for start, end in spans if start < features.shape[0]]
-            pooled.append(torch.stack([piece.mean(dim=0) for piece in pieces]).mean(dim=0))
-        return torch.stack(pooled)
-
     def _prompt_prediction(self, prompts, noisy_latents, timesteps, target=None, adapter_context=None):
         from extensions_built_in.gen2_trainer.registry import clear_adapter_context
 
@@ -427,13 +436,34 @@ class Gen2Trainer(BaseSDTrainProcess):
             return prediction
         return torch.nn.functional.mse_loss(prediction.float(), target.float(), reduction="none").flatten(1).mean(1)
 
+    @staticmethod
+    def _advanced_prompt_embeds(features):
+        from toolkit.advanced_prompt_embeds import AdvancedPromptEmbeds
+        return AdvancedPromptEmbeds(text_embeds=features)
+
+    def _literal_prompt_embeds(self, prompt: str):
+        if self.frozen_e0 is None:
+            raise RuntimeError("literal E0 is unavailable")
+        return self._advanced_prompt_embeds([self._encode_frozen_e0_prompt(prompt).detach()])
+
+    def _frozen_e0_prediction(self, prompts, noisy_latents, timesteps, target=None):
+        """Predict with the same expanded geometry using immutable E0 and no Qwen adapter."""
+        from extensions_built_in.gen2_trainer.registry import clear_adapter_context
+        clear_adapter_context(self.sd.transformer)
+        features = [self._encode_frozen_e0_prompt(prompt) for prompt in prompts]
+        embeds = self._advanced_prompt_embeds(features)
+        prediction = self.sd.get_noise_prediction(noisy_latents, timesteps, embeds)
+        clear_adapter_context(self.sd.transformer)
+        if target is None:
+            return prediction
+        return torch.nn.functional.mse_loss(prediction.float(), target.float(), reduction="none").flatten(1).mean(1)
+
     def _activator_prediction(self, prompts, noisy_latents, timesteps, target=None):
         from extensions_built_in.gen2_trainer.registry import clear_adapter_context
 
         clear_adapter_context(self.sd.transformer)
-        base_embeds = self.sd.get_prompt_embeds(prompts)
         features = [self._encode_soft_prompt(prompt) for prompt in prompts]
-        embeds = type(base_embeds)(text_embeds=features)
+        embeds = self._advanced_prompt_embeds(features)
         prediction = self.sd.get_noise_prediction(noisy_latents, timesteps, embeds)
         clear_adapter_context(self.sd.transformer)
         if target is None:
@@ -454,354 +484,337 @@ class Gen2Trainer(BaseSDTrainProcess):
                 batch.cleanup()
         return probes, iterator
 
-    def _literal_prompt(self, prompt: str) -> str:
-        literal = ((self.config.get("activator") or {}).get("initialization") or {}).get("literal", "")
-        return self.placeholder_contract.replace(prompt, literal)
 
-    def _run_helper_calibration(self, probes):
-        if not probes or not self.helpers:
-            raise RuntimeError("Phase A helper calibration requires probes and at least one helper")
-        calibration = self._calibrate_helper_effect_geometry(probes)
-        if calibration["valid_fraction"] < 1.0:
-            raise RuntimeError(
-                "Phase A helper-effect calibration found degenerate teacher probes: "
-                f"valid_fraction={calibration['valid_fraction']:.3f}"
-            )
-        self._helper_calibration = calibration
-        if self.accelerator.is_main_process:
-            weights = calibration["mixture_weights"]
-            print(
-                "Phase A helper calibration: shared positive mixture; "
-                f"valid_fraction={calibration['valid_fraction']:.3f}; "
-                f"weights={[round(value, 4) for value in weights]}"
-            )
-        return calibration
+    def _prepare_validation_prompts(self) -> None:
+        if self._gen2_split is None or not hasattr(self, "_gen2_dataset"):
+            raise RuntimeError("Gen2 validation prompts require an active dataset split")
+        heldout_ids = set(self._gen2_split.heldout_pair_sha256)
+        heldout_prompts: list[str] = []
+        for item in getattr(self._gen2_dataset, "file_list", []):
+            if _item_pair_hash(item, self._gen2_dataset) in heldout_ids:
+                prompt = str(item.raw_caption)
+                if prompt in heldout_prompts:
+                    raise ValueError("heldout validation prompts contain duplicates")
+                heldout_prompts.append(prompt)
+        merged = heldout_prompts + list(self.gen2_config.validation_prompts)
+        if len(set(merged)) != len(merged):
+            raise ValueError("heldout and YAML validation prompts must not overlap")
+        self._validation_prompts = tuple(merged)
 
-    def _calibrate_helper_effect_geometry(self, probes):
-        helper_effect_batches = []
-        target_effect_batches = []
-        norms = []
-        timestep_values = []
-        valid_probes = []
-        with torch.no_grad():
-            for noisy, timesteps, target, prompt in probes:
-                literal = self._prompt_prediction([self._literal_prompt(prompt)], noisy, timesteps)
-                effects = []
-                for helper in self.helpers:
-                    helper_prompt = self.placeholder_contract.replace(prompt, helper["replacement"])
-                    effects.append(self._prompt_prediction([helper_prompt], noisy, timesteps) - literal)
-                stacked = torch.stack(effects)
-                target_effect = target - literal
-                effect_norm = stacked.float().flatten(2).norm(dim=2)
-                valid = bool(torch.isfinite(stacked).all() and torch.isfinite(target_effect).all() and torch.all(effect_norm > 1e-8))
-                valid_probes.append(valid)
-                if valid:
-                    helper_effect_batches.append(torch.stack([response_field_signature(effect).squeeze(0) for effect in effects], dim=0).unsqueeze(1))
-                    target_effect_batches.append(response_field_signature(target_effect))
-                    norms.append(effect_norm.cpu())
-                    timestep_values.append(timesteps.detach().float().cpu())
-        valid_fraction = float(sum(valid_probes) / max(len(valid_probes), 1))
-        if not helper_effect_batches:
-            raise RuntimeError("Phase A helper calibration produced no finite, non-degenerate probes")
-        helper_effects = torch.cat(helper_effect_batches, dim=1)
-        target_effects = torch.cat(target_effect_batches, dim=0)
-        mixture = fit_shared_positive_helper_mixture(
-            helper_effects,
-            target_effects,
-            iterations=int((self.gen2_config.phase_a.get("calibration") or {}).get("mixture_iterations", 128)),
+    def _prepare_gen2_split(self) -> None:
+        if self.datasets_reg is not None:
+            raise ValueError("Gen2 forbids datasets_reg")
+        if self.data_loader is None:
+            raise ValueError("Gen2 requires the real dataloader before split preflight")
+        datasets = get_dataloader_datasets(self.data_loader)
+        if len(datasets) != 1:
+            raise ValueError("Gen2 frozen plan requires exactly one actual dataset")
+        dataset = datasets[0]
+        self._gen2_dataset = dataset
+        self._gen2_source_dataset = dataset
+        split_settings = self.gen2_config.dataset_split
+        heldout_count = int(split_settings.get("heldout_count", 1))
+        seed = int(split_settings.get("seed", 0))
+        split_path = Path(split_settings.get("artifact_path", self.gen2_root / "dataset_split.json"))
+        if not split_path.is_absolute():
+            split_path = self.gen2_root.parent / split_path
+        self._gen2_split = ensure_split(split_path, dataset, heldout_count, seed)
+        # Zero-heldout is an explicit full-train mode; it is not an error.
+        self._gen2_train_dataset = make_train_dataset_view(dataset, self._gen2_split)
+        self._prepare_validation_prompts()
+        self.data_loader = self._make_gen2_loader(self._gen2_train_dataset, int(self.gen2_config.phase_a.get("batch_size", self.train_config.batch_size)))
+
+    def _make_gen2_loader(self, dataset, batch_size: int):
+        """Rebuild a loader from the actual train-only dataset, never config objects."""
+        if getattr(dataset.dataset_config, "buckets", False):
+            dataset.batch_size = batch_size
+            dataset.buckets = {}
+            dataset.batch_indices = []
+            dataset.setup_buckets(quiet=True)
+            return DataLoader(dataset, batch_size=None, shuffle=True, drop_last=False, collate_fn=dto_collation, num_workers=0)
+        return DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=False, collate_fn=dto_collation, num_workers=0)
+
+    def _load_gen2_fixed_probes(self) -> None:
+        settings = self.gen2_config.phase_a.get("probes") or {}
+        if self._gen2_split is None:
+            raise RuntimeError("Gen2 dataset split must be prepared before fixed probes")
+        # Probe artifact locations are run-scoped and shared by both phases.
+        json_path = self.gen2_root / "fixed_probes.json"
+        tensor_path = self.gen2_root / "fixed_probes.safetensors"
+        configured_json = settings.get("json_path") or settings.get("artifact_path") or settings.get("path")
+        configured_tensor = settings.get("safetensors_path") or settings.get("tensor_artifact_path")
+        if configured_json:
+            json_path = Path(configured_json)
+            if not json_path.is_absolute():
+                json_path = self.gen2_root.parent / json_path
+        if configured_tensor:
+            tensor_path = Path(configured_tensor)
+            if not tensor_path.is_absolute():
+                tensor_path = self.gen2_root.parent / tensor_path
+        timestep_count = int(settings.get("timestep_count", 1))
+        expected_pair_count = len(self._gen2_split.heldout_records)
+        regions = validate_regions({name: {**metadata, "timestep_count": timestep_count, "pair_count": expected_pair_count} for name, metadata in (settings.get("regions") or {}).items()})
+        if not json_path.exists() or not tensor_path.exists():
+            self._create_gen2_fixed_probes(json_path, tensor_path, regions)
+        probes, metadata = load_fixed_probes(
+            json_path,
+            tensor_path,
+            expected_split_fingerprint=self._gen2_split.dataset_fingerprint,
+            expected_regions=regions,
         )
-        effect_norm_tensor = torch.cat(norms, dim=1)
-        common_rms = effect_rms(helper_effects.mean(dim=0))
-        timestep_tensor = torch.cat(timestep_values)
-        bins = int(self.gen2_config.phase_a.get("timestep_bins", 10))
-        bin_ids = torch.clamp((timestep_tensor / 1000.0 * bins).long(), max=bins - 1)
-        bin_scales = []
-        for bin_index in range(bins):
-            selected = common_rms[bin_ids == bin_index]
-            bin_scales.append(float(torch.quantile(selected, 0.5).item()) if selected.numel() else float(common_rms.median().item()))
-        normalized = F.normalize(effect_norm_tensor, dim=1)
-        pairwise = normalized @ normalized.T
-        return {
-            "status": "dataset_selected_shared_positive_mixture",
-            "valid_fraction": valid_fraction,
-            "mixture_weights": mixture["weights"].cpu().tolist(),
-            "mixture_weight_entropy": float(mixture["entropy"].item()),
-            "mixture_fit_residual_norm": float(mixture["residual"].float().flatten(1).norm(dim=1).mean().item()),
-            "mixture_fit_relative_residual": float(mixture["relative_fit"].item()),
-            "effect_norms": effect_norm_tensor.T.tolist(),
-            "helper_scales": torch.quantile(effect_norm_tensor, 0.5, dim=1).tolist(),
-            "timestep_bin_scales": bin_scales,
-            "timestep_bins": bins,
-            "pairwise_cosine": pairwise.cpu().tolist(),
+        self._phase_a_probes = [item for item in probes if item.get("split_label") == "train"]
+        self._phase_a_heldout_probes = [item for item in probes if item.get("split_label") == "heldout"]
+        if self._gen2_split.heldout_count > 0 and not self._phase_a_heldout_probes:
+            raise ValueError("fixed probe artifact is missing required heldout probes")
+        self._phase_b_probes = list(self._phase_a_heldout_probes)
+        self._gen2_fixed_probe_metadata = metadata
+
+    def _create_gen2_fixed_probes(self, json_path: Path, tensor_path: Path, regions: dict[str, dict[str, Any]]) -> None:
+        """Create exact fixed probes once; never replace an existing artifact."""
+        if json_path.exists() or tensor_path.exists():
+            raise FileExistsError("Gen2 fixed probe artifact is incomplete; refusing silent regeneration")
+        split = self._gen2_split
+        train_records = list(split.train_records)
+        heldout_records = list(split.heldout_records)
+        pair_count = len(heldout_records)
+        if pair_count > len(train_records):
+            raise ValueError("Gen2 fixed probes require at least heldout_count train pairs")
+        seed = int((self.gen2_config.phase_a.get("probes") or {})["probe_seed"])
+        selected_ids = set(select_probe_pairs([record.pair_sha256 for record in train_records], pair_count, seed, "train"))
+        selected_train = [record for record in train_records if record.pair_sha256 in selected_ids]
+        # Build a separate heldout view without ever attaching it to self.data_loader.
+        full_dataset = self._gen2_source_dataset
+        heldout_dataset = make_dataset_view(full_dataset, split.heldout_pair_sha256, require_nonempty=False)
+        probe_loader = self._make_gen2_loader(self._gen2_train_dataset, 1)
+        heldout_loader = self._make_gen2_loader(heldout_dataset, 1) if heldout_dataset.file_list else None
+        train_iter, heldout_iter = iter(probe_loader), iter(heldout_loader) if heldout_loader is not None else None
+        probes: list[dict[str, Any]] = []
+        for split_label, records, iterator, dataset in (("train", selected_train, train_iter, self._gen2_train_dataset), ("heldout", heldout_records, heldout_iter, heldout_dataset)):
+            if not records:
+                continue
+            record_ids = {record.pair_sha256 for record in records}
+            pending = set(record_ids)
+            while pending:
+                if iterator is None:
+                    raise RuntimeError("fixed probe dataloader is unavailable")
+                batch, iterator = self._next_batch(iterator, probe_loader if split_label == "train" else heldout_loader)
+                noisy, noise, timesteps, prompts, _ = self._prepare_real_batch(batch, "a")
+                target = self.sd.get_loss_target(noise=noise, batch=batch).detach()
+                for index, item in enumerate(batch.file_items):
+                    pair = _item_pair_hash(item, dataset)
+                    if pair not in pending:
+                        continue
+                    prompt = prompts[index]
+                    for region, metadata in regions.items():
+                        start, end, count = int(metadata.get("min", metadata.get("start"))), int(metadata.get("max", metadata.get("end"))), int(metadata["timestep_count"])
+                        for ordinal in range(count):
+                            timestep_value = deterministic_probe_timestep(seed, pair, region, ordinal, start, end, split_label, count)
+                            timestep_tensor = torch.tensor([float(timestep_value)], device=noisy.device)
+                            clean_one = batch.latents[index:index + 1]
+                            noise_one, noise_seed = deterministic_probe_noise(clean_one, seed, pair, region, ordinal, split_label)
+                            expected_noise_seed = deterministic_probe_noise_seed(seed, pair, region, ordinal, split_label)
+                            if noise_seed != expected_noise_seed:
+                                raise RuntimeError("fixed probe derived noise seed mismatch")
+                            noisy_one = self._make_flowmatch_noisy_latents(clean_one, noise_one, timestep_tensor)
+                            target_one = (noise_one - clean_one).detach()
+                            probes.append({"region": region, "split_label": split_label, "pair_fingerprint": pair, "ordinal": ordinal, "fingerprint": probe_fingerprint(seed, pair, region, ordinal, split_label), "prompt": prompt, "noise_seed": noise_seed, "noisy_latent": noisy_one.detach().cpu().float(), "target": target_one.cpu().float(), "timestep": timestep_tensor.detach().cpu()})
+                    pending.pop(pair)
+                if hasattr(batch, "cleanup"):
+                    batch.cleanup()
+        for region, metadata in regions.items():
+            metadata["pair_count"] = pair_count
+        save_fixed_probes(json_path, tensor_path, probes, split_fingerprint=split.dataset_fingerprint, seed=seed, regions=regions)
+        # Force a post-write reload/hash validation before training can proceed.
+        load_fixed_probes(json_path, tensor_path, expected_split_fingerprint=split.dataset_fingerprint, expected_regions=regions)
+
+    def _probe_loss_and_direction(self, probes, parameters):
+        if not probes:
+            return None, None, {"valid": False, "reason": "no_fixed_probes"}
+        dataset_losses, helper_losses = [], []
+        responses_by_region: dict[str, list[torch.Tensor]] = {}
+        for probe in probes:
+            noisy = probe["noisy_latent"].to(self.device_torch)
+            target = probe["target"].to(self.device_torch)
+            timestep = probe["timestep"].to(self.device_torch)
+            prompt = probe["prompt"]
+            activator = self._activator_prediction([prompt], noisy, timestep)
+            dataset_losses.append(dataset_mse(activator, target))
+            with torch.no_grad():
+                baseline = self._frozen_e0_prediction([prompt], noisy, timestep)
+                helper_stack = torch.stack([
+                    self._prompt_prediction(
+                        [self.placeholder_contract.replace(prompt, helper["replacement"])], noisy, timestep
+                    ) for helper in self.helpers
+                ])
+            helper_loss, cosines, valid = helper_subset_direction_loss(activator, helper_stack, baseline)
+            if bool(valid.any()):
+                helper_losses.append(helper_loss)
+            responses_by_region.setdefault(str(probe["region"]), []).append(spatial_response((activator - baseline).detach())[0])
+        if not dataset_losses:
+            return None, None, {"valid": False, "reason": "empty_fixed_probes"}
+        dataset_loss = torch.stack(dataset_losses).mean()
+        helper_loss = torch.stack(helper_losses).mean() if helper_losses else dataset_loss.detach() * 0.0
+        cosine = isolated_gradient_cosine(dataset_loss, helper_loss, parameters, retain_graph=False)
+        prototype = {region: torch.stack(values).mean(0) for region, values in responses_by_region.items()}
+        return dataset_loss.detach(), prototype, {
+            "valid": cosine is not None,
+            "count": len(dataset_losses),
+            "helper_valid_count": len(helper_losses),
+            "helper_loss": float(helper_loss.detach().item()),
+            "global_gradient_cosine": float(cosine.item()) if cosine is not None else None,
+            "prototype_regions": sorted(responses_by_region),
         }
 
-    def _evaluate_effect_geometry(self, probes):
-        if not probes or not self.helpers:
-            return {"alignment": 0.0, "orthogonal_fraction": 1.0, "magnitude_ratio": 0.0, "valid_fraction": 0.0, "rank": 0.0}
-        alignments = []
-        orthogonal_fractions = []
-        magnitude_ratios = []
-        valid_fractions = []
-        ranks = []
-        with torch.no_grad():
-            for noisy, timesteps, target, prompt in probes:
-                literal_prediction = self._prompt_prediction([self._literal_prompt(prompt)], noisy, timesteps)
-                helper_predictions = []
-                for helper in self.helpers:
-                    helper_prompt = self.placeholder_contract.replace(prompt, helper["replacement"])
-                    helper_predictions.append(self._prompt_prediction([helper_prompt], noisy, timesteps))
-                helper_effects = torch.stack(helper_predictions) - literal_prediction.unsqueeze(0)
-                activator_prediction = self._activator_prediction([prompt], noisy, timesteps)
-                geometry = positive_cone_geometry(
-                    helper_effects,
-                    activator_prediction - literal_prediction,
-                    iterations=int(self.gen2_config.phase_a.get("effect_geometry", {}).get("cone_iterations", 64)),
-                )
-                valid = geometry["valid"]
-                activator_norm = geometry["activator_norm"]
-                helper_norms = helper_effects.float().flatten(2).norm(dim=2).median(dim=0).values
-                magnitude_ratio = geometry["projection_norm"] / helper_norms.clamp_min(1e-8)
-                alignments.append(geometry["alignment"][valid].mean() if torch.any(valid) else torch.zeros((), device=noisy.device))
-                orthogonal_fractions.append(geometry["orthogonal_fraction"][valid].mean() if torch.any(valid) else torch.ones((), device=noisy.device))
-                magnitude_ratios.append(magnitude_ratio[valid].mean() if torch.any(valid) else torch.zeros((), device=noisy.device))
-                valid_fractions.append(valid.float().mean())
-                ranks.append((geometry["coefficients"] > 1e-8).float().sum(dim=1).mean())
-        return {
-            "alignment": float(torch.stack(alignments).mean().item()),
-            "orthogonal_fraction": float(torch.stack(orthogonal_fractions).mean().item()),
-            "magnitude_ratio": float(torch.stack(magnitude_ratios).mean().item()),
-            "valid_fraction": float(torch.stack(valid_fractions).mean().item()),
-            "rank": float(torch.stack(ranks).mean().item()),
-        }
-
-    def _update_geometry_ema(self, previous, current, decay: float):
-        if previous is None:
-            return dict(current)
-        return {
-            key: float(previous.get(key, value)) * decay + float(value) * (1.0 - decay)
-            for key, value in current.items()
-        }
-
-    def _effect_release_gate(self, train_geometry, heldout_geometry, geometry_config):
-        min_alignment = float(geometry_config.get("release_min_alignment", 0.5))
-        max_orthogonal = float(geometry_config.get("release_max_orthogonal_fraction", 0.5))
-        min_magnitude = float(geometry_config.get("release_min_magnitude_ratio", 0.1))
-        max_magnitude = float(geometry_config.get("release_max_magnitude_ratio", 2.0))
-        return effect_geometry_gate(
-            train_geometry,
-            heldout_geometry,
-            min_alignment=min_alignment,
-            max_orthogonal_fraction=max_orthogonal,
-            min_magnitude_ratio=min_magnitude,
-            max_magnitude_ratio=max_magnitude,
-        )
-
-    def _run_phase_a(self) -> None:
+    def _run_frozen_phase_a(self) -> None:
         steps = self._phase_steps("a")
         if steps <= 0:
             return
-        if self.data_loader is None:
-            raise RuntimeError("Phase A requires the real dataset dataloader")
+        self._prepare_gen2_split()
         self._rebuild_dataloader_for_phase("a")
+        self._load_gen2_fixed_probes()
         self._initialize_soft_tokens_from_literal_trigger()
         settings = self.gen2_config.phase_a
-        curriculum = settings.get("curriculum") or {}
-        geometry_config = settings.get("effect_geometry") or {}
-        optimizer = self.optimizer
-        if optimizer is None:
-            raise RuntimeError("Phase A optimizer was not prepared")
+        helpers_per_step = int(settings.get("helpers_per_step", self.gen2_config.helpers_per_step))
+        if not 1 <= helpers_per_step <= 5 or helpers_per_step > len(self.helpers):
+            raise ValueError("phase_a.helpers_per_step must be between 1 and the number of helpers")
+        accumulation = int((settings.get("curriculum") or {}).get("accumulation_steps", settings.get("gradient_accumulation_steps", 1)))
+        if accumulation < 1:
+            raise ValueError("phase_a accumulation steps must be positive")
         iterator = iter(self.data_loader)
-        calibration_settings = settings.get("calibration") or {}
-        calibration_seed = int(calibration_settings.get("seed", 1234))
-        torch.random.manual_seed(calibration_seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(calibration_seed)
-        probe_count = int(calibration_settings.get("probe_count", 8))
-        heldout_count = int((settings.get("calibration") or {}).get("heldout_count", 4))
-        probes, iterator = self._collect_phase_a_probes(probe_count + heldout_count, iterator)
-        self._phase_a_probes = probes[:probe_count]
-        self._phase_a_heldout_probes = probes[probe_count:]
-        self._run_helper_calibration(self._phase_a_probes)
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        helper_supervision_available = bool(self.helpers) and float(self._helper_calibration.get("valid_fraction", 0.0)) == 1.0
-        physical_batch = int(settings.get("batch_size", 1))
-        microbatch_size = int(curriculum.get("microbatch_size", physical_batch))
-        effective_batch = int(curriculum.get("effective_batch_size", physical_batch))
-        if effective_batch % microbatch_size != 0:
-            raise ValueError("Phase A effective batch must be divisible by the microbatch size")
-        accumulation = max(1, effective_batch // microbatch_size)
-        if physical_batch != microbatch_size:
-            raise ValueError("Phase A physical batch and microbatch must match the loaded dataloader batch contract")
+        parameters = [self.soft_tokens.A]
+        if self.qwen_module_lora is not None:
+            parameters.extend(self.qwen_module_lora.parameters())
         self.phase_a_root.mkdir(parents=True, exist_ok=True)
-        with ToolkitProgressBar(total=steps, desc="Phase A curriculum") as progress:
+        prototype_settings = settings.get("prototype") or self.gen2_config.prototype
+        prototype_decay = float(prototype_settings.get("ema_decay", 0.95))
+        regions = (settings.get("probes") or {}).get("regions") or {}
+        controller_cfg = dict(self.gen2_config.controller)
+        controller = AdaptiveJointController(controller_cfg)
+        helper_seed = int(settings.get("helper_sampling_seed", 0))
+        import random
+        helper_rng = random.Random(helper_seed)
+        with ToolkitProgressBar(total=steps, desc="Phase A frozen objective") as progress:
             for step in range(steps):
-                self._assert_qwen_frozen()
+                optimizer = self.optimizer
                 optimizer.zero_grad(set_to_none=True)
-                dataset_loss = torch.zeros((), device=self.device_torch)
-                teacher_loss = torch.zeros_like(dataset_loss)
-                calibration = self._helper_calibration or {}
-                mixture_weights = torch.as_tensor(
-                    calibration.get("mixture_weights", [1.0 / len(self.helpers)] * len(self.helpers)),
-                    device=self.device_torch,
-                    dtype=torch.float32,
-                )
-                if mixture_weights.numel() != len(self.helpers) or not torch.isfinite(mixture_weights).all() or mixture_weights.sum() <= 0:
-                    raise RuntimeError("Phase A calibration has invalid shared helper mixture weights")
-                mixture_weights = mixture_weights / mixture_weights.sum()
-                selected_helper_index = int(torch.multinomial(mixture_weights, 1).item())
-                preserve_loss = torch.zeros_like(dataset_loss)
-                trust_region_loss = torch.zeros_like(dataset_loss)
-                cross_content_deltas = []
-                teacher_effect_norms = []
-                for _ in range(accumulation):
+                dataset_sum = torch.zeros((), device=self.device_torch)
+                dataset_count = 0
+                direction_sum = torch.zeros_like(dataset_sum)
+                direction_count = 0
+                prototype_sum = torch.zeros_like(dataset_sum)
+                prototype_count = 0
+                pending_prototype_samples: dict[str, list[torch.Tensor]] = {}
+                direction_vectors = []
+                selected = helper_rng.sample(self.helpers, min(helpers_per_step, len(self.helpers)))
+                for _micro in range(accumulation):
                     batch, iterator = self._next_batch(iterator, self.data_loader)
                     noisy, noise, timesteps, prompts, _ = self._prepare_real_batch(batch, "a")
-                    target = self.sd.get_loss_target(noise=noise, batch=batch)
-                    activator_prediction = self._activator_prediction(prompts, noisy, timesteps)
-                    dataset_loss = dataset_loss + torch.nn.functional.mse_loss(activator_prediction.float(), target.float()) / accumulation
-                    selected_helper = self.helpers[selected_helper_index]
-                    helper_prompts = [self.placeholder_contract.replace(prompt, selected_helper["replacement"]) for prompt in prompts]
-                    literal_texts = [((self.config.get("activator") or {}).get("initialization") or {}).get("literal", "") for _ in prompts]
+                    target = self.sd.get_loss_target(noise=noise, batch=batch).detach()
+                    activator = self._activator_prediction(prompts, noisy, timesteps)
+                    dataset_values = (activator.float() - target.float()).square().flatten(1).mean(1)
+                    dataset_sum = dataset_sum + dataset_values.sum()
+                    dataset_count += int(dataset_values.shape[0])
                     with torch.no_grad():
-                        helper_prediction = self._prompt_prediction(helper_prompts, noisy, timesteps)
-                        literal_ordinary_features = self._native_ordinary_pooled(prompts, literal_texts)
-                    timestep_bins = int(calibration.get("timestep_bins", settings.get("timestep_bins", 10)))
-                    bin_index = torch.clamp((timesteps.float() / 1000.0 * timestep_bins).long(), max=timestep_bins - 1)
-                    bin_scales = torch.as_tensor(
-                        calibration.get("timestep_bin_scales", [1.0] * timestep_bins),
-                        device=helper_prediction.device,
-                        dtype=torch.float32,
-                    )
-                    if bin_scales.numel() != timestep_bins or not torch.isfinite(bin_scales).all():
-                        raise RuntimeError("Phase A calibration has invalid timestep-bin RMS scales")
-                    teacher_scale = bin_scales[bin_index].to(dtype=helper_prediction.dtype)
-                    current_teacher_loss = normalized_teacher_distillation_loss(activator_prediction, helper_prediction, teacher_scale)
-                    teacher_loss = teacher_loss + current_teacher_loss / accumulation
-                    teacher_effect_norms.append((helper_prediction - activator_prediction.detach()).float().flatten(1).norm(dim=1).mean())
-                    residual_signature = (activator_prediction - helper_prediction).float()
-                    cross_content_deltas.append(residual_signature.mean(dim=tuple(range(2, residual_signature.ndim))))
-                    activator_encoded = [self._encode_soft_prompt(prompt, return_pooled=True) for prompt in prompts]
-                    activator_ordinary_features = torch.stack([item[2].float() for item in activator_encoded])
-                    preserve_loss = preserve_loss + (activator_ordinary_features - literal_ordinary_features.detach()).square().mean() / accumulation
-                    trust_region_loss = trust_region_loss + (self.soft_tokens.A.float() - self._soft_tokens_initial.float()).square().mean() / accumulation
+                        baseline = self._frozen_e0_prediction(prompts, noisy, timesteps)
+                    region_masks = timestep_region_masks(timesteps, regions)
+                    response = spatial_response(activator - baseline.detach())
+                    for region, mask in region_masks.items():
+                        if mask.any():
+                            pending_prototype_samples.setdefault(region, []).append(response[mask].detach())
+                    if self._phase_a_prototype:
+                        for region, mask in region_masks.items():
+                            if region in self._phase_a_prototype and mask.any():
+                                region_losses, region_valid = prototype_consistency_loss(
+                                    response[mask],
+                                    self._phase_a_prototype[region].to(response.device),
+                                    floor=float(prototype_settings.get("response_floor", 1e-8)),
+                                )
+                                if region_valid.any():
+                                    prototype_sum = prototype_sum + region_losses[region_valid].sum()
+                                    prototype_count += int(region_valid.sum().item())
+                    if controller.fraction > 0.0:
+                        helper_predictions = []
+                        with torch.no_grad():
+                            for helper in selected:
+                                helper_prompts = [self.placeholder_contract.replace(prompt, helper["replacement"]) for prompt in prompts]
+                                helper_predictions.append(self._prompt_prediction(helper_prompts, noisy, timesteps))
+                        helper_stack = torch.stack(helper_predictions)
+                        direction_loss, cosines, valid = helper_subset_direction_loss(activator, helper_stack, baseline)
+                        valid_sample_count = int(valid.sum().item())
+                        if valid_sample_count > 0:
+                            direction_sum = direction_sum + direction_loss * valid_sample_count
+                            direction_count += valid_sample_count
+                        direction_vectors.append(cosines.detach()[valid.unsqueeze(0).expand_as(cosines)])
                     if hasattr(batch, "cleanup"):
                         batch.cleanup()
-                evaluation_every = int(geometry_config.get("evaluation_every", 10))
-                evaluate_geometry = (step + 1) % evaluation_every == 0
-                train_geometry = self._evaluate_effect_geometry(self._phase_a_probes) if evaluate_geometry else self._phase_a_geometry or {"alignment": 0.0, "orthogonal_fraction": 1.0, "magnitude_ratio": 0.0, "valid_fraction": 0.0, "rank": 0.0}
-                heldout_geometry = self._evaluate_effect_geometry(self._phase_a_heldout_probes) if evaluate_geometry and self._phase_a_heldout_probes else {"alignment": 0.0, "orthogonal_fraction": 1.0, "magnitude_ratio": 0.0, "valid_fraction": 0.0, "rank": 0.0}
-                if evaluate_geometry:
-                    self._phase_a_geometry = train_geometry
-                    self._phase_a_heldout_geometry = heldout_geometry
-                    ema_decay = float(geometry_config.get("ema_decay", 0.8))
-                    self._phase_a_geometry_ema = self._update_geometry_ema(self._phase_a_geometry_ema, train_geometry, ema_decay)
-                    self._phase_a_heldout_geometry_ema = self._update_geometry_ema(self._phase_a_heldout_geometry_ema, heldout_geometry, ema_decay)
-                    gate_passed, gate_checks = self._effect_release_gate(self._phase_a_geometry_ema, self._phase_a_heldout_geometry_ema, geometry_config)
-                    self._last_effect_gate_passed = gate_passed
-                    if gate_passed:
-                        self._helper_release_streak += 1
-                    else:
-                        self._helper_release_streak = 0
-                        self._phase_a_release_reason = "geometry_gate_failed"
-                    release_streak = int(geometry_config.get("release_consecutive", 3))
-                    if self._helper_release_streak >= release_streak:
-                        self._helper_latched = True
-                        self._phase_a_release_reason = "geometry_gate_passed"
-                self._last_effect_gate_checks = gate_checks if evaluate_geometry else getattr(self, "_last_effect_gate_checks", {})
-                if not evaluate_geometry:
-                    train_geometry = self._phase_a_geometry or {"alignment": 0.0, "orthogonal_fraction": 1.0, "magnitude_ratio": 0.0, "valid_fraction": 0.0, "rank": 0.0}
-                    heldout_geometry = self._phase_a_heldout_geometry or {"alignment": 0.0, "orthogonal_fraction": 1.0, "magnitude_ratio": 0.0, "valid_fraction": 0.0, "rank": 0.0}
-                if len(cross_content_deltas) > 1:
-                    stacked_deltas = torch.cat(cross_content_deltas, dim=0)
-                    mean_delta = stacked_deltas.mean(dim=0, keepdim=True)
-                    cross_content_loss = (1.0 - torch.nn.functional.cosine_similarity(stacked_deltas, mean_delta, dim=-1)).mean()
-                else:
-                    cross_content_loss = dataset_loss * 0.0
-                self._last_phase_a_diagnostics = {
-                    "dataset_loss": float(dataset_loss.detach().item()),
-                    "teacher_loss": float(teacher_loss.detach().item()),
-                    "teacher_effect_norm": float(torch.stack(teacher_effect_norms).mean().item()) if teacher_effect_norms else 0.0,
-                    "mixture_weights": list(calibration.get("mixture_weights", [])),
-                    "mixture_weight_entropy": float(calibration.get("mixture_weight_entropy", 0.0)),
-                    "mixture_fit_residual_norm": float(calibration.get("mixture_fit_residual_norm", 0.0)),
-                    "teacher_prediction_gap_norm": float(torch.stack(teacher_effect_norms).mean().item()) if teacher_effect_norms else 0.0,
-                    "content_preserve_loss": float(preserve_loss.detach().item()),
-                    "cross_content_loss": float(cross_content_loss.detach().item()),
-                    "selected_helper_index": selected_helper_index,
-                    "selected_helper_id": self.helpers[selected_helper_index]["id"] if self.helpers else None,
-                    "trust_region_loss": float(trust_region_loss.detach().item()),
-                    "helper_latched": float(self._helper_latched),
-                    "helper_release_streak": float(self._helper_release_streak),
-                    "effect_gate_checks": dict(self._last_effect_gate_checks),
-                    "effect_gate_passed": bool(self._last_effect_gate_passed),
-                    "effect_gate_reason": self._phase_a_release_reason,
-                    "effect_geometry_ema": self._phase_a_geometry_ema,
-                    "heldout_effect_geometry_ema": self._phase_a_heldout_geometry_ema,
-                    "geometry_evaluated": bool(evaluate_geometry),
-                    "helper_count": len(self.helpers),
-                    "microbatch_accumulation": accumulation,
-                }
-                self._last_phase_a_diagnostics["effect_gate"] = dict(self._last_effect_gate_checks)
-                self._last_phase_a_diagnostics["effect_gate_reason"] = self._phase_a_release_reason
-                if self._phase_a_geometry is not None:
-                    self._last_phase_a_diagnostics["heldout_effect_geometry"] = heldout_geometry
-                if self._phase_a_heldout_geometry_ema is not None:
-                    self._last_phase_a_diagnostics["heldout_effect_geometry_ema"] = self._phase_a_heldout_geometry_ema
-                total_loss = (
-                    float(curriculum.get("dataset_weight", 0.1)) * dataset_loss
-                    + float(curriculum.get("teacher_weight", 1.0)) * teacher_loss
-                    + float(curriculum.get("content_preserve_weight", 0.05)) * preserve_loss
-                    + float(curriculum.get("cross_content_weight", 0.01)) * cross_content_loss
-                    + float(curriculum.get("trust_region_weight", 0.001)) * trust_region_loss
-                )
+                if dataset_count == 0:
+                    raise RuntimeError("Phase A update contains no valid dataset samples")
+                dataset_total = dataset_sum / dataset_count
+                direction_total = direction_sum / direction_count if direction_count > 0 else dataset_total.detach() * 0.0
+                prototype_total = prototype_sum / prototype_count if prototype_count > 0 else dataset_total.detach() * 0.0
+                dataset_weight = float(controller_cfg.get("total_semantic_budget", 1.0)) * (1.0 - controller.fraction)
+                helper_weight = float(controller_cfg.get("total_semantic_budget", 1.0)) * controller.fraction
+                prototype_weight = float(prototype_settings.get("weight", 0.1))
+                total_loss = dataset_weight * dataset_total + helper_weight * direction_total + prototype_weight * prototype_total
+                gradient_cosine = isolated_gradient_cosine(dataset_total, direction_total, parameters) if direction_count > 0 else None
                 self.accelerator.backward(total_loss)
-                trainable = [self.soft_tokens.A]
-                if self.trigger_local_adapter is not None:
-                    trainable.extend(self.trigger_local_adapter.parameters())
-                gradient_norms = [parameter.grad.detach().float().norm() for parameter in trainable if parameter.grad is not None]
-                if not gradient_norms:
-                    raise RuntimeError("Phase A backward produced no activator gradients")
-                phase_a_gradient_norm = torch.stack(gradient_norms).norm()
-                embedding_gradient_norm = self.soft_tokens.A.grad.detach().float().norm() if self.soft_tokens.A.grad is not None else torch.zeros((), device=self.device_torch)
-                adapter_gradients = [parameter.grad.detach().float().norm() for parameter in self.trigger_local_adapter.parameters() if parameter.grad is not None] if self.trigger_local_adapter is not None else []
-                adapter_gradient_norm = torch.stack(adapter_gradients).norm() if adapter_gradients else torch.zeros((), device=self.device_torch)
-                self._last_phase_a_diagnostics.update({
-                    "activator_gradient_norm": float(phase_a_gradient_norm.item()),
-                    "embedding_gradient_norm": float(embedding_gradient_norm.item()),
-                    "adapter_gradient_norm": float(adapter_gradient_norm.item()),
-                })
-                torch.nn.utils.clip_grad_norm_(trainable, self.train_config.max_grad_norm)
+                gradient_norm = self.accelerator.clip_grad_norm_(parameters, self.train_config.max_grad_norm)
                 optimizer.step()
                 if self.lr_scheduler is not None:
                     self.lr_scheduler.step()
+                for region, samples in pending_prototype_samples.items():
+                    values = torch.cat(samples, dim=0)
+                    self._phase_a_prototype = detached_ema_prototype(self._phase_a_prototype, {region: values}, prototype_decay)
+                controller_diag = controller.diagnostics()
+                evaluation_every = int(controller_cfg.get("evaluation_every", 5))
+                if (step + 1) % evaluation_every == 0:
+                    train_probe_loss, train_probe_proto, train_probe_diag = self._probe_loss_and_direction(self._phase_a_probes, parameters)
+                    heldout_probe_loss, heldout_probe_proto, heldout_probe_diag = self._probe_loss_and_direction(self._phase_a_heldout_probes, parameters)
+                    heldout_enabled = self._gen2_split is not None and self._gen2_split.heldout_count > 0
+                    train_cosine = train_probe_diag.get("global_gradient_cosine")
+                    heldout_cosine = heldout_probe_diag.get("global_gradient_cosine")
+                    if heldout_enabled:
+                        probe_cosine = min(train_cosine, heldout_cosine) if train_cosine is not None and heldout_cosine is not None else None
+                        probe_loss = heldout_probe_loss
+                        probe_proto = heldout_probe_proto
+                        probe_reason = "conservative_min_train_heldout" if probe_cosine is not None else "train_or_heldout_signal_unavailable"
+                    else:
+                        probe_cosine = train_cosine
+                        probe_loss = train_probe_loss
+                        probe_proto = train_probe_proto
+                        probe_reason = "explicit_zero_heldout_train_only"
+                    train_loss_value = float(train_probe_loss.item()) if train_probe_loss is not None else None
+                    heldout_loss_value = float(heldout_probe_loss.item()) if heldout_probe_loss is not None else None
+                    probe_diag = {"valid": probe_cosine is not None, "aggregation": probe_reason, "controller_mode": "observational_gradient_cosine_hysteresis", "experimental_multisignal_gates_applied": False, "global_gradient_cosine": probe_cosine, "train": train_probe_diag, "heldout": heldout_probe_diag, "train_loss": train_loss_value, "heldout_loss": heldout_loss_value, "heldout_minus_train_loss": (heldout_loss_value - train_loss_value) if train_loss_value is not None and heldout_loss_value is not None else None, "prototype_signal_available": probe_proto is not None and bool(probe_proto)}
+                    controller_diag = controller.update(probe_cosine, probe_proto, gradient_diagnostics={"norm": float(gradient_norm.item()), "probe": probe_diag})
+                else:
+                    probe_loss, probe_diag = None, {"valid": False, "evaluated": False}
                 current_step = step + 1
+                self._last_phase_a_diagnostics = {"dataset_loss": float(dataset_total.item()), "helper_direction_loss": float(direction_total.item()), "prototype_loss": float(prototype_total.item()), "probe_loss": float(probe_loss.item()) if probe_loss is not None else 0.0, "helper_direction_cosine": float(torch.cat(direction_vectors).mean().item()) if direction_vectors else 0.0, "dataset_helper_gradient_cosine": float(gradient_cosine.item()) if gradient_cosine is not None else None, "helpers_per_step": helpers_per_step, "microbatch_accumulation": accumulation, "controller": controller_diag, "gradient_norm": float(gradient_norm.item())}
                 self._phase_a_history.append({"step": current_step, **self._last_phase_a_diagnostics})
-                calibration_snapshot = None
-                if self._helper_calibration is not None:
-                    calibration_snapshot = {key: value.detach().cpu().tolist() if torch.is_tensor(value) else value for key, value in self._helper_calibration.items()}
                 if self.accelerator.is_main_process:
-                    (self.phase_a_root / "diagnostics.json").write_text(json.dumps({"calibration": calibration_snapshot, "history": self._phase_a_history}, ensure_ascii=False, indent=2), encoding="utf-8")
-                if self.accelerator.is_main_process:
-                    self.logger.log({f"gen2/phase_a/{key}": value for key, value in self._last_phase_a_diagnostics.items()})
+                    (self.phase_a_root / "diagnostics.json").write_text(json.dumps({"history": self._phase_a_history}, ensure_ascii=False, indent=2), encoding="utf-8")
+                    self.logger.log({f"gen2/phase_a/{key}": value for key, value in self._last_phase_a_diagnostics.items() if isinstance(value, (int, float))})
                     self.logger.commit()
+                progress.update(1)
                 save_every = int(((self.config.get("save") or {}).get("phase_a") or {}).get("save_every", 0))
                 if save_every and current_step % save_every == 0:
-                    tensors = {"A": self.soft_tokens.A.detach().cpu()}
-                    if self.trigger_local_adapter is not None:
-                        tensors.update({f"te_adapter.{key}": value.detach().cpu() for key, value in self.trigger_local_adapter.state_dict().items()})
-                    self._phase_checkpoint("a", current_step, tensors, {"phase": "a", "step": current_step, "helper_latched": self._helper_latched, "effect_gate_reason": self._phase_a_release_reason, "effect_gate_passed": self._last_effect_gate_passed, "effect_gate_checks": self._last_effect_gate_checks, "diagnostics": self._last_phase_a_diagnostics, "history_length": len(self._phase_a_history)}, optimizer)
-                progress.set_postfix(step=current_step, total=steps, dataset=f"{dataset_loss.item():.4g}", teacher=f"{teacher_loss.item():.4g}", latch=int(self._helper_latched))
-                progress.update(1)
-        tensors = {"A": self.soft_tokens.A.detach().cpu()}
-        metadata = {"artifact": "gen2_activator", "schema_version": 3, "initializer": "literal_trigger_resampled", "literal": ((self.config.get("activator") or {}).get("initialization") or {}).get("literal"), "placeholder": self.placeholder_contract.placeholder, "tokens": self.soft_tokens.tokens, "dimension": self.soft_tokens.dimension, "trigger_local_adapter": self.trigger_local_adapter is not None, "trigger_local_adapter_rank": self.trigger_local_adapter.rank if self.trigger_local_adapter is not None else 0, "trigger_local_adapter_alpha": self.trigger_local_adapter.alpha if self.trigger_local_adapter is not None else 0.0, "helper_latched": self._helper_latched, "helper_release_streak": self._helper_release_streak, "effect_gate_reason": self._phase_a_release_reason, "effect_gate_passed": self._last_effect_gate_passed, "effect_gate_checks": self._last_effect_gate_checks, "phase_a_diagnostics": self._last_phase_a_diagnostics}
-        if self._helper_calibration is not None:
-            metadata["helper_calibration"] = {key: value.detach().cpu().tolist() if torch.is_tensor(value) else value for key, value in self._helper_calibration.items()}
-        if self.trigger_local_adapter is not None:
-            tensors.update({f"te_adapter.{key}": value for key, value in self.trigger_local_adapter.state_dict().items()})
-        (self.phase_a_root / "diagnostics.json").write_text(json.dumps({"calibration": metadata.get("helper_calibration"), "history": self._phase_a_history}, ensure_ascii=False, indent=2), encoding="utf-8")
-        save_tensor_artifact(self.phase_a_root / "activator.safetensors", tensors, metadata)
+                    self._phase_checkpoint(
+                        "a", current_step,
+                        {"E_A": self.soft_tokens.A.detach().cpu(), "E0": self.frozen_e0.detach().cpu()} if self.frozen_e0 is not None else {"E_A": self.soft_tokens.A.detach().cpu()},
+                        {"phase": "a", "step": current_step, "prototype": {key: value.detach().cpu().tolist() for key, value in (self._phase_a_prototype or {}).items()}, "history_length": len(self._phase_a_history)},
+                        self.optimizer,
+                        scheduler=self.lr_scheduler,
+                    )
+        if self.frozen_e0 is None:
+            raise RuntimeError("frozen E0 was not initialized")
+        activator_tensors = {"E_A": self.soft_tokens.A.detach().cpu(), "E0": self.frozen_e0.detach().cpu(), **self._qwen_adapter_tensors()}
+        activator_metadata = {"artifact": "gen2_activator", "schema_version": 5, "initializer": "literal_trigger_resampled", "literal": ((self.config.get("activator") or {}).get("initialization") or {}).get("literal"), "placeholder": self.placeholder_contract.placeholder, "tokens": self.soft_tokens.tokens, "dimension": self.soft_tokens.dimension, "training_objective": "dataset_helper_direction_timestep_region_ema_prototype", "dataset_split_fingerprint": self._gen2_split.dataset_fingerprint if self._gen2_split else None, "split_ref": self.gen2_config.dataset_split.get("artifact_path"), "probe_ref": (self.gen2_config.phase_a.get("probes") or {}).get("json_path") or (self.gen2_config.phase_a.get("probes") or {}).get("artifact_path"), "prototype": {key: value.detach().cpu().tolist() for key, value in (self._phase_a_prototype or {}).items()}, "controller": controller.state_dict(), "diagnostics_ref": "diagnostics.json", **self._qwen_adapter_metadata()}
+        save_tensor_artifact(self.phase_a_root / "activator.safetensors", activator_tensors, activator_metadata)
+
+    def _run_phase_a(self) -> None:
+        return self._run_frozen_phase_a()
+
 
     def _install_phase_b_optimizer(self) -> None:
         if self._adapter_bank is None:
@@ -849,8 +862,8 @@ class Gen2Trainer(BaseSDTrainProcess):
         artifact = metadata.get("artifact")
         if artifact != "gen2_activator":
             raise ValueError(f"unsupported activator artifact type: {artifact!r}")
-        if int(metadata.get("schema_version", -1)) != 3:
-            raise ValueError("activator artifact schema_version must be 3")
+        if int(metadata.get("schema_version", -1)) != 5:
+            raise ValueError("activator artifact schema_version must be 5 and include immutable E0")
         expected_literal = ((self.config.get("activator") or {}).get("initialization") or {}).get("literal")
         if metadata.get("literal") != expected_literal:
             raise ValueError("activator artifact literal bootstrap does not match the current configuration")
@@ -858,23 +871,17 @@ class Gen2Trainer(BaseSDTrainProcess):
             raise ValueError("activator artifact was not initialized from the literal trigger")
         if metadata.get("placeholder") != self.placeholder_contract.placeholder:
             raise ValueError("activator artifact placeholder does not match the current contract")
-        activator = tensors.get("A")
-        if activator is None:
-            raise ValueError("activator artifact must contain tensor A")
-        if tuple(activator.shape) != tuple(self.soft_tokens.A.shape):
-            raise ValueError("activator artifact shape does not match configured soft tokens")
+        activator = tensors.get("E_A")
+        e0 = tensors.get("E0")
+        if activator is None or e0 is None:
+            raise ValueError("activator artifact must contain tensors E_A and immutable E0")
+        if tuple(activator.shape) != tuple(self.soft_tokens.A.shape) or tuple(e0.shape) != tuple(self.soft_tokens.A.shape):
+            raise ValueError("activator artifact E_A/E0 shapes do not match configured soft tokens")
         if int(metadata.get("tokens", -1)) != self.soft_tokens.tokens or int(metadata.get("dimension", -1)) != self.soft_tokens.dimension:
             raise ValueError("activator artifact dimensions do not match the configured soft token bank")
         self.soft_tokens.A.data.copy_(activator.to(self.soft_tokens.A))
-        artifact_has_adapter = bool(metadata.get("trigger_local_adapter", False))
-        config_has_adapter = self.trigger_local_adapter is not None
-        if artifact_has_adapter != config_has_adapter:
-            raise ValueError("activator artifact trigger-local adapter setting does not match the current configuration")
-        if config_has_adapter:
-            adapter_state = {key.removeprefix("te_adapter."): value for key, value in tensors.items() if key.startswith("te_adapter.")}
-            if not adapter_state:
-                raise ValueError("activator artifact is missing trigger-local adapter state")
-            self.trigger_local_adapter.load_state_dict(adapter_state, strict=True)
+        self.frozen_e0 = e0.to(device=self.soft_tokens.A.device, dtype=self.soft_tokens.A.dtype).detach().clone()
+        self._load_qwen_adapter_state(tensors, metadata)
 
     def _restore_phase_b_checkpoint(self, optimizer) -> int:
         if self.gen2_config.mode != "resume_phase_b":
@@ -884,7 +891,9 @@ class Gen2Trainer(BaseSDTrainProcess):
             raise FileNotFoundError("resume_phase_b requires a phase_b/step_<step> checkpoint")
         checkpoint = max(candidates, key=lambda item: int(item.name.removeprefix("step_")))
         tensors, metadata = load_phase_checkpoint(checkpoint, optimizer=optimizer, scheduler=self.lr_scheduler)
-        self._adapter_bank.load_state_dict(tensors, strict=True)
+        adapter_tensors = {key: value for key, value in tensors.items() if not key.startswith("qwen_adapter.")}
+        self._adapter_bank.load_state_dict(adapter_tensors, strict=True)
+        self._load_qwen_adapter_state(tensors, metadata)
         sampler_state = metadata.get("timestep_sampler") or {}
         order = sampler_state.get("order")
         if order is not None:
@@ -915,9 +924,10 @@ class Gen2Trainer(BaseSDTrainProcess):
         start_step = self._restore_phase_b_checkpoint(optimizer)
         iterator = iter(self.data_loader)
         if not self._phase_b_probes:
-            self._phase_b_probes = self._phase_a_heldout_probes or self._phase_a_probes
-            if not self._phase_b_probes:
-                self._phase_b_probes, iterator = self._collect_phase_a_probes(4, iterator)
+            if self._gen2_split is None or self._gen2_split.heldout_records:
+                raise RuntimeError("Phase B requires strictly loaded heldout fixed probes")
+            # Explicit heldout_count=0 mode uses train fixed probes for diagnostics only.
+            self._phase_b_probes = list(self._phase_a_probes)
         with ToolkitProgressBar(total=steps, desc="Phase B2 TRF-LoRA") as progress:
             for step in range(start_step, steps):
                 self._assert_qwen_frozen()
@@ -948,7 +958,15 @@ class Gen2Trainer(BaseSDTrainProcess):
                     probe_off_losses = []
                     probe_delta_norms = []
                     from extensions_built_in.gen2_trainer.registry import clear_adapter_context
-                    for probe_noisy, probe_timesteps, probe_target, probe_prompt in self._phase_b_probes:
+                    for probe in self._phase_b_probes:
+                        if isinstance(probe, dict):
+                            probe_noisy = probe["noisy_latent"].to(self.device_torch)
+                            probe_timesteps = probe["timestep"].to(self.device_torch)
+                            probe_target = probe["target"].to(self.device_torch)
+                            probe_prompt = probe["prompt"]
+                        else:
+                            probe_noisy, probe_timesteps, probe_target, probe_prompt = probe
+                            probe_noisy, probe_timesteps, probe_target = (item.to(self.device_torch) for item in (probe_noisy, probe_timesteps, probe_target))
                         probe_embeds = type(self.sd.get_prompt_embeds([probe_prompt]))(text_embeds=[self._encode_soft_prompt(probe_prompt).detach()])
                         probe_on = self.sd.get_noise_prediction(probe_noisy, probe_timesteps, probe_embeds, adapter_context=AdapterRuntimeContext(probe_timesteps.float() / 1000.0, torch.ones(1, device=self.device_torch), 1.0))
                         clear_adapter_context(self.sd.transformer)
@@ -1069,16 +1087,19 @@ class Gen2Trainer(BaseSDTrainProcess):
         if bool(sample.get("disable_sampling", False)):
             raise RuntimeError("Gen2 smoke/validation requires sampling; disable_sampling=true is not allowed")
         cases = build_validation_matrix(
-            len(self.gen2_config.validation_prompts),
+            len(self._validation_prompts),
             self.gen2_config.seeds,
-            sample.get("unconditional_scale_sweep") or [0.0],
+            sample.get("unconditional_scale_sweep") or [],
             include_sweep=True,
+            designated_helper_index=next(index for index, helper in enumerate(self.helpers) if helper["id"] == self._designated_helper_id),
         )
         if not cases:
             raise RuntimeError("Gen2 validation matrix is empty")
         self.validation_cases = cases
         output_root = self.gen2_root / "samples" / f"step_{self._phase_steps('b'):06d}"
-        output_root.mkdir(parents=True, exist_ok=True)
+        if output_root.exists() and any(output_root.iterdir()):
+            raise FileExistsError(f"Gen2 validation output already exists; refusing overwrite: {output_root}")
+        output_root.mkdir(parents=True, exist_ok=False)
         diagnostics_path = output_root / "conditioning_diagnostics.json"
         diagnostics_records: list[dict[str, Any]] = []
         progress = ToolkitProgressBar(total=len(cases), desc=f"Gen2 official CFG validation ({len(cases)} cases)")
@@ -1086,7 +1107,7 @@ class Gen2Trainer(BaseSDTrainProcess):
             for case_index, case in enumerate(cases, start=1):
                 if case.eta_u > 0 and self.official_unconditional is None:
                     raise RuntimeError("positive eta_u requires official unconditional transformer")
-                raw_prompt = self.gen2_config.validation_prompts[case.prompt_index]
+                raw_prompt = self._validation_prompts[case.prompt_index]
                 case_diagnostics: dict[str, Any] = {
                     "case_index": case_index,
                     "prompt_index": case.prompt_index,
@@ -1098,17 +1119,20 @@ class Gen2Trainer(BaseSDTrainProcess):
                     "adapter_conditional_enabled": case.style_gate != 0.0 and case.eta_c != 0.0,
                     "adapter_unconditional_enabled": case.style_gate != 0.0 and case.eta_u != 0.0,
                 }
-                if case.conditioning_mode == "native_helper":
+                if case.conditioning_mode == "helper":
                     materialized = self.placeholder_contract.replace(raw_prompt, self.helpers[case.helper_index]["replacement"])
                     embeds = self.sd.get_prompt_embeds([materialized])
                     case_diagnostics["materialized_helper_id"] = self.helpers[case.helper_index]["id"]
                     case_diagnostics["text_length"] = int(embeds.text_embeds[0].shape[0])
                     case_diagnostics["text_feature_norm_mean"] = float(embeds.text_embeds[0].float().norm(dim=-1).mean().item())
                     case_diagnostics["text_feature_norm_max"] = float(embeds.text_embeds[0].float().norm(dim=-1).max().item())
-                elif case.conditioning_mode == "soft_tokens":
+                elif case.conditioning_mode == "activator":
                     embeds = type(self.sd.get_prompt_embeds([raw_prompt]))(
                         text_embeds=[self._encode_soft_prompt(raw_prompt, case_diagnostics).detach()]
                     )
+                elif case.conditioning_mode == "literal_e0":
+                    embeds = self._literal_prompt_embeds(raw_prompt)
+                    case_diagnostics["literal_e0"] = True
                     case_diagnostics["text_length"] = int(embeds.text_embeds[0].shape[0])
                     case_diagnostics["text_feature_norm_mean"] = float(embeds.text_embeds[0].float().norm(dim=-1).mean().item())
                     case_diagnostics["text_feature_norm_max"] = float(embeds.text_embeds[0].float().norm(dim=-1).max().item())
@@ -1142,8 +1166,11 @@ class Gen2Trainer(BaseSDTrainProcess):
                     denoise_progress.close()
                 case_root = output_root / f"prompt_{case.prompt_index:02d}" / f"seed_{case.seed}"
                 case_root.mkdir(parents=True, exist_ok=True)
-                name = f"{case.conditioning_mode}_adapter_{'on' if case.style_gate and case.eta_c else 'off'}_eta_u_{case.eta_u:g}"
-                images[0].save(case_root / f"{name}.png")
+                name = f"{case.conditioning_mode}_b_{'on' if case.style_gate and case.eta_c else 'off'}_eta_u_{case.eta_u:g}"
+                image_path = case_root / f"{name}.png"
+                if image_path.exists():
+                    raise FileExistsError(f"Gen2 validation refuses to overwrite {image_path}")
+                images[0].save(image_path)
                 case_diagnostics["denoise"] = denoise_diagnostics
                 diagnostics_records.append(case_diagnostics)
                 diagnostics_path.write_text(json.dumps(diagnostics_records, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1187,6 +1214,8 @@ class Gen2Trainer(BaseSDTrainProcess):
             self._run_phase_a()
             self._write_manifest("phase_a_training_completed", completed_phase="phase_a")
         else:
+            self._prepare_gen2_split()
+            self._load_gen2_fixed_probes()
             self._load_activator_artifact()
         if mode == "phase_a_only":
             print("Gen2 training completed: Phase A only")
@@ -1249,12 +1278,13 @@ class Gen2Trainer(BaseSDTrainProcess):
         with torch.no_grad():
             literal_embeddings = language_model.embed_tokens(token_ids)[0].float()
             initialization = resample_embedding_sequence(literal_embeddings, self.soft_tokens.tokens)
-        self.soft_tokens.A.data.copy_(initialization.to(self.soft_tokens.A.device, self.soft_tokens.A.dtype))
-        self._soft_tokens_initial = self.soft_tokens.A.detach().clone()
-        if self.trigger_local_adapter is not None:
-            nn.init.zeros_(self.trigger_local_adapter.up.weight)
-            self.trigger_local_adapter.zero_reference = tuple(parameter.detach().clone() for parameter in self.trigger_local_adapter.parameters())
-
+        initialized = initialization.to(device=self.soft_tokens.A.device, dtype=self.soft_tokens.A.dtype)
+        self.soft_tokens.A.data.copy_(initialized)
+        self.frozen_e0 = initialized.detach().clone()
+        if not torch.equal(self.soft_tokens.A.detach(), self.frozen_e0):
+            raise RuntimeError("Gen2 initialization invariant failed: E_A and frozen E0 differ")
+        if self.frozen_e0.requires_grad:
+            raise RuntimeError("Gen2 initialization invariant failed: frozen E0 requires gradients")
     def preflight_caption(self, raw_caption: str, source: str = "caption") -> int:
         _, occurrences = self.placeholder_contract.parse(raw_caption)
         if not occurrences:

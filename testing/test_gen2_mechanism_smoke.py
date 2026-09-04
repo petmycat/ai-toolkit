@@ -70,21 +70,27 @@ class MechanismSmokeTest(unittest.TestCase):
         self.assertEqual(
             [(case.conditioning_mode, case.style_gate, case.eta_c, case.eta_u) for case in cases],
             [
-                ("native_helper", 0.0, 0.0, 0.0),
-                ("soft_tokens", 0.0, 0.0, 0.0),
-                ("native_helper", 1.0, 1.0, 0.0),
-                ("soft_tokens", 1.0, 1.0, 0.0),
-                ("soft_tokens", 1.0, 1.0, 0.5),
-                ("soft_tokens", 1.0, 1.0, 1.0),
+                ("helper", 0.0, 0.0, 0.0),
+                ("helper", 1.0, 1.0, 0.0),
+                ("activator", 0.0, 0.0, 0.0),
+                ("activator", 1.0, 1.0, 0.0),
+                ("activator", 1.0, 1.0, 0.5),
+                ("activator", 1.0, 1.0, 1.0),
+                ("literal_e0", 0.0, 0.0, 0.0),
+                ("literal_e0", 1.0, 1.0, 0.0),
             ],
         )
-        self.assertTrue(process["activator"]["trigger_local_adapter"]["enabled"])
+        self.assertNotIn("trigger_local_adapter", process["activator"])
         self.assertEqual(process["activator"]["initialization"]["strategy"], "literal_trigger_resampled")
         self.assertEqual(process["activator"]["tokens"], 24)
-        self.assertTrue(process["train"]["phase_a"]["calibration"]["enabled"])
-        self.assertIn("effect_geometry", process["train"]["phase_a"])
-        self.assertGreaterEqual(process["train"]["phase_a"]["effect_geometry"]["cone_iterations"], 1)
-        self.assertEqual(process["train"]["phase_a"]["curriculum"]["effective_batch_size"], 4)
+        self.assertTrue(process["train"]["phase_a"]["probes"]["enabled"])
+        self.assertEqual(process["train"]["phase_a"]["probes"]["timestep_count"], 5)
+        self.assertEqual(set(process["train"]["phase_a"]["probes"]), {"enabled", "probe_seed", "timestep_count", "regions"})
+        self.assertTrue(process["dataset_split"]["enabled"])
+        self.assertTrue(process["prototype"]["enabled"])
+        self.assertTrue(process["controller"]["enabled"])
+        self.assertEqual(process["helpers_per_step"], 3)
+        self.assertTrue(process["qwen"]["per_layer_adapter"]["enabled"])
         self.assertEqual(process["train"]["phase_a"]["batch_size"], 1)
         self.assertEqual(process["train"]["phase_b"]["batch_size"], 2)
         self.assertNotEqual(process["train"]["phase_a"]["batch_size"], process["train"]["phase_b"]["batch_size"])
@@ -153,18 +159,6 @@ class MechanismSmokeTest(unittest.TestCase):
         self.assertEqual(output.shape, latents.shape)
         output.square().mean().backward()
         self.assertTrue(all(parameter.grad is not None for parameter in bank.parameters()))
-
-    def test_trigger_local_adapter_supports_bfloat16_hidden_states(self):
-        from extensions_built_in.gen2_trainer.activator import TriggerLocalTEAdapter
-
-        module = TriggerLocalTEAdapter(8, rank=2, alpha=4).to(dtype=torch.float32)
-        hidden = torch.randn(1, 4, 8, dtype=torch.bfloat16, requires_grad=True)
-        mask = torch.tensor([[1, 0, 1, 0]], dtype=torch.long)
-        output = module(hidden, mask)
-        self.assertEqual(output.dtype, hidden.dtype)
-        output.square().mean().backward()
-        self.assertIsNotNone(module.up.weight.grad)
-        self.assertIsNotNone(module.down.weight.grad)
 
     def test_image_only_mask_and_gate(self):
         module = TemporalRankFieldLoRA(4, 4, rank=2)

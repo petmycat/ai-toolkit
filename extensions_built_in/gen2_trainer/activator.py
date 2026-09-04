@@ -11,30 +11,161 @@ import torch
 from torch import nn
 
 
-class TriggerLocalTEAdapter(nn.Module):
-    """Low-rank residual written only to expanded activator rows."""
+class TriggerMaskContext:
+    """Runtime trigger mask shared only as immutable forward context."""
 
-    def __init__(self, dimension: int, rank: int = 4, alpha: float = 4.0) -> None:
+    def __init__(self, activator_mask: torch.Tensor | None):
+        self.activator_mask = activator_mask
+        self._previous: torch.Tensor | None = None
+
+    def __enter__(self):
+        global _ACTIVE_TRIGGER_MASK
+        self._previous = _ACTIVE_TRIGGER_MASK
+        _ACTIVE_TRIGGER_MASK = self.activator_mask
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        global _ACTIVE_TRIGGER_MASK
+        _ACTIVE_TRIGGER_MASK = self._previous
+        return False
+
+
+_ACTIVE_TRIGGER_MASK: torch.Tensor | None = None
+_ADAPTERS_ENABLED = True
+
+
+class AdapterEnabledContext:
+    def __init__(self, enabled: bool):
+        self.enabled = bool(enabled)
+        self.previous = True
+
+    def __enter__(self):
+        global _ADAPTERS_ENABLED
+        self.previous = _ADAPTERS_ENABLED
+        _ADAPTERS_ENABLED = self.enabled
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        global _ADAPTERS_ENABLED
+        _ADAPTERS_ENABLED = self.previous
+        return False
+
+
+def adapter_enabled_context(enabled: bool) -> AdapterEnabledContext:
+    return AdapterEnabledContext(enabled)
+
+
+def trigger_mask_context(activator_mask: torch.Tensor | None) -> TriggerMaskContext:
+    return TriggerMaskContext(activator_mask)
+
+
+class QwenDownProjLoRA(nn.Module):
+    """Independent LoRA residual for one Qwen MLP ``down_proj`` module."""
+
+    def __init__(self, input_dimension: int, output_dimension: int, rank: int = 4, alpha: float = 4.0, enabled: bool = True):
         super().__init__()
-        if dimension < 1 or rank < 1 or alpha < 0:
-            raise ValueError("invalid trigger-local adapter dimensions")
-        self.dimension = dimension
+        if input_dimension < 1 or output_dimension < 1 or rank < 1 or alpha < 0:
+            raise ValueError("invalid Qwen module-LoRA dimensions")
+        self.input_dimension = input_dimension
+        self.output_dimension = output_dimension
         self.rank = rank
         self.alpha = float(alpha)
-        self.down = nn.Linear(dimension, rank, bias=False)
-        self.up = nn.Linear(rank, dimension, bias=False)
+        self.enabled = bool(enabled)
+        self.down = nn.Linear(input_dimension, rank, bias=False)
+        self.up = nn.Linear(rank, output_dimension, bias=False)
         nn.init.kaiming_uniform_(self.down.weight, a=5 ** 0.5)
         nn.init.zeros_(self.up.weight)
-        self.zero_reference: tuple[torch.Tensor, ...] | None = None
 
-    def forward(self, hidden_states: torch.Tensor, activator_mask: torch.Tensor) -> torch.Tensor:
-        if hidden_states.ndim != 3 or activator_mask.shape != hidden_states.shape[:2]:
-            raise ValueError("trigger-local adapter expects hidden states and (batch, sequence) mask")
+    def forward(self, hidden_states: torch.Tensor, activator_mask: torch.Tensor | None = None) -> torch.Tensor:
+        if not self.enabled:
+            return torch.zeros_like(hidden_states[..., : self.output_dimension])
+        if hidden_states.ndim != 3:
+            raise ValueError("Qwen module-LoRA expects (batch, sequence, hidden) states")
+        mask = activator_mask if activator_mask is not None else _ACTIVE_TRIGGER_MASK
+        if mask is None:
+            return torch.zeros_like(hidden_states[..., : self.output_dimension])
+        if mask.shape != hidden_states.shape[:2]:
+            raise ValueError("trigger mask must match Qwen hidden-state batch and sequence")
         parameter_dtype = self.down.weight.dtype
-        adapter_input = hidden_states.to(dtype=parameter_dtype)
-        residual = self.up(self.down(adapter_input)) * (self.alpha / self.rank)
-        mask = activator_mask.to(device=hidden_states.device, dtype=residual.dtype).unsqueeze(-1)
-        return (residual * mask).to(dtype=hidden_states.dtype)
+        residual = self.up(self.down(hidden_states.to(dtype=parameter_dtype))) * (self.alpha / self.rank)
+        return (residual * mask.to(device=residual.device, dtype=residual.dtype).unsqueeze(-1)).to(hidden_states.dtype)
+
+
+class QwenDownProjLoRABank(nn.Module):
+    """Per-layer Qwen ``down_proj`` LoRA modules and their forward hooks."""
+
+    def __init__(self, adapters: Mapping[int, QwenDownProjLoRA], modules: Mapping[int, nn.Module]):
+        super().__init__()
+        self.adapters = nn.ModuleDict({str(index): adapter for index, adapter in adapters.items()})
+        self.layer_indices = tuple(sorted(adapters))
+        self._hooks = []
+        for index in self.layer_indices:
+            module = modules[index]
+            adapter = self.adapters[str(index)]
+            self._hooks.append(module.register_forward_hook(self._hook(adapter)))
+
+    @staticmethod
+    def _hook(adapter):
+        def apply(_module, args, output):
+            if not _ADAPTERS_ENABLED or not adapter.enabled or _ACTIVE_TRIGGER_MASK is None:
+                return output
+            states = args[0]
+            return output + adapter(states)
+        return apply
+
+    def remove(self):
+        for hook in self._hooks:
+            hook.remove()
+        self._hooks.clear()
+
+    def close(self):
+        self.remove()
+
+
+def discover_qwen_down_proj_modules(text_encoder) -> dict[int, nn.Module]:
+    """Find exactly the per-layer Qwen MLP down projections."""
+    language_model = getattr(text_encoder, "language_model", text_encoder)
+    layers = getattr(language_model, "layers", None)
+    if layers is None:
+        raise ValueError("Qwen language_model.layers could not be discovered")
+    result = {}
+    for index, layer in enumerate(layers):
+        module = getattr(getattr(layer, "mlp", None), "down_proj", None)
+        if not isinstance(module, nn.Module):
+            raise ValueError(f"Qwen layer {index} has no mlp.down_proj module")
+        result[index] = module
+    return result
+
+
+def install_qwen_down_proj_lora(text_encoder, rank: int = 4, alpha: float = 4.0, enabled: bool = True, layers: str | Iterable[int] = "all") -> QwenDownProjLoRABank | None:
+    modules = discover_qwen_down_proj_modules(text_encoder)
+    if not enabled:
+        return None
+    selected = tuple(modules) if layers == "all" else tuple(int(index) for index in layers)
+    if not selected or any(index not in modules for index in selected) or len(set(selected)) != len(selected):
+        raise ValueError("qwen module-LoRA layers must be unique valid layer indices")
+    adapters = {index: QwenDownProjLoRA(modules[index].in_features, modules[index].out_features, rank, alpha) for index in selected}
+    return QwenDownProjLoRABank(adapters, modules)
+
+
+def load_qwen_down_proj_lora(bank: QwenDownProjLoRABank | None, state_dict: Mapping[str, torch.Tensor], strict: bool = True):
+    """Load only adapter weights; disabled banks cannot silently consume weights."""
+    if bank is None:
+        if state_dict:
+            raise RuntimeError("cannot load Qwen module-LoRA weights when the adapter is disabled")
+        return None
+    return bank.load_state_dict(state_dict, strict=strict)
+
+
+# Explicit class alias used by callers that avoid the legacy trigger-local name.
+QwenModuleLoRA = QwenDownProjLoRA
+QwenModuleLoRABank = QwenDownProjLoRABank
+
+
+# Short aliases for callers that refer to the mechanism as module-LoRA.
+discover_qwen_module_lora_modules = discover_qwen_down_proj_modules
+install_qwen_module_lora = install_qwen_down_proj_lora
+load_qwen_module_lora = load_qwen_down_proj_lora
 
 
 @dataclass(frozen=True)
@@ -211,7 +342,6 @@ def encode_qwen_inputs_embeds(
     pos_2d: torch.Tensor,
     activation_layers: tuple[int, ...],
     activator_mask: torch.Tensor | None = None,
-    trigger_local_adapter: TriggerLocalTEAdapter | None = None,
     return_details: bool = False,
     gradient_checkpointing: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -240,28 +370,37 @@ def encode_qwen_inputs_embeds(
     captured: dict[int, torch.Tensor] = {}
     hidden_states = inputs_embeds
     tap_set = set(activation_layers)
-    for layer_index, decoder_layer in enumerate(language_model.layers):
-        def layer_forward(states, layer=decoder_layer):
-            output = layer(
-                states,
-                attention_mask=causal_mask,
-                position_ids=text_position_ids,
-                past_key_values=None,
-                use_cache=False,
-                position_embeddings=position_embeddings,
-            )
-            return output[0] if isinstance(output, tuple) else output
+    # Module-LoRA hooks consume this context inside each independent
+    # ``language_model.layers[i].mlp.down_proj`` call. There is deliberately no
+    # shared residual added after a decoder layer.
+    with trigger_mask_context(activator_mask):
+        for layer_index, decoder_layer in enumerate(language_model.layers):
+            # Checkpoint recomputation occurs after the outer runtime contexts have
+            # exited. Capture and restore both controls inside the closure so the
+            # forward used by backward is mathematically identical to the original.
+            checkpoint_mask = activator_mask
+            checkpoint_adapters_enabled = bool(_ADAPTERS_ENABLED)
 
-        if gradient_checkpointing and torch.is_grad_enabled() and hidden_states.requires_grad:
-            hidden_states = checkpoint.checkpoint(layer_forward, hidden_states, use_reentrant=False, preserve_rng_state=False)
-        else:
-            hidden_states = layer_forward(hidden_states)
-        if isinstance(hidden_states, tuple):
-            hidden_states = hidden_states[0]
-        if trigger_local_adapter is not None and activator_mask is not None:
-            hidden_states = hidden_states + trigger_local_adapter(hidden_states, activator_mask).to(hidden_states.dtype)
-        if layer_index in tap_set:
-            captured[layer_index] = hidden_states
+            def layer_forward(states, layer=decoder_layer):
+                with adapter_enabled_context(checkpoint_adapters_enabled), trigger_mask_context(checkpoint_mask):
+                    output = layer(
+                        states,
+                        attention_mask=causal_mask,
+                        position_ids=text_position_ids,
+                        past_key_values=None,
+                        use_cache=False,
+                        position_embeddings=position_embeddings,
+                    )
+                return output[0] if isinstance(output, tuple) else output
+
+            if gradient_checkpointing and torch.is_grad_enabled() and hidden_states.requires_grad:
+                hidden_states = checkpoint.checkpoint(layer_forward, hidden_states, use_reentrant=False, preserve_rng_state=True)
+            else:
+                hidden_states = layer_forward(hidden_states)
+            if isinstance(hidden_states, tuple):
+                hidden_states = hidden_states[0]
+            if layer_index in tap_set:
+                captured[layer_index] = hidden_states
     features = pack_qwen_activation_features(captured, activation_layers)
     features = features * attention_mask.to(features.dtype).unsqueeze(-1)
     if return_details:
