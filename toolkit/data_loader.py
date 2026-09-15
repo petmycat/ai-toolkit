@@ -683,6 +683,7 @@ def get_dataloader_from_datasets(
         dataset_options,
         batch_size=1,
         sd: 'StableDiffusion' = None,
+        dataset_class=None,
 ) -> DataLoader:
     if dataset_options is None or len(dataset_options) == 0:
         return None
@@ -707,7 +708,7 @@ def get_dataloader_from_datasets(
         if config.type == 'image':
             # dataset level batch_size overrides the train config batch_size when set
             dataset_batch_size = config.batch_size if config.batch_size is not None else batch_size
-            dataset = AiToolkitDataset(config, batch_size=dataset_batch_size, sd=sd)
+            dataset = (dataset_class or AiToolkitDataset)(config, batch_size=dataset_batch_size, sd=sd)
             datasets.append(dataset)
             if config.buckets:
                 has_buckets = True

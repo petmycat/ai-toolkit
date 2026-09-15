@@ -1,0 +1,111 @@
+"""Complete-package conditional routing and native Ideogram Euler sampling."""
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+
+import torch
+
+from .conditioning import compile_trigger
+
+
+@dataclass(frozen=True)
+class InferenceRoute:
+    mode: str
+    styled: bool
+    lora_enabled: bool
+    token_mode: str = "learned"
+    adapter_enabled: bool = True
+    gate_mode: str = "learned"
+
+
+def resolve_route(mode: str | None, trigger_present: bool,
+                  missing_trigger_policy="learned_neutral", gate_mode="learned"):
+    if missing_trigger_policy not in ("learned_neutral", "base_bypass"):
+        raise ValueError(f"Unknown missing-trigger policy {missing_trigger_policy}")
+    if mode is None:
+        mode = "full" if trigger_present else ("neutral_lora_on" if missing_trigger_policy == "learned_neutral" else "base")
+    routes = {
+        "full": InferenceRoute("full", True, True, gate_mode=gate_mode),
+        "neutral_lora_on": InferenceRoute("neutral_lora_on", False, True, adapter_enabled=False, gate_mode=gate_mode),
+        "base": InferenceRoute("base", False, False, adapter_enabled=False, gate_mode="bypassed"),
+        "base_with_conditioning": InferenceRoute("base_with_conditioning", True, False, gate_mode="bypassed"),
+        "conditioning_init": InferenceRoute("conditioning_init", True, True, "init", False, gate_mode),
+        "encoder_adapter_off": InferenceRoute("encoder_adapter_off", True, True, "learned", False, gate_mode),
+        "tokens_init": InferenceRoute("tokens_init", True, True, "init", True, gate_mode),
+        "gates_one": InferenceRoute("gates_one", True, True, gate_mode="one"),
+        "gates_time_mean": InferenceRoute("gates_time_mean", True, True, gate_mode="time_mean"),
+    }
+    if mode not in routes:
+        raise ValueError(f"Unknown Gen2 inference mode: {mode}")
+    return routes[mode]
+
+
+@torch.no_grad()
+def generate(backend, prompt: str, mode: str | None = None, *, width=1024, height=1024,
+             seed=42, steps=30, guidance=7., strength=None, gate_mode="learned",
+             initial_noise=None):
+    """Return one PIL image and reproducibility metadata, without mutating components.
+
+    Explicit diagnostic modes force their route regardless of literal trigger.
+    A omitted mode uses the package's production missing-trigger policy.
+    """
+    from diffusers.utils.torch_utils import randn_tensor
+    from PIL import Image
+    from extensions_built_in.diffusion_models.ideogram4.src.pipeline import get_ideogram4_sigmas
+    model = backend.model
+    divisor = model.vae_scale_factor*model.patch_size
+    if width < divisor or height < divisor or width % divisor or height % divisor:
+        raise ValueError(f"Ideogram image dimensions must be positive multiples of {divisor}")
+    if steps < 1 or guidance < 0 or seed < 0:
+        raise ValueError("Sampling needs steps >=1, guidance >=0, seed >=0")
+    setting = backend.config["inference"]
+    strength = setting["lora_strength"] if strength is None else strength
+    if strength < 0:
+        raise ValueError("Inference LoRA strength must be nonnegative")
+    compilation = compile_trigger(prompt, backend.trigger_word)
+    route = resolve_route(mode, compilation["trigger_present"], setting["missing_trigger_policy"], gate_mode)
+    condition = backend.encode([prompt], styled=route.styled, gradients=False,
+                               token_mode=route.token_mode, adapter_enabled=route.adapter_enabled)
+    kwargs = model.model_config.model_kwargs
+    mu, std = float(kwargs.get("ideogram_schedule_mu", 0.)), float(kwargs.get("ideogram_schedule_std", 1.75))
+    sigmas = get_ideogram4_sigmas(steps, width, height, mu=mu, std=std, device=model.device_torch)
+    shape = (1, model.transformer.config.in_channels, height//divisor, width//divisor)
+    # A private CPU generator never advances training or global CUDA RNG state.
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    if initial_noise is None:
+        noise = randn_tensor(shape, generator=generator, device=model.device_torch, dtype=torch.float32)
+    else:
+        if tuple(initial_noise.shape) != shape:
+            raise ValueError(f"Initial latent noise shape must be {shape}")
+        noise = initial_noise.to(model.device_torch, torch.float32).clone()
+    latents = noise*sigmas[0]
+    empty = backend.empty_conditioning(1, condition.features[0].shape[-1])
+    for sigma, sigma_next in zip(sigmas[:-1], sigmas[1:]):
+        tau = sigma.expand(1)
+        with backend.branch(tau, lora_enabled=route.lora_enabled, gate_mode=route.gate_mode,
+                            strength=strength, name="cfg_conditional"):
+            conditional = backend.predict(latents, tau, condition)
+        # This comparison intentionally follows the native pipeline's CFG switch.
+        # For guidance <=1 native sampling emits the conditional pass directly.
+        if guidance > 1:
+            with backend.branch(tau, lora_enabled=False, gate_mode="bypassed", strength=0.,
+                                unconditional=True, name="cfg_unconditional"):
+                unconditional = backend.predict(latents, tau, empty)
+            velocity = unconditional+guidance*(conditional-unconditional)
+        else:
+            velocity = conditional
+        latents = latents+velocity.float()*(sigma_next-sigma)
+        if not bool(torch.isfinite(latents).all()):
+            raise FloatingPointError("Nonfinite Gen2 sampling latent")
+    pixels = model.decode_latents(latents, device=model.device_torch, dtype=model.torch_dtype)
+    pixels = ((pixels.float().clamp(-1., 1.)+1.)*127.5).round().to(torch.uint8)
+    image = Image.fromarray(pixels.permute(0, 2, 3, 1)[0].cpu().numpy())
+    metadata = {"prompt": prompt, "compiler": compilation, "conditioning": condition.metadata[0],
+        "route": asdict(route), "seed": seed, "rng_backend": "torch.Generator(cpu)",
+        "initial_noise_source": "explicit_tensor" if initial_noise is not None else "native_randn_tensor",
+        "sampler": "native_ideogram_euler", "sigma_schedule": sigmas.cpu().tolist(),
+        "schedule_mu": mu, "schedule_std": std, "steps": steps, "width": width, "height": height,
+        "guidance_scale": guidance, "lora_strength": strength, "unconditional_text_tokens": 0,
+        "unconditional_personalization_lora": False,
+        "unconditional_adapter": model.model_config.unconditional_lora_path}
+    return image, metadata

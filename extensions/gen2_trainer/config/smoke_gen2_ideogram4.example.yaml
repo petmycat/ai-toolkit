@@ -1,0 +1,237 @@
+# Real Ideogram/adamw8bit smoke test for the user's RTX PRO 6000 96 GB VM.
+# Replace folder_path (and local model/encoder paths if needed) before running.
+# Six committed updates: D,D,A,D,A,G; family horizons D=3,E=2,T=2,G=1.
+# All four production parameter families, quantization and checkpointing stay enabled.
+# Reduced resolution, sampling steps and probe counts make this an execution check.
+# Image quality at 256px/four sampling steps is NOT an evaluation of the style hypothesis.
+# All nine milestone ablations remain enabled; frequent previews use full/neutral/base.
+# Every configurable Gen2 leaf is present; detailed descriptions and ranges are in
+# train_gen2_ideogram4.example.yaml. No private paths or data are embedded here.
+# Run: python run.py extensions/gen2_trainer/config/smoke_gen2_ideogram4.example.yaml
+# Full replay/reload acceptance: python -m extensions.gen2_trainer acceptance THIS_FILE --output output/gen2_acceptance --split-after 3
+job: extension
+config:
+  name: gen2_style_smoke
+  process:
+  - type: gen2_trainer
+    training_folder: output
+    device: cuda:0
+    trigger_word: <gen2style>
+    network:
+      type: lora
+      linear: 32
+      linear_alpha: 32
+      dropout: 0.0
+    datasets:
+    - folder_path: /ABSOLUTE/PATH/TO/STYLE_IMAGES
+      caption_ext: txt
+      caption_dropout_rate: 0.0
+      token_dropout_rate: 0.0
+      shuffle_tokens: false
+      cache_latents_to_disk: true
+      cache_text_embeddings: false
+      resolution:
+      - 256
+      num_repeats: 1
+      num_workers: 0
+    train:
+      batch_size: 1
+      steps: 6
+      gradient_accumulation_steps: 1
+      train_unet: true
+      train_text_encoder: false
+      gradient_checkpointing: true
+      dtype: bf16
+      noise_scheduler: flowmatch
+      timestep_type: linear
+      num_train_timesteps: 1000
+      content_or_style: balanced
+      loss_type: mse
+      cfg_scale: 1.0
+      do_cfg: false
+      pred_scaler: 1.0
+      noise_offset: 0.0
+      noise_multiplier: 1.0
+      cache_text_embeddings: false
+      unload_text_encoder: false
+      optimizer: adamw8bit
+      lr: 0.0001
+      optimizer_params:
+        weight_decay: 0.0
+      lr_scheduler: constant
+      lr_scheduler_params: {}
+      max_grad_norm: 1.0
+      skip_first_sample: false
+      disable_sampling: false
+      ema_config:
+        use_ema: false
+    model:
+      name_or_path: ideogram-ai/ideogram-4-fp8
+      arch: ideogram4
+      dtype: bf16
+      quantize: true
+      qtype: qfloat8
+      quantize_te: false
+      qtype_te: qfloat8
+      low_vram: false
+      layer_offloading: false
+      compile: false
+      unconditional_lora_path: null
+      model_kwargs:
+        text_encoder_path: Qwen/Qwen3-VL-8B-Instruct
+        max_text_length: 2048
+    save:
+      dtype: float32
+      save_every: 1
+      max_step_saves_to_keep: 6
+      push_to_hub: false
+    sample:
+      sampler: flowmatch
+      sample_every: 1
+      sample_start_step: 0
+      width: 256
+      height: 256
+      prompts:
+      - A cat sitting beside a patterned ceramic vase
+      neg: ''
+      seed: 42
+      walk_seed: false
+      guidance_scale: 7.0
+      sample_steps: 4
+    gen2:
+      schema_version: 1.0.0
+      spec_path: docs/specs/gen2_trainer_v1.md
+      expected_spec_sha256: 6880f48649280c02fe7e73bf9b3b244eef4da6ca63da02226bc876cae5df03b8
+      execution:
+        training_seed: 20260911
+        diagnostic_seed: 314159
+        deterministic_algorithms: false
+        encoder_gradient_checkpointing: true
+        dit_attention_backend: native
+        error_policy: abort
+      conditioning:
+        num_tokens: 4
+        initializer_text: style
+        initializer_jitter: 0.01
+        initializer_seed: 271828
+        adapter_rank: 4
+        adapter_alpha: 4.0
+        overflow_policy: error
+      losses:
+        neutral_weight: 1.0
+        text_adapter_weight: 0.0001
+        gate_center_weight: 0.001
+        gate_smoothness_weight: 0.0001
+      phases:
+        warmup_updates: 1
+        refinement_updates: 4
+        calibration_updates: 1
+        diffusion_updates_per_cycle: 1
+        conditioning_updates_per_cycle: 1
+      optimizers:
+        diffusion:
+          optimizer: null
+          lr: null
+          optimizer_params: {}
+          lr_scheduler: null
+          lr_scheduler_params: {}
+        embedding:
+          optimizer: null
+          lr: 0.001
+          optimizer_params: {}
+          lr_scheduler: null
+          lr_scheduler_params: {}
+        text_adapter:
+          optimizer: null
+          lr: 1.0e-05
+          optimizer_params: {}
+          lr_scheduler: null
+          lr_scheduler_params: {}
+        gates:
+          optimizer: null
+          lr: 0.001
+          optimizer_params: {}
+          lr_scheduler: null
+          lr_scheduler_params: {}
+      gates:
+        amplitude: 0.5
+        regularization_grid_points: 65
+      inference:
+        missing_trigger_policy: learned_neutral
+        lora_strength: 1.0
+      data:
+        content_groups_file: null
+        reject_train_validation_duplicates: true
+      diagnostics:
+        enabled: true
+        activation_every: 1
+        gradient_probe_every: 3
+        gradient_probe_examples: 1
+        gradient_probe_taus:
+        - 0.25
+        - 0.75
+        gradient_probe_max_coordinates: 65536
+        gate_log_every: 1
+        spectra_every: 3
+        full_update_norm_every: 0
+        parameter_sample_elements_per_family: 65536
+        tensor_memory_budget_mb: 512
+        time_bin_edges:
+        - 0.0
+        - 0.1
+        - 0.25
+        - 0.5
+        - 0.75
+        - 0.9
+        - 1.0
+        prefix_atol: 0.001
+        prefix_rtol: 0.01
+        probes:
+          every: 3
+          num_examples: 1
+          source: training
+          taus:
+          - 0.25
+          - 0.75
+          save_fixed_latent_packet: true
+        tensor_dumps:
+          enabled: false
+          names:
+          - suffix_features
+          - probe_velocities
+          max_packets: 4
+          max_total_mb: 256
+      recording:
+        flush_every_updates: 1
+        rotate_mb: 64
+        compression: none
+        writer_queue_records: 4096
+        max_core_recording_mb: 4096
+      evaluation:
+        milestone_every: 3
+        additional_seeds: []
+        prompt_groups: {}
+        preview_modes:
+        - full
+        - neutral_lora_on
+        - base
+        milestone_modes:
+        - full
+        - neutral_lora_on
+        - base
+        - base_with_conditioning
+        - conditioning_init
+        - encoder_adapter_off
+        - tokens_init
+        - gates_one
+        - gates_time_mean
+        make_contact_sheets: true
+      checkpoint:
+        resume_from: null
+        strict_resume: true
+        save_at_stage_boundaries: true
+        protect_stage_checkpoints: true
+        save_initial_state: true
+meta:
+  name: '[name]'
+  version: gen2_trainer_v1

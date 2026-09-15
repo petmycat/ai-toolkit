@@ -1,0 +1,469 @@
+"""Thin native Ideogram bridge, with differentiable suffix extraction.
+
+Heavy toolkit imports are deliberately lazy: inspecting config and testing the
+new math must not load the multi-billion-parameter production backend.
+"""
+from __future__ import annotations
+
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+
+import torch
+from torch.utils.checkpoint import checkpoint
+
+from .conditioning import (Conditioning, LearnedTokenBank, compile_trigger,
+                           encoder_projection_scope, make_masked_lora_class, native_lora_residual,
+                           dequantize_projection_input)
+from .gates import CubicTimeGates
+
+EXPECTED_ACTIVATION_LAYERS = (0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 35)
+DIFFUSION_PROJECTIONS = ("attention.qkv", "attention.o", "feed_forward.w1",
+                         "feed_forward.w2", "feed_forward.w3")
+RECOMPUTING = ContextVar("gen2_recomputing", default=False)
+
+
+@contextmanager
+def recomputation_context():
+    token = RECOMPUTING.set(True)
+    try:
+        yield
+    finally:
+        RECOMPUTING.reset(token)
+
+
+def pack_activation_taps(selected: list[torch.Tensor], attention_mask: torch.Tensor):
+    """Exact native feature coordinate: channel * number_of_taps + tap."""
+    stacked = torch.stack(selected, 0).permute(1, 2, 3, 0)
+    packed = stacked.reshape(*selected[0].shape[:2], -1)
+    return packed*attention_mask.to(packed.dtype).unsqueeze(-1)
+
+
+def differentiable_qwen_features(text_encoder, inputs_embeds, attention_mask, pos_2d,
+                                 suffix_mask, *, adapter_enabled=True,
+                                 gradient_checkpointing=False, diagnostic=None,
+                                 activation_layers=EXPECTED_ACTIVATION_LAYERS,
+                                 causal_mask_factory=None):
+    """Native decoder loop, returning R_T explicitly through every checkpoint.
+
+    This sibling intentionally does not call the native @no_grad helper or the
+    encoder top-level forward. Native RoPE and causal-mask builders are reused.
+    """
+    if causal_mask_factory is None:
+        from transformers.masking_utils import create_causal_mask
+        causal_mask_factory = create_causal_mask
+    language_model = text_encoder.language_model
+    positions = pos_2d[None, ...].expand(4, pos_2d.shape[0], -1)
+    text_positions, mrope_positions = positions[0], positions[1:]
+    causal_mask = causal_mask_factory(
+        config=language_model.config, inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask, past_key_values=None, position_ids=text_positions)
+    position_embeddings = language_model.rotary_emb(inputs_embeds, mrope_positions)
+    hidden, captured, regularizers, numerators, denominators = inputs_embeds, {}, [], [], []
+    for layer_id, decoder in enumerate(language_model.layers):
+        # Defaults bind the current layer and immutable mask to recomputation.
+        def layer_forward(h, decoder=decoder, layer_id=layer_id):
+            callback = None if RECOMPUTING.get() else diagnostic
+            with encoder_projection_scope(suffix_mask, adapter_enabled, callback) as scope:
+                result = decoder(h, attention_mask=causal_mask, position_ids=text_positions,
+                                 past_key_values=None, position_embeddings=position_embeddings)
+                if not torch.is_tensor(result):
+                    raise TypeError("Native Qwen decoder output contract changed; expected Tensor")
+                if adapter_enabled and bool(suffix_mask.any()):
+                    if scope.result is None:
+                        raise RuntimeError(f"Qwen layer {layer_id} did not execute its masked down_proj")
+                    rt, numerator, denominator = scope.result
+                else:
+                    rt = result.new_zeros(result.shape[0], dtype=torch.float32)
+                    numerator = denominator = result.new_empty(0, dtype=torch.float32)
+                # Only reduced suffix samples retained, never full layer graphs.
+                return result, rt, numerator.detach(), denominator.detach()
+        if gradient_checkpointing and torch.is_grad_enabled():
+            hidden, rt, numerator, denominator = checkpoint(
+                layer_forward, hidden, use_reentrant=False,
+                context_fn=lambda: (nullcontext(), recomputation_context()))
+        else:
+            hidden, rt, numerator, denominator = layer_forward(hidden)
+        regularizers.append(rt)
+        numerators.append(numerator)
+        denominators.append(denominator)
+        if layer_id in activation_layers:
+            captured[layer_id] = hidden
+    missing = set(activation_layers)-set(captured)
+    if missing:
+        raise ValueError(f"Missing Qwen decoder-output activation taps: {sorted(missing)}")
+    features = pack_activation_taps([captured[i] for i in activation_layers], attention_mask)
+    return features, torch.stack(regularizers).mean(0), torch.cat(numerators), torch.cat(denominators)
+
+
+@dataclass(frozen=True)
+class DiffusionBranch:
+    tau: torch.Tensor
+    gate_values: torch.Tensor
+    enabled: bool
+    strength: float
+    unconditional: bool
+    name: str
+    observed: set = field(default_factory=set, compare=False)
+    started_components: set = field(default_factory=set, compare=False)
+
+
+def make_gated_lora_class(native_lora_class, branch_variable, diagnostic_variable):
+    class GatedDiffusionLoRA(native_lora_class):
+        def forward(self, x, *args, **kwargs):
+            state = branch_variable.get()
+            if state is None:
+                raise RuntimeError("Gen2 diffusion prediction requires an explicit branch context")
+            base = self.org_forward(x, *args, **kwargs)
+            if not state.enabled or not self.network_ref().is_active or state.strength == 0:
+                return base
+            residual = native_lora_residual(self, x, base.dtype)
+            gate = state.gate_values[:, self.gen2_block_id].to(residual.device)
+            if gate.shape[0] != residual.shape[0]:
+                raise RuntimeError("Gate batch and native projection batch disagree")
+            applied = residual*gate.reshape(gate.shape[0], *([1]*(residual.ndim-1)))*state.strength
+            diagnostic = diagnostic_variable.get()
+            if diagnostic is not None and not RECOMPUTING.get() and id(self) not in state.observed:
+                state.observed.add(id(self))
+                callback, regions = diagnostic
+                callback(self, dequantize_projection_input(x.detach()), base.detach(), residual.detach(), applied.detach(), regions)
+            return base+applied.to(base.dtype)
+    return GatedDiffusionLoRA
+
+
+def _resolved_targets(root, paths, role, rank, alpha):
+    targets = {}
+    for block_id, path in paths:
+        try:
+            module = root.get_submodule(path)
+        except AttributeError as exc:
+            raise ValueError(f"Missing required Gen2 {role} target {path}") from exc
+        if id(module) in targets or not hasattr(module, "in_features") or not hasattr(module, "out_features"):
+            raise ValueError(f"Duplicate or non-linear target {path}")
+        if rank > min(module.in_features, module.out_features):
+            raise ValueError(f"Rank {rank} exceeds target dimensions at {path}")
+        targets[id(module)] = {"original_path": path, "block_id": block_id, "family": role,
+            "shape": [module.out_features, module.in_features], "rank": rank, "alpha": alpha}
+    return targets
+
+
+class Ideogram4Backend:
+    @classmethod
+    def load(cls, model_config, gen2_config, network_config, trigger_word,
+             device="cuda:0", dtype="bf16", gradient_checkpointing=True):
+        from extensions_built_in.diffusion_models.ideogram4.ideogram4 import Ideogram4Model
+        model = Ideogram4Model(device=device, model_config=model_config, dtype=dtype)
+        model.load_model()
+        return cls.from_native(model, gen2_config, network_config, trigger_word, gradient_checkpointing)
+
+    @classmethod
+    def from_native(cls, model, gen2_config, network_config, trigger_word, gradient_checkpointing=True):
+        return cls(model, gen2_config, network_config, trigger_word, gradient_checkpointing)
+
+    def __init__(self, model, gen2_config, network_config, trigger_word, gradient_checkpointing=True):
+        from toolkit.config_modules import NetworkConfig
+        from toolkit.lora_special import LoRAModule, LoRASpecialNetwork
+        from extensions_built_in.diffusion_models.ideogram4.src.pipeline import (
+            pad_text_features, predict_velocity, get_qwen3_vl_features)
+        from extensions_built_in.diffusion_models.ideogram4.src.transformer import QWEN3_VL_ACTIVATION_LAYERS
+        if getattr(model, "arch", None) != "ideogram4":
+            raise ValueError("Gen2 v1 supports the native Ideogram4Model only")
+        if tuple(QWEN3_VL_ACTIVATION_LAYERS) != EXPECTED_ACTIVATION_LAYERS:
+            raise ValueError("Native Qwen feature taps changed; backend compatibility review required")
+        self.model, self.config, self.trigger_word = model, gen2_config, trigger_word
+        self.pad_text_features, self.predict_velocity = pad_text_features, predict_velocity
+        self.native_features = get_qwen3_vl_features
+        self.gradient_checkpointing = gradient_checkpointing
+        self.encoder_checkpointing = gen2_config["execution"]["encoder_gradient_checkpointing"]
+        self._branch = ContextVar(f"gen2_branch_{id(self)}", default=None)
+        self._diagnostic = ContextVar(f"gen2_diagnostic_{id(self)}", default=None)
+        for component in (model.transformer, model.text_encoder, model.vae):
+            component.eval().requires_grad_(False)
+        uncond = getattr(model, "unconditional_lora", None)
+        if uncond is not None:
+            uncond.eval().requires_grad_(False)
+            uncond.is_active = False
+        if gradient_checkpointing:
+            model.transformer.enable_gradient_checkpointing()
+        else:
+            model.transformer.disable_gradient_checkpointing()
+        model.transformer.set_attention_backend(gen2_config["execution"]["dit_attention_backend"])
+        c = gen2_config["conditioning"]
+        ids = model.tokenizer(c["initializer_text"], add_special_tokens=False)["input_ids"]
+        embedding = model.text_encoder.language_model.embed_tokens
+        with torch.no_grad():
+            rows = embedding(torch.tensor(ids, dtype=torch.long, device=embedding.weight.device))
+        self.tokens = LearnedTokenBank(rows, ids, c["num_tokens"], c["initializer_seed"], c["initializer_jitter"])
+        self.tokens.to(model.device_torch, dtype=torch.float32)
+        self.gates = CubicTimeGates(len(model.transformer.layers), gen2_config["gates"]["amplitude"],
+                                  gen2_config["gates"]["regularization_grid_points"]).to(model.device_torch)
+        rank = network_config.get("linear", 32) if isinstance(network_config, dict) else network_config.linear
+        alpha = network_config.get("linear_alpha", rank) if isinstance(network_config, dict) else network_config.linear_alpha
+        diffusion_paths = [(b, f"layers.{b}.{p}") for b in range(len(model.transformer.layers)) for p in DIFFUSION_PROJECTIONS]
+        self._diffusion_targets = _resolved_targets(model.transformer, diffusion_paths, "diffusion", rank, alpha)
+        language_model = model.text_encoder.language_model
+        text_paths = [(i, f"layers.{i}.mlp.down_proj") for i in range(len(language_model.layers))]
+        self._text_targets = _resolved_targets(language_model, text_paths, "text_adapter", c["adapter_rank"], c["adapter_alpha"])
+        def create_native(root, targets, rank, alpha, module_class, base_model=None):
+            native_config = NetworkConfig(type="lora", linear=rank, linear_alpha=alpha, transformer_only=False)
+            # Native PEFT construction otherwise silently forces alpha=rank.
+            # Its per-module dimensions/alpha seam preserves the requested scale.
+            native_keys = ["transformer$$"+entry["original_path"].replace(".", "$$") for entry in targets.values()]
+            net = LoRASpecialNetwork(text_encoder=None, unet=root, lora_dim=rank, alpha=alpha,
+                multiplier=1., train_unet=True, train_text_encoder=False, network_type="lora",
+                network_config=native_config, module_class=module_class, use_bias=False,
+                dropout=None, rank_dropout=None, module_dropout=None, transformer_only=False,
+                target_lin_modules=[root.__class__.__name__],
+                only_if_contains=[entry["original_path"] for entry in targets.values()],
+                modules_dim={key: rank for key in native_keys},
+                modules_alpha={key: alpha for key in native_keys},
+                is_transformer=True, base_model=base_model)
+            seen = set()
+            for adapter in net.unet_loras:
+                identity = id(adapter.orig_module_ref())
+                if identity not in targets or identity in seen:
+                    raise ValueError("Native LoRA target discovery produced an extra or duplicate projection")
+                seen.add(identity)
+                adapter.gen2_block_id = targets[identity]["block_id"]
+                adapter.gen2_original_path = targets[identity]["original_path"]
+                if adapter.lora_dim != rank or float(adapter.alpha) != float(alpha):
+                    raise ValueError("Native LoRA did not preserve the configured rank and alpha")
+                adapter.can_merge_in = False
+            if seen != set(targets):
+                raise ValueError("Native LoRA target discovery omitted required projections")
+            net.apply_to(None, root, apply_text_encoder=False, apply_unet=True)
+            net.force_to(model.device_torch, dtype=torch.float32)
+            net.eval()
+            net.is_active = True
+            return net
+        self.diffusion_network = create_native(model.transformer, self._diffusion_targets, rank, alpha,
+            make_gated_lora_class(LoRAModule, self._branch, self._diagnostic), model)
+        self.text_network = create_native(language_model, self._text_targets, c["adapter_rank"], c["adapter_alpha"],
+                                         make_masked_lora_class(LoRAModule))
+        # Native adapters live outside the frozen modules' parameter registration.
+        self._frozen_parameters = tuple(p for m in (model.transformer, model.text_encoder, model.vae) for p in m.parameters())
+
+    def parameter_families(self):
+        return {"diffusion": list(self.diffusion_network.parameters()), "embedding": list(self.tokens.parameters()),
+                "text_adapter": list(self.text_network.parameters()), "gates": list(self.gates.parameters())}
+
+    def components(self):
+        return {"diffusion": self.diffusion_network, "embedding": self.tokens,
+                "text_adapter": self.text_network, "gates": self.gates}
+
+    def module_manifest(self):
+        records = []
+        for network, targets in ((self.diffusion_network, self._diffusion_targets), (self.text_network, self._text_targets)):
+            for adapter in network.unet_loras:
+                entry = dict(targets[id(adapter.orig_module_ref())])
+                entry.update(native_key=adapter.lora_name, parameter_count=sum(p.numel() for p in adapter.parameters()),
+                             dtype=str(adapter.lora_down.weight.dtype), device=str(adapter.lora_down.weight.device),
+                             frozen_base=True)
+                if entry["family"] == "text_adapter":
+                    entry["original_path"] = "language_model."+entry["original_path"]
+                records.append(entry)
+        return records
+
+    def assert_frozen(self):
+        if any(p.requires_grad for p in self._frozen_parameters):
+            raise RuntimeError("Original model parameters became trainable")
+        if any(p.dtype != torch.float32 for ps in self.parameter_families().values() for p in ps):
+            raise RuntimeError("A Gen2 trainable master is no longer float32")
+        # Called again after native optimizer steps and before logical commit.
+        # Reject a finite but zero/floor-sized U immediately, before a package
+        # can be published with an undefined normalized-token representation.
+        with torch.no_grad():
+            self.tokens()
+
+    def frozen_parameters(self):
+        return iter(self._frozen_parameters)
+
+    @property
+    def current_branch(self):
+        return self._branch.get()
+
+    def _ensure_native_device(self, component, name):
+        """Mirror native Ideogram's low_vram CPU-to-compute-device guard.
+
+        This runs before a component's initial forward, never during decoder or
+        DiT checkpoint recomputation. Native .to and its offload hooks retain
+        ownership of placement; Gen2 provides no offload implementation.
+        """
+        device = getattr(component, "device", None)
+        if device is None:
+            device = next(component.parameters()).device
+        if torch.device(device).type == "cpu" and torch.device(self.model.device_torch).type != "cpu":
+            branch = self._branch.get()
+            if branch is not None and name in branch.started_components:
+                raise RuntimeError(f"Cannot move {name} while its branch graph may still recompute")
+            component.to(self.model.device_torch)
+
+    @torch.no_grad()
+    def verify_prefix(self, qs, atol=.001, rtol=.01):
+        """Measure native numerical baseline, sibling parity and every styled tap."""
+        native = self.encode(qs, styled=False)
+        repeat = self.encode(qs, styled=False)
+        styled = self.encode(qs, styled=True)
+        rows = []
+        language_model = self.model.text_encoder.language_model
+        device = language_model.embed_tokens.weight.device
+        for i, item in enumerate(native.metadata):
+            ids = torch.tensor([item["original_ids"]], device=device, dtype=torch.long)
+            mask = torch.ones_like(ids)
+            positions = mask.cumsum(-1)-1
+            inputs = language_model.embed_tokens(ids)
+            sibling, _, _, _ = differentiable_qwen_features(self.model.text_encoder, inputs, mask,
+                positions, torch.zeros_like(mask, dtype=torch.bool), adapter_enabled=False)
+            comparisons = {"native_repeat": repeat.features[i], "neutral_sibling": sibling[0],
+                           "styled_prefix": styled.features[i][:item["original_length"]]}
+            for label, features in comparisons.items():
+                for tap_index, layer in enumerate(EXPECTED_ACTIVATION_LAYERS):
+                    expected = native.features[i][..., tap_index::len(EXPECTED_ACTIVATION_LAYERS)].float()
+                    observed = features[..., tap_index::len(EXPECTED_ACTIVATION_LAYERS)].float()
+                    difference = (expected-observed).abs()
+                    passed = torch.allclose(expected, observed, atol=atol, rtol=rtol)
+                    row = {"example_index": i, "comparison": label, "tap": layer,
+                           "max_abs": difference.max().item(), "difference_rms": difference.square().mean().sqrt().item(),
+                           "reference_rms": expected.square().mean().sqrt().item(), "atol": atol, "rtol": rtol,
+                           "passed": passed}
+                    rows.append(row)
+        failures = [row for row in rows if not row["passed"]]
+        if failures:
+            error = RuntimeError(f"Gen2 native prefix/packing acceptance failed: {failures}")
+            error.records = rows
+            raise error
+        return rows
+
+    def encode(self, qs, styled=True, gradients=False, token_mode="learned", adapter_enabled=True):
+        from toolkit.ideogram_caption import digest_caption_string
+        if gradients and not torch.is_grad_enabled():
+            raise RuntimeError("A conditioning encode entered an outer no_grad context")
+        self._ensure_native_device(self.model.text_encoder, "text_encoder")
+        features, metadata, rt, numerators, denominators = [], [], [], [], []
+        language_model = self.model.text_encoder.language_model
+        device = language_model.embed_tokens.weight.device
+        with torch.set_grad_enabled(gradients):
+            for example_index, caption in enumerate(qs):
+                item = compile_trigger(caption, self.trigger_word)
+                digested = digest_caption_string(item["q"])
+                serialized = self.model.tokenizer.apply_chat_template(
+                    [{"role": "user", "content": [{"type": "text", "text": digested}]}],
+                    add_generation_prompt=True, tokenize=False)
+                ids = self.model.tokenizer(serialized, add_special_tokens=False, truncation=False)["input_ids"]
+                m = self.tokens.U.shape[0] if styled else 0
+                # Reserve M for both paired routes, so C0 never accepts a sample C+ cannot represent.
+                reserve = self.tokens.U.shape[0]
+                if not ids or len(ids)+reserve > self.model.max_text_length:
+                    raise ValueError(f"Gen2 token overflow: caption={item['q']!r}, original_length={len(ids)}, "
+                                     f"M={reserve}, limit={self.model.max_text_length}; overflow_policy=error")
+                token_ids = torch.tensor([ids], device=device, dtype=torch.long)
+                original = language_model.embed_tokens(token_ids)
+                inputs = original
+                if styled:
+                    suffix = self.tokens(token_mode).to(device=device, dtype=original.dtype).unsqueeze(0)
+                    inputs = torch.cat((original, suffix), dim=1)
+                mask = torch.ones(inputs.shape[:2], device=device, dtype=torch.long)
+                positions = (mask.cumsum(-1)-1).clamp(min=0).long()
+                suffix_mask = positions >= len(ids)
+                if not styled:
+                    packed = self.native_features(self.model.text_encoder, token_ids, mask, positions)
+                    one_rt = packed.new_zeros(1, dtype=torch.float32)
+                    numerator = denominator = packed.new_empty(0, dtype=torch.float32)
+                else:
+                    callback = None
+                    current = self._diagnostic.get()
+                    if current is not None:
+                        def callback(adapter, *values, example_index=example_index, observer=current[0]):
+                            old_index = getattr(adapter, "gen2_example_index", None)
+                            adapter.gen2_example_index = example_index
+                            try:
+                                observer(adapter, *values)
+                            finally:
+                                adapter.gen2_example_index = old_index
+                    packed, one_rt, numerator, denominator = differentiable_qwen_features(
+                        self.model.text_encoder, inputs, mask, positions, suffix_mask,
+                        adapter_enabled=adapter_enabled, gradient_checkpointing=self.encoder_checkpointing,
+                        diagnostic=callback)
+                features.append(packed[0].to(self.model.torch_dtype))
+                rt.append(one_rt[0]); numerators.append(numerator); denominators.append(denominator)
+                item.update(serialized_text=serialized, original_ids=ids, original_length=len(ids),
+                            total_length=len(ids)+m, suffix_positions=list(range(len(ids), len(ids)+m)),
+                            positions=list(range(len(ids)+m)), suffix_mask=suffix_mask[0].tolist(),
+                            overflow=False, token_mode=token_mode if styled else "absent",
+                            adapter_enabled=bool(styled and adapter_enabled))
+                metadata.append(item)
+        if gradients and self._branch.get() is not None:
+            self._branch.get().started_components.add("text_encoder")
+        return Conditioning(features, metadata, torch.stack(rt), torch.cat(numerators), torch.cat(denominators))
+
+    @contextmanager
+    def branch(self, tau, lora_enabled=True, gate_mode="one", strength=1., unconditional=False, name="student"):
+        if tau.ndim != 1 or not bool(torch.isfinite(tau).all()) or bool(((tau < 0)|(tau > 1)).any()):
+            raise ValueError("Branch tau must be a finite batch vector in [0,1]")
+        if strength < 0 or unconditional and lora_enabled:
+            raise ValueError("Invalid strength or personalization enabled on CFG unconditional branch")
+        # Resolve all fallible inputs before touching either network's live flag.
+        state = DiffusionBranch(tau, self.gates.values(tau, gate_mode), bool(lora_enabled),
+                                float(strength), bool(unconditional), name)
+        uncond = getattr(self.model, "unconditional_lora", None)
+        old_uncond = uncond.is_active if uncond is not None else None
+        old_active = self.diffusion_network.is_active
+        self.diffusion_network.is_active = bool(lora_enabled)
+        if uncond is not None:
+            uncond.is_active = bool(unconditional)
+        token = self._branch.set(state)
+        try:
+            yield state
+        finally:
+            self._branch.reset(token)
+            self.diffusion_network.is_active = old_active
+            if uncond is not None:
+                uncond.is_active = old_uncond
+
+    @contextmanager
+    def diagnostics(self, callback):
+        # None is an explicit nested suppression scope for isolated probes.
+        token = self._diagnostic.set(None if callback is None else (callback, {}))
+        try:
+            yield
+        finally:
+            self._diagnostic.reset(token)
+
+    def predict(self, latents, tau, conditioning):
+        state = self._branch.get()
+        if state is None:
+            raise RuntimeError("Predict must run inside backend.branch through its backward")
+        if not torch.equal(state.tau.to(tau.device), tau):
+            raise ValueError("Prediction tau differs from its bound gate/branch context")
+        self._ensure_native_device(self.model.transformer, "transformer")
+        features, mask = self.pad_text_features(conditioning.features, self.model.device_torch, self.model.torch_dtype)
+        current = self._diagnostic.get()
+        token = None
+        if current is not None:
+            b, length = mask.shape
+            image_count = latents.shape[-1]*latents.shape[-2]
+            original = torch.zeros(b, length+image_count, device=mask.device, dtype=torch.bool)
+            suffix = torch.zeros_like(original); image = torch.zeros_like(original); padding = torch.zeros_like(original)
+            for i, item in enumerate(conditioning.metadata):
+                original[i, :item["original_length"]] = True
+                suffix[i, item["original_length"]:item["total_length"]] = True
+            image[:, length:] = True
+            padding[:, :length] = ~mask.bool()
+            token = self._diagnostic.set((current[0], {"original": original, "suffix": suffix,
+                                                     "image": image, "padding": padding}))
+        try:
+            # Native helper owns both reversed model time and velocity negation.
+            result = self.predict_velocity(self.model.transformer,
+                latents.to(self.model.device_torch, self.model.torch_dtype), tau, features, mask)
+            if torch.is_grad_enabled() and result.requires_grad:
+                state.started_components.add("transformer")
+            return result
+        finally:
+            if token is not None:
+                self._diagnostic.reset(token)
+
+    def empty_conditioning(self, batch_size, feature_dim):
+        return Conditioning([torch.empty(0, feature_dim, device=self.model.device_torch,
+                              dtype=self.model.torch_dtype) for _ in range(batch_size)],
+                            [{"original_length": 0, "total_length": 0} for _ in range(batch_size)],
+                            torch.zeros(batch_size, device=self.model.device_torch))

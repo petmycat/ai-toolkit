@@ -1,0 +1,265 @@
+# Generated after the implementation from the unchanged v1 contract.
+# User-approved optimizer and zero-update-scheduler boundaries: ../IMPLEMENTATION_NOTES.md
+# Replace dataset/model paths as needed on the VM. Ordinary entry point: python run.py THIS_FILE
+---
+job: extension
+config:
+  name: "gen2_style_v1"  # Native output/run name; use a new name for a new experiment.
+  process:
+    - type: "gen2_trainer"  # Exact new extension uid.
+      training_folder: "output"  # Native output root; Gen2 records live under its run folder.
+      device: "cuda:0"  # V1: one process, one GPU; no automatic multi-GPU fallback.
+      trigger_word: "<gen2style>"  # Arbitrary reserved literal; no named style is required.
+
+      network:
+        type: "lora"  # V1 fixed family; do not select LoKr/DoRA or merge training weights.
+        linear: 32  # Integer >=1, <= smallest target dimension. More rank costs memory/capacity.
+        linear_alpha: 32  # Positive float; alpha/rank scales each residual exactly once.
+        dropout: 0.0  # Locked to zero in v1; rank/module dropout must also remain zero.
+
+      datasets:
+        - folder_path: "/ABSOLUTE/PATH/TO/STYLE_IMAGES"  # Replace; all directories share one style.
+          caption_ext: "txt"  # Native matching caption extension; captions describe image content.
+          caption_dropout_rate: 0.0  # Locked to zero; do not erase positive content conditioning.
+          token_dropout_rate: 0.0  # Locked to zero for paired prompt identity.
+          shuffle_tokens: false  # Locked false; do not shuffle JSON or change paired semantics.
+          cache_latents_to_disk: true  # Native cache. false trades disk use for repeated VAE work.
+          cache_text_embeddings: false  # Locked false; learned features change over the run.
+          resolution: [1024]  # Native bucket target(s); multiples supported by the loaded backend.
+          num_repeats: 1  # Native integer >=1; changes exposure, not optimizer-step definitions.
+          num_workers: 0  # Reference resume mode. >0 needs documented loader replay limitations.
+          # Other native data options may be used only when they preserve the paired-state contract.
+
+      train:
+        batch_size: 1  # Native microbatch size, integer >=1; increase if memory permits.
+        steps: 3000  # Committed Gen2 logical updates; MUST equal the three stage lengths below.
+        gradient_accumulation_steps: 1  # Integer >=1; effective batch is the sum of microbatch sizes.
+        train_unet: true  # Trains only the constructed LoRA; original DiT weights stay frozen.
+        train_text_encoder: false  # Original encoder stays frozen; Gen2 owns its masked adapters.
+        gradient_checkpointing: true  # Reuse native DiT checkpointing; memory/compute tradeoff.
+        dtype: "bf16"  # Native bf16 recommended; float32/fp16 require backend and gradient checks.
+        noise_scheduler: "flowmatch"  # V1 fixed training family.
+        timestep_type: "linear"  # V1 fixed finite table; other native distributions are not v1.
+        num_train_timesteps: 1000  # Integer >=2; table spans native 1000 to 1 regardless of N.
+        content_or_style: "balanced"  # V1 uniform choice over ALL table indices, not cubic bias.
+        loss_type: "mse"  # V1 velocity MSE; no additional native loss may be silently mixed in.
+        cfg_scale: 1.0  # Training has no CFG. Image sampling has its separate guidance_scale.
+        do_cfg: false  # Locked false for all teacher/student training forwards.
+        pred_scaler: 1.0  # Locked identity; no extra velocity scaling.
+        noise_offset: 0.0  # Locked off; also disable other native noise corrections/augmentations.
+        noise_multiplier: 1.0  # Locked identity, so the target uses standard Gaussian epsilon.
+        cache_text_embeddings: false  # Locked false, including native sample-feature caches.
+        unload_text_encoder: false  # Locked false; A updates need a differentiable encoder path.
+        optimizer: "adamw8bit"  # Standard native optimizer; adamw8bit is the VM reference. See README compatibility.
+        lr: 1.0e-4  # Inherited D LR. Prodigy/DAdaptation may reinterpret rates natively; record it.
+        optimizer_params:
+          weight_decay: 0.0  # Passed to the native factory; zero is the v1 default for all families.
+          # betas: [0.9, 0.999]  # Example for compatible Adam-family optimizers only.
+        lr_scheduler: "constant"  # Any compatible native scheduler; clock is optimizer-local.
+        lr_scheduler_params: {}  # Pass native kwargs; derive local horizons without resetting phases.
+        max_grad_norm: 1.0  # Positive finite norm cap per active family; native Adafactor is exempt. No disable value in this checkout.
+        skip_first_sample: false  # Sample initialization for a useful visual reference.
+        disable_sampling: false  # true skips images, but MUST NOT disable numeric recording/probes.
+        ema_config:
+          use_ema: false  # V1 locked off; partial EMA across only one component is invalid.
+
+        # Optional held-out images. Use native schema and preprocessing; Gen2 handles evaluation.
+        # Do not point these at training images and then label them held-out.
+        # validation_config:
+        #   resolution: 1024
+        #   validate_every_n_steps: 250  # Committed Gen2 updates, not microbatches.
+        #   validation_sigmas: [0.05, 0.25, 0.5, 0.75, 1.0]  # Native/toolkit noise fractions in [0,1].
+        #   validation_items:
+        #     - image_path: "/ABSOLUTE/PATH/TO/HELD_OUT_IMAGE.png"
+        #       prompt: "Content caption for this held-out target-style image"
+
+      model:
+        name_or_path: "ideogram-ai/ideogram-4-fp8"  # Native model ID or local model directory.
+        arch: "ideogram4"  # Only backend implemented by v1; reject an unsupported arch.
+        dtype: "bf16"  # Native model compute/load precision; log actual component precision too.
+        quantize: true  # Native DiT quantization; must preserve A-step gradients to its input features.
+        qtype: "qfloat8"  # A native supported quantizer; no Gen2 quantization implementation.
+        quantize_te: false  # Conservative encoder default; enabling needs actual A-gradient validation.
+        qtype_te: "qfloat8"  # Only used if quantize_te=true; native choices/dependencies apply.
+        low_vram: false  # Native placement option, not permission to detach A-step computations.
+        layer_offloading: false  # Optional native offload; validate frozen-weight input backpropagation.
+        compile: false  # Locked off in v1; branch/context-safe compilation is a later optimization.
+        unconditional_lora_path: null  # Optional EXISTING frozen native unconditional adapter only.
+        model_kwargs:
+          text_encoder_path: "Qwen/Qwen3-VL-8B-Instruct"  # Native encoder loader path; match backend.
+          max_text_length: 2048  # Total original + M soft positions; require M < limit <=2048 in v1.
+        # Do not set pretrained/assistant/inference style LoRAs; v1 starts a fresh diffusion LoRA.
+
+      save:
+        dtype: "float32"  # Native inference-export dtype; resume always preserves float32 masters.
+        save_every: 250  # Integer >=1 committed updates; also save zero, boundaries and final.
+        max_step_saves_to_keep: 4  # Native rolling retention; protect Gen2 boundary checkpoints.
+        push_to_hub: false  # Publishing is not part of implementing or validating this pipeline.
+
+      sample:
+        sampler: "flowmatch"  # Reuse native Ideogram Euler/sigma utilities with explicit Gen2 roles.
+        sample_every: 250  # Frequent-preview interval in committed updates; integer >=1.
+        sample_start_step: 0  # Native preview start; nonnegative committed-update count.
+        width: 1024  # Backend-supported dimensions; do not silently change them on OOM.
+        height: 1024
+        prompts:  # Content-only examples; Gen2 selects styled/neutral modes explicitly.
+          - "A person reading beside a window with a cat sleeping on the table"
+          - "A transparent mechanical device with many interlocking moving parts"
+        neg: ""  # V1 fixed empty; Ideogram CFG unconditional input is image-only.
+        seed: 42  # First preview seed; repeated verbatim for every ablation.
+        walk_seed: false  # Locked false; comparisons need matched initial noise.
+        guidance_scale: 7.0  # Native inference CFG; >=0. Higher values can change style/content balance.
+        sample_steps: 30  # Integer >=1; hold fixed across comparisons, more steps cost inference time.
+
+      gen2:
+        schema_version: "1.0.0"  # Must equal the implemented v1 schema.
+        spec_path: "docs/specs/gen2_trainer_v1.md"  # Put an unchanged copy of this file here.
+        expected_spec_sha256: "6880f48649280c02fe7e73bf9b3b244eef4da6ca63da02226bc876cae5df03b8"  # Exact immutable v1 bytes; null also pins this version.
+
+        execution:
+          training_seed: 20260911  # Integer >=0; isolate training from diagnostics/preview RNG.
+          diagnostic_seed: 314159  # Integer >=0; fixed probe/coordinate sampling RNG.
+          deterministic_algorithms: false  # true requests framework determinism; unsupported ops error.
+          encoder_gradient_checkpointing: true  # Non-reentrant, preserving masks/context and autograd.
+          dit_attention_backend: "native"  # native|flash via original set_attention_backend; validate it.
+          error_policy: "abort"  # V1 only option; no silent OOM or nonfinite-update skipping.
+
+        conditioning:
+          num_tokens: 4  # Integer 1..32 and less than total token budget; more positions add capacity/cost.
+          initializer_text: "style"  # Generic shared initialization only; NEVER a required target name.
+          initializer_jitter: 0.01  # Float in [0,1]; 0 starts identical vectors, larger values diversify.
+          initializer_seed: 271828  # Same recipe/seed may be reused for every style.
+          adapter_rank: 4  # Integer >=1 and <= each targeted projection's smaller dimension.
+          adapter_alpha: 4.0  # Positive; applied exactly once as alpha/rank.
+          overflow_policy: "error"  # V1 only option; report overlength prompts instead of truncating.
+          # Fixed v1: suffix after original chat tokens, all decoder MLP down_proj targets,
+          # no vocabulary update, fixed forward norms, no target-style semantic anchor or cosine loss.
+
+        losses:
+          neutral_weight: 1.0  # >=0; higher favors base preservation, may constrain achievable styling.
+          text_adapter_weight: 1.0e-4  # >=0; higher discourages large suffix-adapter residuals.
+          gate_center_weight: 1.0e-3  # >=0; higher keeps g near one during calibration.
+          gate_smoothness_weight: 1.0e-4  # >=0; higher penalizes rapid changes with noise time.
+          # Setting a weight to zero is an explicitly recorded ablation, not an unreported default.
+
+        phases:
+          warmup_updates: 450  # Integer >=0, D only with initialized fixed conditioning.
+          refinement_updates: 2100  # Integer >=0, deterministic alternating cycle below.
+          calibration_updates: 450  # Integer >=0, gates only; all three must sum to train.steps.
+          diffusion_updates_per_cycle: 4  # Integer >=1; these D updates precede A updates each cycle.
+          conditioning_updates_per_cycle: 1  # Integer >=1; each A update steps E and T once.
+
+        optimizers:
+          # null scalar inherits train.*; maps merge over a COPY of the train.* map.
+          # Defaults below change only LR. Every role uses the approved standard native optimizer set.
+          diffusion:
+            optimizer: null
+            lr: null  # Inherit 1e-4; scheduler horizon 2130 in this example.
+            optimizer_params: {}
+            lr_scheduler: null
+            lr_scheduler_params: {}
+          embedding:
+            optimizer: null
+            lr: 1.0e-3  # Default for conventional optimizers; horizon 420 here.
+            optimizer_params: {}
+            lr_scheduler: null
+            lr_scheduler_params: {}
+          text_adapter:
+            optimizer: null
+            lr: 1.0e-5  # Lower default for contextual encoder corrections; horizon 420 here.
+            optimizer_params: {}
+            lr_scheduler: null
+            lr_scheduler_params: {}
+          gates:
+            optimizer: null
+            lr: 1.0e-3  # Default gate LR; horizon 450 here. Larger rates may saturate tanh.
+            optimizer_params: {}
+            lr_scheduler: null
+            lr_scheduler_params: {}
+          # Optional example: change ONE role without changing the factory implementation.
+          # In gates above, replace optimizer/lr with:
+          # optimizer: "prodigy"
+          # lr: 1.0
+          # optimizer_params: {weight_decay: 0.0}
+          # Use valid upstream options; Gen2 must record native automatic LR adaptation.
+
+        gates:
+          amplitude: 0.5  # rho, strictly between 0 and 1; g lies in (1-rho, 1+rho).
+          regularization_grid_points: 65  # Integer >=5, linspace [0,1], both endpoints included.
+          # Fixed v1: four cubic Bernstein coefficients per actual block; zero initialization.
+          # To omit calibration as an ablation, set calibration_updates=0 and adjust train.steps.
+
+        inference:
+          missing_trigger_policy: "learned_neutral"  # learned_neutral|base_bypass; see Section 8.
+          lora_strength: 1.0  # Float >=0; inference only. Training strength is exactly one.
+          # strength=0 still leaves learned conditioning present when the trigger is present.
+          # It is not identical to the base mode, which also removes learned conditioning.
+
+        data:
+          content_groups_file: null  # Optional CSV: relative_path,group. Labels only; no new sampler.
+          reject_train_validation_duplicates: true  # bool; compare image hashes when validation exists.
+          # Group names are user supplied. Missing labels are "unassigned", not guessed easy/hard.
+
+        diagnostics:
+          enabled: true  # V1 fixed true for core recording; never silently turn it off.
+          activation_every: 100  # Integer >=1; larger reduces all-module activation-summary overhead.
+          gradient_probe_every: 250  # Integer >=1; isolated loss-gradient comparisons, no updates.
+          gradient_probe_examples: 1  # Integer >=1, <= numerical probe example count.
+          gradient_probe_taus: [0.25, 0.75]  # Nonempty unique floats in (0,1], fixed for the run.
+          gradient_probe_max_coordinates: 65536  # Per family; 0=full, >0=uniform sampled estimates.
+          gate_log_every: 100  # Integer >=1; all blocks on the fixed grid; also every boundary.
+          spectra_every: 500  # Integer >=1; small-matrix QR/SVD, also at zero and phase boundaries.
+          full_update_norm_every: 0  # 0=off; positive interval requests exact before/after snapshots.
+          parameter_sample_elements_per_family: 65536  # Integer >=1; all entries for smaller families.
+          tensor_memory_budget_mb: 512  # Positive additional diagnostic-buffer budget, not total VRAM.
+          time_bin_edges: [0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0]  # Strictly increasing, covers [0,1].
+          prefix_atol: 0.001  # Positive absolute tolerance for real-backend prefix comparison.
+          prefix_rtol: 0.01  # Positive relative tolerance; do not loosen without explaining evidence.
+          probes:
+            every: 250  # Integer >=1; full 2x2 velocity interaction probes, also boundaries.
+            num_examples: 4  # Integer >=1; select fixed examples once using diagnostic_seed.
+            source: "training"  # training|validation; validation requires real held-out items above.
+            taus: [0.05, 0.25, 0.5, 0.75, 1.0]  # Unique toolkit noise fractions in (0,1].
+            save_fixed_latent_packet: true  # V1 fixed true for reproducible numerical comparison.
+          tensor_dumps:
+            enabled: false  # Optional raw diagnostics; scalar/provenance recording is always retained.
+            names: ["suffix_features", "probe_velocities"]  # Allowed names; no arbitrary module dumps.
+            max_packets: 4  # Integer >=0 total retained optional packets per run.
+            max_total_mb: 256  # Positive total optional-dump budget; explicit skip reason on limit.
+
+        recording:
+          flush_every_updates: 10  # Integer >=1; always flush on save/boundary/error.
+          rotate_mb: 64  # Positive size of a JSONL segment before rotation.
+          compression: "none"  # none|gzip; gzip closed rotated segments, not the active append file.
+          writer_queue_records: 4096  # Integer >=1; backpressure, never silently drop core records.
+          max_core_recording_mb: 4096  # Positive hard budget excluding weights/images/optional dumps.
+          # Reaching the core limit stops cleanly; it does not disable recording and keep training.
+
+        evaluation:
+          milestone_every: 1000  # Integer >=1; expanded images, plus every stage boundary/final.
+          additional_seeds: [43]  # Appended to sample.seed, deduplicated in order; nonnegative integers.
+          prompt_groups: {}  # Optional map: p000: easy, p001: hard. IDs follow native prompt order.
+          # Set groups only from actual dataset/experience; examples here have no asserted difficulty.
+          preview_modes: ["full", "neutral_lora_on", "base"]  # Nonempty subset of Section 8.1 modes.
+          milestone_modes:
+            - "full"
+            - "neutral_lora_on"
+            - "base"
+            - "base_with_conditioning"
+            - "conditioning_init"
+            - "encoder_adapter_off"
+            - "tokens_init"
+            - "gates_one"
+            - "gates_time_mean"
+          make_contact_sheets: true  # bool; reuse existing image/grid utilities, retain individual files.
+
+        checkpoint:
+          resume_from: null  # Optional complete Gen2 checkpoint directory; not a bare LoRA file.
+          strict_resume: true  # V1 fixed true; incompatible restart is a separate user decision/run ID.
+          save_at_stage_boundaries: true  # V1 fixed true; preserve interpretable component checkpoints.
+          protect_stage_checkpoints: true  # V1 fixed true despite native rolling checkpoint retention.
+          save_initial_state: true  # V1 fixed true; zero, initialized tokens and modules are references.
+
+meta:
+  name: "[name]"  # Native substitution.
+  version: "gen2_trainer_v1"
