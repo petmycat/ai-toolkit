@@ -212,6 +212,96 @@ class BackendContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             _resolved_targets(model, [(0, "layers.0.projection")], "diffusion", 3, 3)
 
+    def test_unconditional_personalization_requires_no_grad_and_explicit_opt_in(self):
+        backend = Ideogram4Backend.__new__(Ideogram4Backend)
+        backend._branch = ContextVar("test_unconditional_opt_in", default=None)
+        backend.gates = CubicTimeGates(2)
+        backend.diffusion_network = SimpleNamespace(is_active=True)
+        backend.model = SimpleNamespace(unconditional_lora=SimpleNamespace(is_active=False))
+        tau = torch.tensor([.4])
+        with torch.no_grad(), self.assertRaisesRegex(ValueError, "explicit inference opt-in"):
+            with backend.branch(tau, unconditional=True):
+                pass
+        with self.assertRaisesRegex(ValueError, "inference-only"):
+            with backend.branch(tau, unconditional=True, allow_unconditional_lora=True):
+                pass
+        for strength in (float("nan"), float("inf"), -.5):
+            with self.assertRaisesRegex(ValueError, "finite and nonnegative"):
+                with backend.branch(tau, strength=strength):
+                    pass
+        with torch.no_grad(), backend.branch(tau, lora_enabled=False, name="teacher") as teacher:
+            with self.assertRaisesRegex(RuntimeError, "diagnostic failed"):
+                with backend.branch(tau, unconditional=True, allow_unconditional_lora=True,
+                                    strength=.5, gate_mode="learned") as diagnostic:
+                    self.assertTrue(backend.diffusion_network.is_active)
+                    self.assertTrue(backend.model.unconditional_lora.is_active)
+                    self.assertEqual(diagnostic.strength, .5)
+                    torch.testing.assert_close(diagnostic.gate_values, backend.gates(tau))
+                    raise RuntimeError("diagnostic failed")
+            self.assertIs(backend.current_branch, teacher)
+            self.assertFalse(backend.diffusion_network.is_active)
+            self.assertFalse(backend.model.unconditional_lora.is_active)
+        self.assertTrue(backend.diffusion_network.is_active)
+        self.assertFalse(backend.model.unconditional_lora.is_active)
+        self.assertIsNone(backend.current_branch)
+
+    def test_native_adapter_chain_applies_unconditional_strength_once_in_compute_dtype(self):
+        native = native_lora_class()
+        scope = native.__init__.__globals__
+        scope["QTensor"] = type("UnusedQuantizedTensorFixture", (), {})
+        native_definitions("toolkit/network_mixins.py", ["broadcast_and_multiply"], scope)
+        class FixtureNetwork:
+            network_type = "lora"
+            is_active = False
+            is_lorm = False
+            is_merged_in = False
+            _multiplier = 1.
+            torch_multiplier = torch.ones(1)
+        backend = Ideogram4Backend.__new__(Ideogram4Backend)
+        backend._branch = ContextVar("test_native_adapter_chain", default=None)
+        backend._diagnostic = ContextVar("test_native_adapter_chain_diag", default=None)
+        backend.gates = CubicTimeGates(1)
+        frozen_network, trained_network = FixtureNetwork(), FixtureNetwork()
+        trained_network.is_active = True
+        backend.diffusion_network = trained_network
+        backend.model = SimpleNamespace(unconditional_lora=frozen_network)
+        base = nn.Linear(3, 2, bias=False).to(torch.bfloat16)
+        frozen = native("frozen_unconditional", base, lora_dim=2, alpha=2., network=frozen_network)
+        frozen.to(torch.bfloat16).eval().requires_grad_(False)
+        frozen.apply_to()
+        gated = make_gated_lora_class(native, backend._branch, backend._diagnostic)
+        trained = gated("trained_gen2", base, lora_dim=2, alpha=6., network=trained_network)
+        trained.gen2_block_id = 0
+        trained.eval()
+        trained.apply_to()
+        with torch.no_grad():
+            frozen.lora_up.weight.fill_(.1)
+            trained.lora_up.weight.fill_(.2)
+            backend.gates.beta.fill_(.3)
+            # Image-only projection tokens: no text rows, native compute bf16,
+            # trained Gen2 masters fp32, already attached frozen native adapter.
+            x = torch.randn(1, 4, 3, dtype=torch.bfloat16)
+            tau = torch.tensor([.75])
+            original = frozen.org_forward(x)
+            frozen_residual = frozen._call_forward(x)
+            from extensions.gen2_trainer.conditioning import native_lora_residual
+            trained_residual = native_lora_residual(trained, x, torch.bfloat16)
+            with backend.branch(tau, lora_enabled=False, unconditional=True):
+                torch.testing.assert_close(base(x), original+frozen_residual, rtol=0, atol=0)
+            for strength in (.5, 1.):
+                with backend.branch(tau, unconditional=True, allow_unconditional_lora=True,
+                                    strength=strength, gate_mode="learned") as branch:
+                    expected = original+frozen_residual
+                    expected = expected+(trained_residual*branch.gate_values[:, None, :]*strength).to(expected.dtype)
+                    torch.testing.assert_close(base(x), expected, rtol=0, atol=0)
+                    self.assertEqual(base(x).dtype, torch.bfloat16)
+            with backend.branch(tau, unconditional=False, gate_mode="learned") as branch:
+                expected = original+(trained_residual*branch.gate_values[:, None, :]).to(original.dtype)
+                torch.testing.assert_close(base(x), expected, rtol=0, atol=0)
+        self.assertTrue(all(parameter.dtype == torch.float32 for parameter in trained.parameters()))
+        self.assertFalse(frozen_network.is_active)
+        self.assertTrue(trained_network.is_active)
+
     def test_modes_do_not_mutate_components(self):
         full = resolve_route(None, True)
         self.assertTrue(full.styled and full.lora_enabled)

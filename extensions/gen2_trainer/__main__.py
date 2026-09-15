@@ -31,6 +31,7 @@ def read_config(path, process_index=0):
 
 
 def parser():
+    from .config import MODES
     result = argparse.ArgumentParser(prog="python -m extensions.gen2_trainer",
                                      description=__doc__)
     commands = result.add_subparsers(dest="command", required=True)
@@ -45,8 +46,7 @@ def parser():
     infer.add_argument("--prompt", required=True)
     infer.add_argument("--output", required=True, help="PNG output; JSON metadata is saved beside it")
     infer.add_argument("--device")
-    infer.add_argument("--mode", choices=["full", "neutral_lora_on", "base", "base_with_conditioning",
-        "conditioning_init", "encoder_adapter_off", "tokens_init", "gates_one", "gates_time_mean"],
+    infer.add_argument("--mode", choices=MODES,
         help="Omit for production literal-trigger routing")
     infer.add_argument("--width", type=int, default=1024)
     infer.add_argument("--height", type=int, default=1024)

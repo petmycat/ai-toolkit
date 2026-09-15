@@ -149,17 +149,32 @@ Explicit diagnostic modes override trigger routing:
 - `full`: current suffix, encoder adapter, diffusion LoRA and current gates.
 - `neutral_lora_on`: neutral conditioning with current diffusion LoRA/gates.
 - `base`: neutral conditioning with personalization bypassed.
+- `base_with_tokens`: current suffix, encoder adapter off, diffusion LoRA off.
 - `base_with_conditioning`: learned conditioning with diffusion LoRA bypassed.
 - `conditioning_init`: saved initial suffix, encoder adapter off.
 - `encoder_adapter_off`: current suffix, encoder adapter off.
 - `tokens_init`: saved initial suffix with the current encoder adapter.
 - `gates_one`: full components with all gates equal to one.
 - `gates_time_mean`: full components with each gate's fixed-grid mean.
+- `full_uncond_half`: full conditional path, with the same diffusion LoRA also
+  applied to the unconditional pass at absolute strength 0.5.
+- `full_uncond_full`: full conditional path, with the same diffusion LoRA also
+  applied to the unconditional pass at absolute strength 1.0.
 
-The CFG unconditional pass is image-only and disables personalization. An optional
-existing native unconditional adapter remains frozen and its complete weight
-identity is checked. `--strength 0` removes the diffusion residual; a triggered
-prompt still has learned conditioning. Use `--mode base` for a base comparison.
+The CFG unconditional pass is image-only. Production routing and the original
+diagnostic modes disable personalization there. The two explicit `full_uncond_*`
+experiments require guidance greater than one and enable only the trained diffusion
+LoRA on that pass, with the same time gates as the conditional pass. Their strengths
+are independent of `--strength`, which controls the conditional diffusion residual.
+Learned tokens and the encoder adapter remain conditional-only. An optional existing
+native unconditional adapter remains frozen, is kept fixed across modes, and has its
+complete weight identity checked. `--strength 0` leaves triggered learned conditioning
+present; it also leaves the explicitly requested `full_uncond_*` strength in effect.
+Use `--mode base` for a base comparison.
+
+See the [visual diagnostics and plain-language parameter guide](docs/visual_diagnostics.md)
+for the six matched comparisons, an embedding-off reference, and configuration advice.
+These extra experiments are opt-in; existing default mode lists remain unchanged.
 
 **A bare diffusion LoRA file is incomplete.** The package includes tokens,
 encoder adapters and gates. Native PEFT export also omits alpha tensors; the

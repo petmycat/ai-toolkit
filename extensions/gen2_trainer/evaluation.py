@@ -24,6 +24,89 @@ def bundle_identity(backend) -> tuple[str, dict]:
     return hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest(), hashes
 
 
+_CONTACT_MODES = {
+    "base_with_tokens": ("1. Embedding only", False, False, "on", 0.),
+    "base_with_conditioning": ("2. Embedding + text adapter", False, True, "on", 0.),
+    "encoder_adapter_off": ("3. Embedding + diffusion", True, False, "on", 0.),
+    "full": ("4. Full / uncond off", True, True, "on", 0.),
+    "full_uncond_half": ("5. Full / uncond half", True, True, "on", .5),
+    "full_uncond_full": ("6. Full / uncond full", True, True, "on", 1.),
+    "base": ("Base reference", False, False, "off", 0.),
+    "neutral_lora_on": ("Neutral + diffusion", True, False, "off", 0.),
+    "conditioning_init": ("Initial conditioning", True, False, "init", 0.),
+    "tokens_init": ("Initial embedding", True, True, "init", 0.),
+    "gates_one": ("Gates fixed to one", True, True, "on", 0.),
+    "gates_time_mean": ("Time-mean gates", True, True, "on", 0.),
+}
+
+
+def contact_sheet_label(mode, metadata):
+    """Keep route controls readable without fitting long internal mode names."""
+    title, diffusion, adapter, tokens, unconditional = _CONTACT_MODES.get(
+        mode, (mode.replace("_", " "), False, False, "off", 0.))
+    route = metadata.get("route", {})
+    diffusion = route.get("lora_enabled", diffusion)
+    adapter = metadata.get("conditional_text_adapter_enabled", route.get("adapter_enabled", adapter))
+    styled = metadata.get("conditional_embedding_enabled", route.get("styled", tokens != "off"))
+    tokens = ("init" if route.get("token_mode", tokens) == "init" else "on") if styled else "off"
+    adapter = adapter and styled
+    strength = metadata.get("conditional_lora_strength", metadata.get("lora_strength", 1.))
+    unconditional = metadata.get("unconditional_lora_strength", route.get("unconditional_lora_strength", unconditional))
+    positive = f"on({strength:g})" if diffusion else "off"
+    uncond = f"{unconditional:g}" if metadata.get("unconditional_branch_executed", True) else "skipped"
+    return [title, f"D {positive} | TE {'on' if adapter else 'off'} | U {tokens}",
+            f"Uncond D: {uncond}", f"{metadata['prompt_id']} | seed {metadata['seed']}"]
+
+
+def make_contact_sheet(images, modes):
+    """Align each prompt/seed row to stable mode columns, including dedup gaps.
+
+    ``images`` contains only newly generated images. A previously sampled mode
+    leaves a labeled empty cell, so remaining modes never shift into its column.
+    """
+    from PIL import Image, ImageDraw, ImageFont
+    modes = list(dict.fromkeys(modes))
+    grouped = {}
+    for image, metadata in images:
+        key = (metadata["prompt_id"], metadata["seed"])
+        mode = metadata["ablation_mode"]
+        if mode not in modes:
+            raise ValueError(f"Contact-sheet image has an unrequested mode: {mode}")
+        row = grouped.setdefault(key, {})
+        if mode in row:
+            raise ValueError(f"Duplicate contact-sheet image for {key}, {mode}")
+        row[mode] = image, metadata
+    if not grouped or not modes:
+        raise ValueError("Contact sheet needs at least one image and mode")
+    cell, label_height = 256, 62
+    sheet = Image.new("RGB", (len(modes) * cell, len(grouped) * (cell + label_height)), "white")
+    draw, font = ImageDraw.Draw(sheet), ImageFont.load_default()
+    for row_index, ((prompt_id, seed), entries) in enumerate(grouped.items()):
+        for column, mode in enumerate(modes):
+            x, y = column * cell, row_index * (cell + label_height)
+            if mode in entries:
+                image, metadata = entries[mode]
+                thumbnail = image.copy()
+                thumbnail.thumbnail((cell, cell))
+                sheet.paste(thumbnail, (x + (cell-thumbnail.width)//2, y + (cell-thumbnail.height)//2))
+            else:
+                reference = next(iter(entries.values()))[1]
+                metadata = {"prompt_id": prompt_id, "seed": seed,
+                            "lora_strength": reference.get("lora_strength", 1.),
+                            "unconditional_branch_executed": reference.get("unconditional_branch_executed", True)}
+                draw.rectangle((x, y, x + cell-1, y + cell-1), fill="#eeeeee")
+                draw.text((x + 12, y + cell//2), "Previously sampled", font=font, fill="black")
+            for line_index, label in enumerate(contact_sheet_label(mode, metadata)):
+                # A fallback mode title may be arbitrarily long; use ellipsis
+                # instead of allowing it to overlap the next comparison.
+                if draw.textlength(label, font=font) > cell - 8:
+                    while label and draw.textlength(label + "...", font=font) > cell - 8:
+                        label = label[:-1]
+                    label += "..."
+                draw.text((x + 4, y + cell + 4 + line_index*14), label, font=font, fill="black")
+    return sheet
+
+
 class Evaluation:
     def __init__(self, backend, config, recorder, root):
         self.backend, self.config, self.recorder, self.root = backend, config, recorder, Path(root)
@@ -367,7 +450,6 @@ class Evaluation:
         from .inference import generate
         from .provenance import code_identity
         from toolkit.config_modules import GenerateImageConfig
-        from PIL import Image, ImageDraw
         options = self.config["sample"]
         evaluation = self.config["gen2"]["evaluation"]
         records, images = [], []
@@ -402,18 +484,8 @@ class Evaluation:
                         self.recorder.record("samples/manifest", row)
                         self.sampled_requests.add(request)
                         records.append(row)
-                        images.append((image, f"{prompt_id} / {mode} / seed {seed}"))
+                        images.append((image, row))
         append_rating_template(self.root / "human_ratings.csv", records)
         if images and evaluation["make_contact_sheets"]:
-            cell = 256
-            columns = min(4, len(images))
-            rows = (len(images) + columns - 1) // columns
-            sheet = Image.new("RGB", (columns * cell, rows * (cell + 34)), "white")
-            draw = ImageDraw.Draw(sheet)
-            for i, (image, label) in enumerate(images):
-                thumbnail = image.copy()
-                thumbnail.thumbnail((cell, cell))
-                x, y = (i % columns) * cell, (i // columns) * (cell + 34)
-                sheet.paste(thumbnail, (x, y))
-                draw.text((x + 4, y + cell + 4), label, fill="black")
+            sheet = make_contact_sheet(images, modes)
             sheet.save(self.root / "samples" / f"u{update:08d}_contact_sheet.png")

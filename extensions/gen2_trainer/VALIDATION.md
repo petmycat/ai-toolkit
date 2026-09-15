@@ -2,7 +2,7 @@
 
 ## Status on 2026-09-15
 
-**Local verification passed: 89 tests. Real VM acceptance is pending.**
+**Local verification passed: 106 tests. Real VM acceptance is pending.**
 
 The user will manually run the smoke and actual configurations on an RTX PRO
 6000 with 96 GB VRAM, using the VM's existing ai-toolkit dependencies, weights
@@ -19,7 +19,7 @@ packages are absent, including bitsandbytes. The tests use CPU tensors.
 
 ```text
 python -B -m pytest extensions/gen2_trainer/tests -q -p no:cacheprovider
-89 passed in 4.19s
+106 passed
 ```
 
 For the native config-file parsing test, `oyaml==1.0` was installed with
@@ -69,6 +69,31 @@ that single parsing test explicitly skips; ordinary VM dependencies provide it.
   counters exact, and reject incomplete packages before importing models.
 
 ## Additional checks
+
+The user-requested visual diagnostics add three explicit routes: tokens only,
+full conditioning with unconditional diffusion LoRA strength 0.5, and full
+conditioning with unconditional diffusion LoRA strength 1.0. Existing modes
+supply the other three requested comparisons. Tests execute the actual Gen2
+sampling loop with a tiny recording backend and source-isolated native sigma
+schedule; they verify matched initial noise, image-only unconditional features,
+independent absolute strengths, shared gates, unchanged components/gradients/RNG,
+and restoration after prediction exceptions. A separate source-isolated native
+LoRA test checks composition with the frozen native unconditional adapter using
+bf16 projection inputs and fp32 Gen2 masters. Config/CLI checks enforce CFG > 1
+for the new unconditional diagnostics while preserving legacy mode defaults.
+Contact-sheet tests verify prompt/seed rows, stable mode columns, actual-control
+labels, and gaps for deduplicated requests. These remain CPU fixture checks,
+not actual Ideogram/CUDA image or training acceptance.
+
+The reviewed local 12-update user smoke passes native YAML parsing and strict
+Gen2 validation after repairing the JSON prompt's YAML quoting. It retains one
+prompt, arbitrary-text initialization and deliberate weight decay 0.999. Its
+family horizons are D9/E1/T1/G2. Seven explicit modes (the requested six plus a
+base reference), seeds 42/43, and events 0/2/6/10/12 schedule 70 images. The exact
+native caption/chat path was checked with the locally cached Qwen tokenizer at
+revision `0c351dd01ed87e9c1b53cbc748cba10e6187ff3b`: 1,269 original positions plus
+four learned positions fit the 2,048-position budget. No weights were loaded
+or downloaded for that check. The private user YAML remains in ignored `config/`.
 
 Both examples passed the **native** config parser and Gen2 resolver:
 

@@ -20,9 +20,12 @@ ROLES = ("diffusion", "embedding", "text_adapter", "gates")
 # These are names forwarded unchanged to the native factory, not implementations.
 STANDARD_OPTIMIZERS = frozenset({"adam", "adamw", "adagrad", "lion", "prodigy",
     "adafactor", "dadaptation", "adam8bit", "adamw8bit", "lion8bit", "ademamix8bit"})
-MODES = ("full", "neutral_lora_on", "base", "base_with_conditioning",
-         "conditioning_init", "encoder_adapter_off", "tokens_init",
-         "gates_one", "gates_time_mean")
+DEFAULT_MILESTONE_MODES = ("full", "neutral_lora_on", "base", "base_with_conditioning",
+                           "conditioning_init", "encoder_adapter_off", "tokens_init",
+                           "gates_one", "gates_time_mean")
+# Additional user-requested visual experiments are explicit opt-ins. Preserve
+# the original defaults and production unconditional route for existing configs.
+MODES = DEFAULT_MILESTONE_MODES + ("base_with_tokens", "full_uncond_half", "full_uncond_full")
 
 
 class ConfigError(ValueError):
@@ -101,7 +104,7 @@ SCHEMA = {
                   "max_core_recording_mb": L(4096, "positive")},
     "evaluation": {"milestone_every": L(1000, minimum=1), "additional_seeds": L([43], "seeds"),
                    "prompt_groups": L({}, "prompt_groups"), "preview_modes": L(["full", "neutral_lora_on", "base"], "modes"),
-                   "milestone_modes": L(list(MODES), "modes"), "make_contact_sheets": L(True)},
+                   "milestone_modes": L(list(DEFAULT_MILESTONE_MODES), "modes"), "make_contact_sheets": L(True)},
     "checkpoint": {"resume_from": L(None, "str", nullable=True), "strict_resume": L(True, choices=(True,)),
                    "save_at_stage_boundaries": L(True, choices=(True,)), "protect_stage_checkpoints": L(True, choices=(True,)),
                    "save_initial_state": L(True, choices=(True,))},
@@ -303,6 +306,9 @@ def _native_compatibility(cfg):
     if isinstance(cfg["sample"].get("prompts"), list):
         for i, prompt in enumerate(cfg["sample"]["prompts"]):
             if not isinstance(prompt, str): errors.append(f"sample.prompts[{i}] must be a content prompt string in v1")
+    requested_modes = set(cfg["gen2"]["evaluation"]["preview_modes"] + cfg["gen2"]["evaluation"]["milestone_modes"])
+    if requested_modes & {"full_uncond_half", "full_uncond_full"} and cfg["sample"]["guidance_scale"] <= 1:
+        errors.append("sample.guidance_scale must be > 1 for full_uncond_half/full_uncond_full; native sampling otherwise skips the unconditional pass")
     for i, data in enumerate(cfg.get("datasets", [])):
         if not isinstance(data, dict): raise ConfigError(f"datasets[{i}] must be a mapping")
         for key, value in {"caption_dropout_rate": 0., "token_dropout_rate": 0., "shuffle_tokens": False,

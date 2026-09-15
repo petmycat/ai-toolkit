@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import math
 
 import torch
 
@@ -16,6 +17,7 @@ class InferenceRoute:
     token_mode: str = "learned"
     adapter_enabled: bool = True
     gate_mode: str = "learned"
+    unconditional_lora_strength: float = 0.
 
 
 def resolve_route(mode: str | None, trigger_present: bool,
@@ -28,12 +30,17 @@ def resolve_route(mode: str | None, trigger_present: bool,
         "full": InferenceRoute("full", True, True, gate_mode=gate_mode),
         "neutral_lora_on": InferenceRoute("neutral_lora_on", False, True, adapter_enabled=False, gate_mode=gate_mode),
         "base": InferenceRoute("base", False, False, adapter_enabled=False, gate_mode="bypassed"),
+        "base_with_tokens": InferenceRoute("base_with_tokens", True, False, adapter_enabled=False, gate_mode="bypassed"),
         "base_with_conditioning": InferenceRoute("base_with_conditioning", True, False, gate_mode="bypassed"),
         "conditioning_init": InferenceRoute("conditioning_init", True, True, "init", False, gate_mode),
         "encoder_adapter_off": InferenceRoute("encoder_adapter_off", True, True, "learned", False, gate_mode),
         "tokens_init": InferenceRoute("tokens_init", True, True, "init", True, gate_mode),
         "gates_one": InferenceRoute("gates_one", True, True, gate_mode="one"),
         "gates_time_mean": InferenceRoute("gates_time_mean", True, True, gate_mode="time_mean"),
+        "full_uncond_half": InferenceRoute("full_uncond_half", True, True, gate_mode=gate_mode,
+                                           unconditional_lora_strength=.5),
+        "full_uncond_full": InferenceRoute("full_uncond_full", True, True, gate_mode=gate_mode,
+                                           unconditional_lora_strength=1.),
     }
     if mode not in routes:
         raise ValueError(f"Unknown Gen2 inference mode: {mode}")
@@ -47,7 +54,11 @@ def generate(backend, prompt: str, mode: str | None = None, *, width=1024, heigh
     """Return one PIL image and reproducibility metadata, without mutating components.
 
     Explicit diagnostic modes force their route regardless of literal trigger.
-    A omitted mode uses the package's production missing-trigger policy.
+    An omitted mode uses the package's production missing-trigger policy.
+    The two full_uncond_* diagnostics apply the trained diffusion adapter to
+    the empty image-only pass at absolute strengths .5 and 1.; these strengths
+    are independent of the conditional strength. Learned tokens and the text
+    adapter remain confined to the conditional pass.
     """
     from diffusers.utils.torch_utils import randn_tensor
     from PIL import Image
@@ -56,14 +67,16 @@ def generate(backend, prompt: str, mode: str | None = None, *, width=1024, heigh
     divisor = model.vae_scale_factor*model.patch_size
     if width < divisor or height < divisor or width % divisor or height % divisor:
         raise ValueError(f"Ideogram image dimensions must be positive multiples of {divisor}")
-    if steps < 1 or guidance < 0 or seed < 0:
+    if steps < 1 or not math.isfinite(guidance) or guidance < 0 or seed < 0:
         raise ValueError("Sampling needs steps >=1, guidance >=0, seed >=0")
     setting = backend.config["inference"]
     strength = setting["lora_strength"] if strength is None else strength
-    if strength < 0:
-        raise ValueError("Inference LoRA strength must be nonnegative")
+    if not math.isfinite(strength) or strength < 0:
+        raise ValueError("Inference LoRA strength must be finite and nonnegative")
     compilation = compile_trigger(prompt, backend.trigger_word)
     route = resolve_route(mode, compilation["trigger_present"], setting["missing_trigger_policy"], gate_mode)
+    if route.unconditional_lora_strength > 0 and guidance <= 1:
+        raise ValueError("Unconditional LoRA comparisons require guidance >1 so native CFG runs both branches")
     condition = backend.encode([prompt], styled=route.styled, gradients=False,
                                token_mode=route.token_mode, adapter_enabled=route.adapter_enabled)
     kwargs = model.model_config.model_kwargs
@@ -88,8 +101,12 @@ def generate(backend, prompt: str, mode: str | None = None, *, width=1024, heigh
         # This comparison intentionally follows the native pipeline's CFG switch.
         # For guidance <=1 native sampling emits the conditional pass directly.
         if guidance > 1:
-            with backend.branch(tau, lora_enabled=False, gate_mode="bypassed", strength=0.,
-                                unconditional=True, name="cfg_unconditional"):
+            uncond_enabled = route.unconditional_lora_strength > 0
+            with backend.branch(tau, lora_enabled=uncond_enabled,
+                                gate_mode=route.gate_mode if uncond_enabled else "bypassed",
+                                strength=route.unconditional_lora_strength,
+                                unconditional=True, allow_unconditional_lora=uncond_enabled,
+                                name="cfg_unconditional"):
                 unconditional = backend.predict(latents, tau, empty)
             velocity = unconditional+guidance*(conditional-unconditional)
         else:
@@ -105,7 +122,16 @@ def generate(backend, prompt: str, mode: str | None = None, *, width=1024, heigh
         "initial_noise_source": "explicit_tensor" if initial_noise is not None else "native_randn_tensor",
         "sampler": "native_ideogram_euler", "sigma_schedule": sigmas.cpu().tolist(),
         "schedule_mu": mu, "schedule_std": std, "steps": steps, "width": width, "height": height,
-        "guidance_scale": guidance, "lora_strength": strength, "unconditional_text_tokens": 0,
-        "unconditional_personalization_lora": False,
+        "guidance_scale": guidance, "lora_strength": strength,
+        "conditional_lora_strength": strength if route.lora_enabled else 0.,
+        "conditional_gate_mode": route.gate_mode, "conditional_embedding_enabled": route.styled,
+        "conditional_text_adapter_enabled": bool(route.styled and route.adapter_enabled),
+        "unconditional_lora_strength": route.unconditional_lora_strength,
+        "unconditional_lora_strength_kind": "absolute",
+        "unconditional_gate_mode": route.gate_mode if route.unconditional_lora_strength > 0 else "bypassed",
+        "unconditional_branch_executed": guidance > 1,
+        "unconditional_image_only": True, "unconditional_text_tokens": 0,
+        "unconditional_embedding_enabled": False, "unconditional_text_adapter_enabled": False,
+        "unconditional_personalization_lora": route.unconditional_lora_strength > 0,
         "unconditional_adapter": model.model_config.unconditional_lora_path}
     return image, metadata

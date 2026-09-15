@@ -18,6 +18,16 @@ The user approved these decisions in this task before authorizing implementation
 3. The user manually runs smoke/actual configurations on an RTX PRO 6000 96 GB
    VM, using its existing dependencies and datasets, and supplies results under
    the local `gen2/` directory. A local test pass does not establish VM acceptance.
+4. On 2026-09-15 the user requested six matched visual comparisons, including
+   the same trained diffusion LoRA on the image-only unconditional pass at
+   strengths 0, 0.5 and 1.0. The explicit `full_uncond_half` and `full_uncond_full`
+   inference diagnostics supersede the reference's unconditional-personalization
+   prohibition for those two experiments only. They require no-grad execution
+   and CFG greater than one. Conditional tokens/encoder adapters stay absent
+   from the unconditional pass; training and default production routing retain
+   the original behavior. Both passes use the same time-gate profile. The
+   immutable specification remains unchanged. `base_with_tokens` supplies the
+   requested tokens-only reference.
 
 ## Inventory recorded before implementation
 
@@ -48,7 +58,8 @@ trainer/Ideogram/factory integration files match reference revision
   scaling. Complete master states and module manifests retain alpha on reload.
 - Reuse `pad_text_features`, `predict_velocity`, native time table and
   `add_noise`, `get_ideogram4_sigmas`, VAE and image-save machinery. Explicit CFG
-  contexts disable personalization on the image-only unconditional pass.
+  contexts disable personalization on the image-only unconditional pass except
+  for the two explicitly requested inference experiments described above.
 - Reuse native `get_optimizer`, `get_lr_scheduler`, accelerator backward and
   precision helpers. Resume restores all parameter families together.
 - Gen2 supplies coherent atomic checkpoints, protected retention, bounded JSONL

@@ -27,6 +27,27 @@ class ConfigurationTests(unittest.TestCase):
             "assert 'transformers' not in sys.modules"], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_unconditional_visual_modes_require_cfg_and_are_opt_in(self):
+        from extensions.gen2_trainer.__main__ import parser
+        modes = ["base_with_tokens", "base_with_conditioning", "encoder_adapter_off",
+                 "full", "full_uncond_half", "full_uncond_full", "base"]
+        cfg = resolve_process_config({"sample": {"guidance_scale": 3.},
+            "gen2": {"evaluation": {"preview_modes": modes, "milestone_modes": modes}}})
+        self.assertEqual(cfg["gen2"]["evaluation"]["milestone_modes"], modes)
+        for mode in modes:
+            self.assertEqual(parser().parse_args(["infer", "bundle", "--prompt", "scene",
+                "--output", "image.png", "--mode", mode]).mode, mode)
+        defaults = resolve_process_config({})["gen2"]["evaluation"]
+        self.assertEqual(len(defaults["milestone_modes"]), 9)
+        self.assertFalse({"full_uncond_half", "full_uncond_full"} & set(defaults["milestone_modes"]))
+        for key in ("preview_modes", "milestone_modes"):
+            for scale in (0., 1.):
+                with self.subTest(key=key, scale=scale), self.assertRaisesRegex(ConfigError, "skips the unconditional"):
+                    resolve_process_config({"sample": {"guidance_scale": scale},
+                        "gen2": {"evaluation": {key: modes}}})
+        # Existing conditional-only native sampling remains valid.
+        resolve_process_config({"sample": {"guidance_scale": 1.}})
+
     def test_real_native_discovery_loads_only_lightweight_registration(self):
         script = """
 import sys

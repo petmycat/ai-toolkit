@@ -8,6 +8,7 @@ from __future__ import annotations
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+import math
 
 import torch
 from torch.utils.checkpoint import checkpoint
@@ -397,11 +398,17 @@ class Ideogram4Backend:
         return Conditioning(features, metadata, torch.stack(rt), torch.cat(numerators), torch.cat(denominators))
 
     @contextmanager
-    def branch(self, tau, lora_enabled=True, gate_mode="one", strength=1., unconditional=False, name="student"):
+    def branch(self, tau, lora_enabled=True, gate_mode="one", strength=1., unconditional=False,
+               name="student", allow_unconditional_lora=False):
         if tau.ndim != 1 or not bool(torch.isfinite(tau).all()) or bool(((tau < 0)|(tau > 1)).any()):
             raise ValueError("Branch tau must be a finite batch vector in [0,1]")
-        if strength < 0 or unconditional and lora_enabled:
-            raise ValueError("Invalid strength or personalization enabled on CFG unconditional branch")
+        if not math.isfinite(strength) or strength < 0:
+            raise ValueError("Branch LoRA strength must be finite and nonnegative")
+        if unconditional and lora_enabled:
+            if not allow_unconditional_lora:
+                raise ValueError("CFG unconditional personalization requires explicit inference opt-in")
+            if torch.is_grad_enabled():
+                raise ValueError("CFG unconditional personalization is an inference-only diagnostic; use torch.no_grad")
         # Resolve all fallible inputs before touching either network's live flag.
         state = DiffusionBranch(tau, self.gates.values(tau, gate_mode), bool(lora_enabled),
                                 float(strength), bool(unconditional), name)
