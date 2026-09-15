@@ -28,6 +28,14 @@ The user approved these decisions in this task before authorizing implementation
    the original behavior. Both passes use the same time-gate profile. The
    immutable specification remains unchanged. `base_with_tokens` supplies the
    requested tokens-only reference.
+5. The user subsequently required visual sampling to follow its own interval.
+   `sample.sample_every` now exclusively controls repeating image events, with
+   optional initialization controlled by `skip_first_sample`. Checkpoint saves,
+   stage boundaries and final updates do not force images. `milestone_every`
+   only expands modes/seeds at an already-due sample. This explicitly supersedes
+   the reference's mandatory boundary/milestone image scheduling. Numerical
+   boundary probes and protected checkpoint saves retain their original rules.
+   The user's 12-update smoke uses `sample_every: 6`, producing images at 0/6/12.
 
 ## Inventory recorded before implementation
 

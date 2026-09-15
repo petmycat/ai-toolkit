@@ -55,7 +55,7 @@ DiT quantization, both forms of gradient checkpointing, `adamw8bit`, rank-32
 diffusion LoRA and all four learned tokens. It reduces image resolution to 256,
 sampling to four steps and numerical probes to one example. Its images check
 execution and comparisons; use the actual configuration for image-quality work.
-Initial and boundary probes, spectra, and all nine image ablations make it more
+Initial and boundary probes, spectra, and scheduled image ablations make it more
 expensive than six optimizer steps alone.
 
 ### 3. Run strict continuation and package acceptance
@@ -129,6 +129,28 @@ prefetch, cache regeneration with random transforms, changed hardware, quantizer
 or CUDA versions cannot be treated as an established bitwise replay guarantee.
 
 ## Complete-package inference
+
+### Independent image and checkpoint schedules
+
+`sample.sample_every` is the sole repeating image interval, measured in committed
+updates. `sample.sample_start_step` delays regular images; initialization is
+controlled separately by `train.skip_first_sample`. `train.disable_sampling`
+disables both. Saves, stage boundaries, and the final update never force images.
+For example, 12 updates with `sample_every: 6` and initialization enabled produce
+images at 0, 6, and 12. With `sample_every: 5`, images occur at 0, 5, and 10.
+
+`gen2.evaluation.milestone_every` only expands a sample that is already due and
+whose update is divisible by that interval: it adds milestone modes and extra
+seeds. It does not create another sampling clock. Ordinary samples use preview
+modes and the primary seed. Both lists can contain the same six or seven visual
+comparisons. Initialization is an expanded milestone because its update is zero.
+
+`save.save_every` controls regular checkpoint saves. Gen2 separately retains
+initialization, phase-boundary, and final checkpoints. Thus the reviewed 12-update
+smoke with boundaries 0/2/10/12 and `save_every: 6` has five checkpoint directories
+(0, 2, 6, 10, 12), while `sample_every: 6` generates only three image sets (0, 6, 12).
+
+### Load a complete package
 
 ```bash
 python -m extensions.gen2_trainer infer output/gen2_style_smoke/gen2/checkpoints/update_00000006 --prompt "A cat beside a vase <gen2style>" --output output/gen2_inference.png --width 256 --height 256 --steps 4

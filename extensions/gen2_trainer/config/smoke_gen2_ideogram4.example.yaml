@@ -87,7 +87,7 @@ config:
       push_to_hub: false
     sample:
       sampler: flowmatch
-      sample_every: 1
+      sample_every: 1  # Image interval only; independent of checkpoint saves and stage boundaries.
       sample_start_step: 0
       width: 256
       height: 256
@@ -208,7 +208,7 @@ config:
         writer_queue_records: 4096
         max_core_recording_mb: 4096
       evaluation:
-        milestone_every: 3
+        milestone_every: 3  # Expand modes/seeds at already-due samples; never triggers extra images.
         additional_seeds: []
         prompt_groups: {}
         preview_modes:

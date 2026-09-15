@@ -98,7 +98,7 @@ config:
 
       sample:
         sampler: "flowmatch"  # Reuse native Ideogram Euler/sigma utilities with explicit Gen2 roles.
-        sample_every: 250  # Frequent-preview interval in committed updates; integer >=1.
+        sample_every: 250  # Sole repeating image interval; saves/stage boundaries do not trigger images.
         sample_start_step: 0  # Native preview start; nonnegative committed-update count.
         width: 1024  # Backend-supported dimensions; do not silently change them on OOM.
         height: 1024
@@ -236,7 +236,7 @@ config:
           # Reaching the core limit stops cleanly; it does not disable recording and keep training.
 
         evaluation:
-          milestone_every: 1000  # Integer >=1; expanded images, plus every stage boundary/final.
+          milestone_every: 1000  # Expand modes/seeds only at already-scheduled image events divisible by this interval.
           additional_seeds: [43]  # Appended to sample.seed, deduplicated in order; nonnegative integers.
           prompt_groups: {}  # Optional map: p000: easy, p001: hard. IDs follow native prompt order.
           # Set groups only from actual dataset/experience; examples here have no asserted difficulty.

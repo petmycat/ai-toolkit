@@ -218,12 +218,19 @@ class Gen2Runner:
         numeric_due = boundary or any(update % interval == 0 for interval in
             (dg["probes"]["every"], dg["gradient_probe_every"], dg["spectra_every"], dg["gate_log_every"]))
         save_due = boundary or force_save or update % self.config["save"]["save_every"] == 0
-        milestone = boundary or update % evaluation["milestone_every"] == 0
-        preview = update >= self.config["sample"]["sample_start_step"] and update % self.config["sample"]["sample_every"] == 0
+        # Image timing has one repeating clock, independent of saves, numeric
+        # diagnostics and phase boundaries. The optional initial image ignores
+        # sample_start_step; skip_first_sample owns that separate choice.
+        preview = ((initial and not self.config["train"]["skip_first_sample"]) or
+                   (not initial and update > 0 and update >= self.config["sample"]["sample_start_step"]
+                    and update % self.config["sample"]["sample_every"] == 0))
+        sampling_due = preview and not self.config["train"]["disable_sampling"]
+        # A milestone expands an existing image event; it cannot create one.
+        milestone = sampling_due and update % evaluation["milestone_every"] == 0
         validation = self.config["train"].get("validation_config")
         validation_due = validation and (boundary or update % validation.get("validate_every_n_steps", 10) == 0)
         package_hash = hashes = None
-        if numeric_due or save_due or validation_due or ((milestone or preview) and not self.config["train"]["disable_sampling"]):
+        if numeric_due or save_due or validation_due or sampling_due:
             package_hash, hashes = bundle_identity(self.backend)
             self.recorder.set_context(checkpoint_hash=package_hash)
             self.recorder.event("component_state_hashes", component_hashes=hashes, package_state_hash=package_hash,
@@ -240,9 +247,9 @@ class Gen2Runner:
             self.evaluation.representations(spectra=spectra)
         if validation_due:
             self.evaluation.validate(update)
-        if not self.config["train"]["disable_sampling"] and (milestone or preview) and not (initial and self.config["train"]["skip_first_sample"]):
-            # Union identical sampling requests across interval/boundary causes.
-            modes = list(dict.fromkeys((evaluation["preview_modes"] if preview else []) + (evaluation["milestone_modes"] if milestone else [])))
+        if sampling_due:
+            # Union the base preview set with any milestone expansion once.
+            modes = list(dict.fromkeys(evaluation["preview_modes"] + (evaluation["milestone_modes"] if milestone else [])))
             seeds = list(dict.fromkeys([self.config["sample"]["seed"]] + (evaluation["additional_seeds"] if milestone else [])))
             self.evaluation.sample(update, modes, seeds, reasons + (["milestone"] if milestone else []) + (["preview"] if preview else []), package_hash, hashes)
         if save_due:

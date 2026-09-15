@@ -191,26 +191,51 @@ For a separate smoke intended to exercise more conditioning updates, a **1 D :
 for the existing 4:1 configuration. Neither short schedule establishes style
 quality or convergence.
 
-### Sampling times and expected initial similarities
+### Image sampling has its own interval
 
-With `sample_every: 250`, `milestone_every: 6`, and initialization sampling on,
-images are generated at **updates 0, 2, 6, 10, and 12**. Phase boundaries trigger
-milestones even when the ordinary preview interval has not elapsed. Events that
-coincide are combined rather than generating the same request twice.
+**`sample.sample_every` is the only repeating image-generation interval.**
+Checkpoint saves, phase boundaries, and the final update do not independently
+trigger images. `train.skip_first_sample: false` adds an initialization comparison
+at update 0; setting it true skips that comparison. `train.disable_sampling: true`
+disables all images while numerical diagnostics and checkpointing continue.
 
-At each of those five events, seven modes and seeds 42 and 43 yield **14 individual
-images**. The run therefore produces **70 individual comparison images**, plus
-five contact sheets, when completed normally. The six requested modes alone would
-produce 60 images. To keep only one seed, `additional_seeds: []` leaves the single
-prompt unchanged and halves the image count.
+The selected smoke interval is **every 6 updates**, so its images occur at
+**updates 0, 6, and 12**. The matching `evaluation.milestone_every: 6` expands
+those already scheduled image events to use milestone modes and additional
+seeds. It does not create another sampling schedule. With seven modes and seeds
+42 and 43, the completed smoke produces **14 individual images at each event:
+42 images total, plus three contact sheets**. The six requested modes alone
+would produce 36 images. `additional_seeds: []` keeps the same single prompt and
+halves the image count for this configuration.
+
+When the two intervals differ, ordinary image events use the primary seed and
+`preview_modes`; events also divisible by `milestone_every` add milestone modes
+and `additional_seeds`. For example, sampling every 3 updates and expanding every
+6 gives ordinary previews at 3 and 9, with expanded comparisons at 0, 6, and 12.
+An expansion interval never creates an image event on its own. Leaving
+`sample_every: 250` in a 12-update run would produce only the optional update-0
+comparison, even if checkpoint and milestone settings are both 6.
+
+### Checkpoint saves are independent
+
+With `save.save_every: 6`, the two regular saves are **updates 6 and 12**. The
+required initial and phase-boundary checkpoints add **updates 0, 2, and 10**.
+Update 12 is also a boundary but is saved once. This gives **five complete
+checkpoint directories: 0, 2, 6, 10, and 12**. Protected reference checkpoints can
+make the retained count exceed `max_step_saves_to_keep`, which governs rolling
+retention. Changing the image interval does not change this checkpoint schedule.
+
+### Expected initial similarities
 
 At initialization, the six learned-embedding modes should agree because both
 LoRAs start at zero. The seventh base image can differ because it has no extra
 suffix positions. Before the first A update at update 7, images 1 and 2 should
 still agree, and images 3 and 4 should agree: the text adapter has not learned
-anything yet. Similarity here is expected. The update-10 snapshot includes one A
-update followed by three D updates, so it does not isolate the immediate effect
-of the A update alone.
+anything yet. Similarity at update 6 is expected. The selected next visual sample
+is update 12, after one A update, three further D updates, and two G updates. It
+compares the final smoke state rather than isolating the immediate effect of the
+A update. The separately saved update-10 checkpoint remains available for an
+explicit later inference comparison.
 
 Sampling at 1536 × 1024 for 28 steps makes this a substantial visual smoke. Image
 generation and diagnostics can dominate its runtime even though training has
@@ -418,10 +443,17 @@ assign an automatic visual-quality score.
   rather than silently dropping core records. **`max_core_recording_mb`** is a
   hard budget for core records, separate from model weights, images, and optional
   tensor dumps. Reaching it stops the run instead of continuing without records.
-- **`evaluation.milestone_every`** requests expanded comparisons in addition to
-  phase boundaries. Native **`sample.sample_every`** controls ordinary previews.
-  **`preview_modes`** and **`milestone_modes`** choose their images.
-- **`additional_seeds`** adds matched seeds at milestones. **`prompt_groups`**
+- **`sample.sample_every`** sets the repeating image interval, independently of
+  saves and phase boundaries. **`sample_start_step`** controls when repeating
+  samples become eligible. **`train.skip_first_sample`** separately controls the
+  optional initialization comparison. No extra image is forced at the final
+  update when it is not a scheduled image event.
+- **`evaluation.milestone_every`** expands an already scheduled image event when
+  its update is also divisible by this value. It does not trigger images by
+  itself. **`preview_modes`** selects the regular set, and **`milestone_modes`**
+  adds the expanded set at those events; duplicate requests are combined.
+- **`additional_seeds`** adds matched seeds at expanded events; ordinary previews
+  use `sample.seed`. **`prompt_groups`**
   labels existing prompt IDs such as `p000`; it does not add prompts.
   **`make_contact_sheets`** produces labeled overview sheets while preserving
   full-size individual images and their metadata.

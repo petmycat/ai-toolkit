@@ -2,7 +2,7 @@
 
 ## Status on 2026-09-15
 
-**Local verification passed: 106 tests. Real VM acceptance is pending.**
+**Local verification passed: 114 tests. Real VM acceptance is pending.**
 
 The user will manually run the smoke and actual configurations on an RTX PRO
 6000 with 96 GB VRAM, using the VM's existing ai-toolkit dependencies, weights
@@ -19,7 +19,7 @@ packages are absent, including bitsandbytes. The tests use CPU tensors.
 
 ```text
 python -B -m pytest extensions/gen2_trainer/tests -q -p no:cacheprovider
-106 passed
+114 passed in 4.41s
 ```
 
 For the native config-file parsing test, `oyaml==1.0` was installed with
@@ -82,14 +82,20 @@ LoRA test checks composition with the frozen native unconditional adapter using
 bf16 projection inputs and fp32 Gen2 masters. Config/CLI checks enforce CFG > 1
 for the new unconditional diagnostics while preserving legacy mode defaults.
 Contact-sheet tests verify prompt/seed rows, stable mode columns, actual-control
-labels, and gaps for deduplicated requests. These remain CPU fixture checks,
+labels, and gaps for deduplicated requests. Event tests execute the real scheduling
+method and verify that only the sample interval and optional initialization trigger
+images. They cover mismatched save/sample intervals, no forced final image,
+milestone expansion, start/skip/disable settings, forced saves, and preservation
+of checkpoint and numerical/validation schedules. These remain CPU fixture checks,
 not actual Ideogram/CUDA image or training acceptance.
 
 The reviewed local 12-update user smoke passes native YAML parsing and strict
 Gen2 validation after repairing the JSON prompt's YAML quoting. It retains one
 prompt, arbitrary-text initialization and deliberate weight decay 0.999. Its
 family horizons are D9/E1/T1/G2. Seven explicit modes (the requested six plus a
-base reference), seeds 42/43, and events 0/2/6/10/12 schedule 70 images. The exact
+base reference), seeds 42/43, and the selected sample interval of six schedule
+42 images at updates 0/6/12. A real event-method fixture using the corrected user
+config confirms 14 images per event and checkpoint saves at 0/2/6/10/12. The exact
 native caption/chat path was checked with the locally cached Qwen tokenizer at
 revision `0c351dd01ed87e9c1b53cbc748cba10e6187ff3b`: 1,269 original positions plus
 four learned positions fit the 2,048-position budget. No weights were loaded
