@@ -2,7 +2,8 @@
 
 ## Status on 2026-09-15
 
-**Local verification passed: 114 tests. Real VM acceptance is pending.**
+**Local verification passed: 125 tests. First VM smoke failed before update 1;
+the checkpoint-context fix awaits a VM rerun.**
 
 The user will manually run the smoke and actual configurations on an RTX PRO
 6000 with 96 GB VRAM, using the VM's existing ai-toolkit dependencies, weights
@@ -19,7 +20,7 @@ packages are absent, including bitsandbytes. The tests use CPU tensors.
 
 ```text
 python -B -m pytest extensions/gen2_trainer/tests -q -p no:cacheprovider
-114 passed in 4.41s
+125 passed in 4.65s
 ```
 
 For the native config-file parsing test, `oyaml==1.0` was installed with
@@ -29,6 +30,40 @@ packages and the production environment were not upgraded. Without oyaml,
 that single parsing test explicitly skips; ordinary VM dependencies provide it.
 
 ## What these tests establish
+
+### First VM failure and regression coverage
+
+The supplied VM traceback completed native model loading, qfloat8 diffusion and
+text-encoder quantization, and caching of 40 images at each of three resolutions.
+It then failed in the initialization gradient probe when backward checkpoint
+recomputation entered a gated diffusion projection without its branch ContextVar.
+No optimizer update had begun. The failure was visible and stopped the run.
+
+An exact-error reproduction keeps the parent branch open and invokes backward
+from a fresh worker context. The previous same-thread CPU test did not cover
+this boundary. Gen2 now captures the per-forward branch and native adapter flags
+and restores them through PyTorch's non-reentrant checkpoint context callback.
+The captured gate tensor remains connected to its original gradient graph.
+Encoder and diffusion replay scopes are reusable for retained-graph probe chunks
+and remove their ContextVar bindings on exit, including nested exceptions.
+
+Eight regression tests execute source-isolated native transformer/LoRA code,
+checking D/A/G eager-versus-replay gradients, normal backward and autograd.grad,
+nonzero gate-coefficient gradients, repeated Qwen replay, actual chunked gradient
+probe orchestration, teacher isolation, native default fallback, and state
+restoration after exceptions. A 100-context test checks immediate binding cleanup.
+Three additional cache tests execute the native failure/removal callback and
+check source membership at each resolution. They close a potential silent-skip
+gap discovered during the cache audit; that gap was not observed in the VM log.
+
+These local tests isolate the reported mechanism on CPU. They do not establish
+that the actual CUDA/Quanto pipeline now completes all stages. The retry retains
+the same training settings and caches under a new run name to preserve failed-run
+evidence. Native cache keys still do not fingerprint source image bytes or VAE
+weights; see the visual diagnostics guide before reusing caches after data or VAE
+changes.
+
+### Existing mathematical and integration coverage
 
 - Native extension discovery finds the new lazy `gen2_trainer` registration.
   Unrelated optional extensions are filtered in that test; it does not load the

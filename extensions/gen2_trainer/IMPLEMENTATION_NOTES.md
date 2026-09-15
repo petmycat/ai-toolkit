@@ -83,8 +83,22 @@ factory gains an optional `dataset_class` injection argument, defaulting to the
 same `AiToolkitDataset` as before. This lets Gen2 inherit native preprocessing
 while overriding only the native retry/replacement policy: a failed source image
 must abort rather than silently substitute another sample. Stock callers retain
-their existing behavior. No dataset algorithm is forked. All other implementation
-and tests live in this extension; no optimizer repair or broad trainer refactor.
+their existing behavior. Gen2 also rejects native cache-time removals and checks
+membership independently for each source and expanded resolution; a surviving
+copy at another resolution cannot hide a missing example. No dataset algorithm
+is forked.
+
+The native Ideogram transformer has one additional optional checkpoint callback
+(`_gradient_checkpointing_func`), falling back to the original torch function
+for stock callers. Gen2 installs a callback that captures each block forward's
+branch, gate tensor, and adapter flags and rebinds them during backward replay.
+Keeping the outer branch scope open is insufficient when CUDA autograd performs
+recomputation in another Python context. Replays preserve the original gate
+autograd graph, suppress duplicate diagnostics, and restore ambient state even
+on exceptions. Both diffusion and encoder replay contexts support repeated
+entries for chunked `autograd.grad` probes. The transformer forward, attention,
+checkpoint boundaries and gradients remain native. All pipeline logic and tests
+live in this extension; no optimizer repair or broad trainer refactor.
 
 ## Validation status
 

@@ -24,13 +24,42 @@ DIFFUSION_PROJECTIONS = ("attention.qkv", "attention.o", "feed_forward.w1",
 RECOMPUTING = ContextVar("gen2_recomputing", default=False)
 
 
-@contextmanager
+class _ReusableContext:
+    """Create a fresh scope for each replay of a retained checkpoint graph.
+
+    Non-reentrant checkpointing retains the context returned by context_fn.
+    Chunked autograd.grad can enter that same context more than once, and CUDA
+    autograd workers do not inherit the calling thread's ContextVar bindings.
+    Keep entry stacks local to the execution context, too.
+    """
+    def __init__(self, factory):
+        self.factory = factory
+        self._stack = ContextVar(f"gen2_replay_scopes_{id(self)}", default=())
+
+    def __enter__(self):
+        scope = self.factory()
+        value = scope.__enter__()
+        entry = [scope]
+        entry.append(self._stack.set((*self._stack.get(), entry)))
+        return value
+
+    def __exit__(self, *error):
+        scope, token = self._stack.get()[-1]
+        # Reset rather than storing an empty stack: autograd worker contexts
+        # must not retain a new ContextVar key for every completed graph.
+        self._stack.reset(token)
+        return scope.__exit__(*error)
+
+
 def recomputation_context():
-    token = RECOMPUTING.set(True)
-    try:
-        yield
-    finally:
-        RECOMPUTING.reset(token)
+    @contextmanager
+    def scope():
+        token = RECOMPUTING.set(True)
+        try:
+            yield
+        finally:
+            RECOMPUTING.reset(token)
+    return _ReusableContext(scope)
 
 
 def pack_activation_taps(selected: list[torch.Tensor], attention_mask: torch.Tensor):
@@ -178,6 +207,9 @@ class Ideogram4Backend:
         self.encoder_checkpointing = gen2_config["execution"]["encoder_gradient_checkpointing"]
         self._branch = ContextVar(f"gen2_branch_{id(self)}", default=None)
         self._diagnostic = ContextVar(f"gen2_diagnostic_{id(self)}", default=None)
+        # Native block checkpointing keeps its forward/arguments. This callback
+        # carries Gen2's exact forward context into autograd worker replays.
+        model.transformer._gradient_checkpointing_func = self._checkpoint
         for component in (model.transformer, model.text_encoder, model.vae):
             component.eval().requires_grad_(False)
         uncond = getattr(model, "unconditional_lora", None)
@@ -282,6 +314,48 @@ class Ideogram4Backend:
     @property
     def current_branch(self):
         return self._branch.get()
+
+    def _checkpoint(self, function, *args, **kwargs):
+        """Bind each native block replay to the state from its own forward.
+
+        Holding branch() around backward is insufficient on CUDA workers:
+        ContextVars belong to a Python execution context, not the autograd graph.
+        Capture the original gate tensor without detaching it so G gradients
+        still reach the gate coefficients. Restore all ambient state on exit.
+        """
+        state = self._branch.get()
+        if state is None:
+            raise RuntimeError("Gen2 checkpoint requires an explicit forward branch context")
+        if kwargs.get("use_reentrant", False) or "context_fn" in kwargs:
+            raise ValueError("Gen2 requires non-reentrant checkpointing with its bound replay context")
+        kwargs["use_reentrant"] = False
+        network = self.diffusion_network
+        uncond = getattr(self.model, "unconditional_lora", None)
+        active = network.is_active
+        unconditional_active = uncond.is_active if uncond is not None else None
+
+        @contextmanager
+        def replay():
+            branch_token = self._branch.set(state)
+            diagnostic_token = self._diagnostic.set(None)
+            recomputing_token = RECOMPUTING.set(True)
+            previous_active = network.is_active
+            previous_unconditional = uncond.is_active if uncond is not None else None
+            network.is_active = active
+            if uncond is not None:
+                uncond.is_active = unconditional_active
+            try:
+                yield
+            finally:
+                network.is_active = previous_active
+                if uncond is not None:
+                    uncond.is_active = previous_unconditional
+                RECOMPUTING.reset(recomputing_token)
+                self._diagnostic.reset(diagnostic_token)
+                self._branch.reset(branch_token)
+
+        return checkpoint(function, *args, **kwargs,
+                          context_fn=lambda: (nullcontext(), _ReusableContext(replay)))
 
     def _ensure_native_device(self, component, name):
         """Mirror native Ideogram's low_vram CPU-to-compute-device guard.

@@ -530,7 +530,10 @@ class Ideogram4Transformer2DModel(nn.Module, OstrisModelMixin):
 
         for layer in self.layers:
             if self.gradient_checkpointing and torch.is_grad_enabled():
-                h = checkpoint(
+                # Extensions may bind per-forward state to backward replay.
+                # Stock callers retain the original torch checkpoint function.
+                checkpoint_fn = getattr(self, "_gradient_checkpointing_func", checkpoint)
+                h = checkpoint_fn(
                     layer,
                     h,
                     attn_mask,

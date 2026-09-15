@@ -58,6 +58,13 @@ execution and comparisons; use the actual configuration for image-quality work.
 Initial and boundary probes, spectra, and scheduled image ablations make it more
 expensive than six optimizer steps alone.
 
+If initialization fails before the initial checkpoint is published, use a new
+`config.name` for the retry and retain the failed run's logs. Such a run cannot
+resume from an unpublished checkpoint. A code-only checkpoint-context fix does
+not require rebuilding image latents when the image/VAE settings are unchanged.
+See [image-latent caching](docs/visual_diagnostics.md#what-image-latent-caching-changes)
+for the cache's scope and validity limits.
+
 ### 3. Run strict continuation and package acceptance
 
 ```bash

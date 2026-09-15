@@ -132,17 +132,29 @@ def make_native_loader(config: dict, model: Any, manifest: list[dict]):
     from toolkit.data_loader import get_dataloader_from_datasets, get_dataloader_datasets
     from .native_data import Gen2AbortDataset
 
-    native = []
-    for index, raw in enumerate(preprocess_dataset_raw_config(copy.deepcopy(config["datasets"]))):
-        raw["trigger_word"] = None
-        item = DatasetConfig(**raw)
-        item.gen2_initialization_seed = config["gen2"]["execution"]["training_seed"] + index
-        native.append(item)
+    native, source_indices = [], []
+    for source_index, source in enumerate(config["datasets"]):
+        for raw in preprocess_dataset_raw_config([copy.deepcopy(source)]):
+            raw["trigger_word"] = None
+            item = DatasetConfig(**raw)
+            item.gen2_initialization_seed = config["gen2"]["execution"]["training_seed"] + len(native)
+            native.append(item)
+            source_indices.append(source_index)
     loader = get_dataloader_from_datasets(native, batch_size=config["train"]["batch_size"], sd=model, dataset_class=Gen2AbortDataset)
-    observed = {str(Path(item.path).resolve()) for dataset in get_dataloader_datasets(loader) for item in dataset.file_list}
-    expected = {row["path"] for row in manifest}
-    if observed != expected:
-        raise RuntimeError(f"Native loader changed dataset membership: missing={sorted(expected-observed)}, extra={sorted(observed-expected)}")
+    datasets = get_dataloader_datasets(loader)
+    if len(datasets) != len(native):
+        raise RuntimeError("Native loader changed the number of datasets after resolution expansion")
+    # Check every expanded dataset: a surviving copy at another resolution
+    # must not conceal a native constructor skipping an invalid source item.
+    for dataset, native_config, source_index in zip(datasets, native, source_indices):
+        observed = {str(Path(item.path).resolve()) for item in dataset.file_list}
+        expected = {row["path"] for row in manifest if row["dataset_index"] == source_index}
+        if observed != expected:
+            raise RuntimeError(
+                f"Native loader changed dataset membership for source {source_index} "
+                f"at resolution {native_config.resolution}: "
+                f"missing={sorted(expected-observed)}, extra={sorted(observed-expected)}"
+            )
     return loader
 
 

@@ -395,6 +395,37 @@ that family's `optimizer_params.weight_decay` without changing the others.
   part of what the VM smoke must verify. Quantization and checkpointing do not
   establish that every resolution/batch combination fits available VRAM.
 
+### What image-latent caching changes
+
+For this Ideogram backend, the frozen VAE encodes an image using its posterior
+mean, then applies the native latent packing and normalization. The cache stores
+that clean image representation (`z0`). Each training visit still draws fresh
+noise and a fresh noise level, constructs its noisy input, and recomputes the
+learned embedding/text-adapter conditioning. Caching image latents does not cache
+those trainable text features. Keep `cache_text_embeddings: false`.
+
+With the same pixels, resize/crop, VAE, normalization and precision, cached and
+fresh image encoding implement the same calculation. There is no repeated random
+VAE posterior sample being removed in this backend. Batched versus single-image
+GPU encoding can still have small numerical differences. Caching may affect
+experiments with changing image transforms; the reviewed bucketed smoke uses
+fixed preprocessing and does not request such variation.
+
+Forty source images at three resolutions create forty latent variants per
+resolution. They remain forty source images, not 120 independent examples.
+
+**Cache validity needs care when source data or the encoder changes.** The native
+key includes filename, crop/resize, flips, and latent version fields, but not the
+image content hash, VAE weight hash, or compute dtype. Replacing same-name images
+or changing the VAE/encoding settings can reuse stale entries; rebuild the
+affected caches in those cases. Changing captions or the trained Gen2 components
+does not invalidate image latents. Existing caches can be reused for a code-only
+checkpoint-context fix when the images and VAE settings are unchanged.
+
+Gen2 aborts if native caching tries to remove a failed example. It also checks
+dataset membership independently at every resolution, so one successful copy
+cannot conceal a missing copy elsewhere.
+
 ### Numerical diagnostics
 
 These measurements explain component behavior alongside the PNGs; they do not
