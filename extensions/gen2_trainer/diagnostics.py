@@ -806,7 +806,7 @@ def export_diagnostics(run_dir: str | Path, destination: str | Path,
     # it only; regenerated summaries are written straight into the output zip.
     summary = summarize_run(root, write=False)
     approved = []
-    root_metadata = {"run_manifest.json", "module_manifest.json", "probe_manifest.json",
+    root_metadata = {"run_manifest.json", "module_manifest.json", "probe_manifest.json", "caption_token_report.json",
                      "config.requested.yaml", "config.resolved.yaml", "human_ratings.csv",
                      }
     for path in root.rglob("*"):

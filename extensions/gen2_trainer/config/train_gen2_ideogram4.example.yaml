@@ -87,7 +87,7 @@ config:
         unconditional_lora_path: null  # Optional EXISTING frozen native unconditional adapter only.
         model_kwargs:
           text_encoder_path: "Qwen/Qwen3-VL-8B-Instruct"  # Native encoder loader path; match backend.
-          max_text_length: 2048  # Total original + M soft positions; require M < limit <=2048 in v1.
+          max_text_length: 2048  # Total original + M soft positions; user-approved maximum is 3072, overflow still errors.
         # Do not set pretrained/assistant/inference style LoRAs; v1 starts a fresh diffusion LoRA.
 
       save:

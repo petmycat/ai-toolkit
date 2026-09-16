@@ -39,6 +39,11 @@ def parser():
     validate.add_argument("config")
     validate.add_argument("--process-index", type=int, default=0)
     validate.add_argument("--output", help="Optional destination for the complete resolved process YAML")
+    captions = commands.add_parser("check-captions", help="Check every caption and sample prompt with the native tokenizer, without loading model weights")
+    captions.add_argument("config")
+    captions.add_argument("--process-index", type=int, default=0)
+    captions.add_argument("--output", help="Optional destination for the complete JSON token-length report")
+    captions.add_argument("--local-files-only", action="store_true", help="Use only locally cached tokenizer files; do not download missing files")
     inspect = commands.add_parser("inspect", help="Validate all checksums and inspect a complete package")
     inspect.add_argument("checkpoint")
     infer = commands.add_parser("infer", help="Load a complete package and generate one image on CUDA")
@@ -84,6 +89,28 @@ def main(argv=None):
             output.write_text(yaml.safe_dump(resolved, sort_keys=False, allow_unicode=True), encoding="utf-8")
         print(json.dumps({"valid": True, "name": name, "spec_sha256": SPEC_SHA256,
             "resolved": resolved, "models_loaded": False}, indent=2, ensure_ascii=False))
+    elif arguments.command == "check-captions":
+        from .config import resolve_process_config
+        from .data import preflight_datasets
+        from .recording import assert_writable_path, write_json
+        from .text_preflight import build_token_report, load_tokenizer
+        raw, name = read_config(arguments.config, arguments.process_index)
+        resolved = resolve_process_config(raw)
+        output = assert_writable_path(arguments.output) if arguments.output else None
+        manifest = preflight_datasets(resolved)
+        tokenizer_path = resolved["model"]["model_kwargs"].get("text_encoder_path", "Qwen/Qwen3-VL-8B-Instruct")
+        try:
+            tokenizer = load_tokenizer(resolved, local_files_only=arguments.local_files_only)
+        except (ImportError, OSError, ValueError) as error:
+            raise RuntimeError(f"Could not load tokenizer {tokenizer_path!r} for check-captions "
+                f"(local_files_only={arguments.local_files_only}): {error}") from error
+        report = build_token_report(resolved, manifest, tokenizer)
+        report = {**report, "name": name, "models_loaded": False, "tokenizer_source": tokenizer_path,
+                  "local_files_only": arguments.local_files_only}
+        if output is not None:
+            write_json(output, report)
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        return 0 if report["passed"] else 1
     elif arguments.command == "inspect":
         from .checkpointing import load_manifest
         from .config import SPEC_SHA256

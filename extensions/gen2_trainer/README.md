@@ -37,6 +37,30 @@ local scheduler horizons. It prints the resolved configuration. Add
 parser handles `${VARIABLE}` and `[name]` substitutions. Model paths, installed
 GPU packages and actual native constructors are verified when the real run loads.
 
+Check every training/validation caption and enabled sampling prompt with the
+native tokenizer before starting a run:
+
+```bash
+python -m extensions.gen2_trainer check-captions CONFIG.yaml --output output/caption-token-report.json --local-files-only
+```
+
+This loads tokenizer files only. Omit `--local-files-only` to allow fetching
+missing tokenizer files; it never loads model weights or creates latent caches.
+The JSON report contains source paths, complete serialized token lengths and
+every overflow, and the command returns a failure status if any input cannot fit.
+Normal training runs the same check automatically before loading model weights
+and saves the report as `gen2/caption_token_report.json` under the run output.
+
+`model.model_kwargs.max_text_length` counts the full chat-wrapped caption plus
+the learned tokens. Its default remains 2,048; the user-approved maximum is now
+3,072. Four learned tokens leave 3,068 original positions at the larger budget.
+`overflow_policy: error` remains mandatory: no caption or learned position is
+silently removed. Unlike Gen2, the native Ideogram trainer truncates inputs above
+its configured cap (default 3,072). Longer Gen2 inputs increase compute/memory;
+the native model's ability to accept variable lengths does not establish equal
+quality at every length. Use a new run name after changing this setting because
+it changes the strict resume contract.
+
 ### 2. Run the six-update smoke configuration
 
 ```bash
@@ -145,6 +169,13 @@ controlled separately by `train.skip_first_sample`. `train.disable_sampling`
 disables both. Saves, stage boundaries, and the final update never force images.
 For example, 12 updates with `sample_every: 6` and initialization enabled produce
 images at 0, 6, and 12. With `sample_every: 5`, images occur at 0, 5, and 10.
+
+During sampling the console prints the update, the number of new images after
+deduplication, and each image's position, prompt ID, seed and mode. It reports
+the first denoising step, approximately each quarter, and the last step, then
+image completion with elapsed time. Failures name the active image and propagate
+normally. These progress messages do not add model evaluations or device
+synchronization.
 
 `gen2.evaluation.milestone_every` only expands a sample that is already due and
 whose update is divisible by that interval: it adds milestone modes and extra

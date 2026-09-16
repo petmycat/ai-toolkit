@@ -452,40 +452,68 @@ class Evaluation:
         from toolkit.config_modules import GenerateImageConfig
         options = self.config["sample"]
         evaluation = self.config["gen2"]["evaluation"]
+        modes, seeds = list(modes), list(seeds)
         records, images = [], []
+        pending = []
+        planned = set(self.sampled_requests)
+        for prompt_index, prompt in enumerate(options["prompts"]):
+            if not isinstance(prompt, str):
+                prompt = prompt["prompt"]
+            prompt_id = f"p{prompt_index:03d}"
+            for seed in seeds:
+                for mode in modes:
+                    settings = {"package_hash": package_hash, "prompt": prompt, "seed": seed, "mode": mode,
+                        "width": options["width"], "height": options["height"], "steps": options["sample_steps"],
+                        "guidance": options["guidance_scale"], "strength": self.config["gen2"]["inference"]["lora_strength"],
+                        "gate_mode": self.gate_mode(update)}
+                    request = hashlib.sha256(json.dumps(settings, sort_keys=True).encode()).hexdigest()
+                    if request not in planned:
+                        pending.append((prompt_id, settings, request))
+                        planned.add(request)
+        total = len(pending)
+        started = time.perf_counter()
+        print(f"[Gen2 sampling] update {update}: {total} new image(s) to generate", flush=True)
         with isolated_rng(self.seed):
-            for prompt_index, prompt in enumerate(options["prompts"]):
-                if not isinstance(prompt, str):
-                    prompt = prompt["prompt"]
-                prompt_id = f"p{prompt_index:03d}"
-                for seed in seeds:
-                    for mode in modes:
-                        settings = {"package_hash": package_hash, "prompt": prompt, "seed": seed, "mode": mode,
-                            "width": options["width"], "height": options["height"], "steps": options["sample_steps"],
-                            "guidance": options["guidance_scale"], "strength": self.config["gen2"]["inference"]["lora_strength"],
-                            "gate_mode": self.gate_mode(update)}
-                        request = hashlib.sha256(json.dumps(settings, sort_keys=True).encode()).hexdigest()
-                        if request in self.sampled_requests:
-                            continue
-                        image, metadata = generate(self.backend, **{key: value for key, value in settings.items() if key != "package_hash"})
-                        filename = f"u{update:08d}_{prompt_id}_s{seed}_{mode}_{request[:10]}.png"
-                        destination = self.root / "samples" / filename
-                        destination.parent.mkdir(parents=True, exist_ok=True)
-                        native = GenerateImageConfig(prompt=prompt, output_path=str(destination), output_ext="png", seed=seed,
-                            width=options["width"], height=options["height"], num_inference_steps=options["sample_steps"],
-                            guidance_scale=options["guidance_scale"], add_prompt_file=False)
-                        native.save_image_atomic(image)
-                        row = {"image_id": request, "prompt_id": prompt_id, "prompt_hash": hashlib.sha256(prompt.encode()).hexdigest(),
-                            "group": evaluation["prompt_groups"].get(prompt_id, "unassigned"), "checkpoint_hash": package_hash,
-                            "component_hashes": component_hashes, "model_identities": self.model_identities,
-                            "path": f"samples/{filename}", "ablation_mode": mode,
-                            "reasons": reasons, "inference_code": code_identity(), **metadata}
-                        write_json(destination.with_suffix(".json"), row)
-                        self.recorder.record("samples/manifest", row)
-                        self.sampled_requests.add(request)
-                        records.append(row)
-                        images.append((image, row))
+            for index, (prompt_id, settings, request) in enumerate(pending, start=1):
+                prompt, seed, mode = settings["prompt"], settings["seed"], settings["mode"]
+                prefix = f"[Gen2 sampling] update {update} image {index}/{total} | {prompt_id} | seed {seed} | {mode}"
+                image_started = time.perf_counter()
+                print(f"{prefix} | starting", flush=True)
+
+                def report_progress(completed, steps):
+                    checkpoints = {1, steps, *((steps*quarter + 3)//4 for quarter in (1, 2, 3))}
+                    if completed in checkpoints:
+                        print(f"{prefix} | denoising {completed}/{steps} | "
+                              f"{time.perf_counter()-image_started:.1f}s elapsed", flush=True)
+
+                try:
+                    image, metadata = generate(self.backend, progress_callback=report_progress,
+                        **{key: value for key, value in settings.items() if key != "package_hash"})
+                    filename = f"u{update:08d}_{prompt_id}_s{seed}_{mode}_{request[:10]}.png"
+                    destination = self.root / "samples" / filename
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    native = GenerateImageConfig(prompt=prompt, output_path=str(destination), output_ext="png", seed=seed,
+                        width=options["width"], height=options["height"], num_inference_steps=options["sample_steps"],
+                        guidance_scale=options["guidance_scale"], add_prompt_file=False)
+                    native.save_image_atomic(image)
+                    row = {"image_id": request, "prompt_id": prompt_id, "prompt_hash": hashlib.sha256(prompt.encode()).hexdigest(),
+                        "group": evaluation["prompt_groups"].get(prompt_id, "unassigned"), "checkpoint_hash": package_hash,
+                        "component_hashes": component_hashes, "model_identities": self.model_identities,
+                        "path": f"samples/{filename}", "ablation_mode": mode,
+                        "reasons": reasons, "inference_code": code_identity(), **metadata}
+                    write_json(destination.with_suffix(".json"), row)
+                    self.recorder.record("samples/manifest", row)
+                    self.sampled_requests.add(request)
+                    records.append(row)
+                    images.append((image, row))
+                except Exception as error:
+                    print(f"{prefix} | FAILED after {time.perf_counter()-image_started:.1f}s: "
+                          f"{type(error).__name__}: {error}", flush=True)
+                    raise
+                print(f"{prefix} | complete in {time.perf_counter()-image_started:.1f}s", flush=True)
         append_rating_template(self.root / "human_ratings.csv", records)
         if images and evaluation["make_contact_sheets"]:
             sheet = make_contact_sheet(images, modes)
             sheet.save(self.root / "samples" / f"u{update:08d}_contact_sheet.png")
+        print(f"[Gen2 sampling] update {update}: complete, {len(records)}/{total} new image(s) "
+              f"in {time.perf_counter()-started:.1f}s", flush=True)

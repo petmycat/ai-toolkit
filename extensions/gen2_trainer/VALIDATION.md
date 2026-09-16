@@ -1,9 +1,13 @@
 # Validation record
 
-## Status on 2026-09-15
+## Status on 2026-09-16
 
-**Local verification passed: 125 tests. First VM smoke failed before update 1;
-the checkpoint-context fix awaits a VM rerun.**
+**The retry1 VM run progressed past initialization and reached the training
+loop, where a complete 2,055-token caption plus four learned positions exceeded
+the configured 2,048-position budget. Full VM acceptance remains incomplete.**
+
+**Local verification: 150 tests passed**, including caption preflight, the
+approved 3,072-token cap, and visible sampling progress.
 
 The user will manually run the smoke and actual configurations on an RTX PRO
 6000 with 96 GB VRAM, using the VM's existing ai-toolkit dependencies, weights
@@ -20,7 +24,7 @@ packages are absent, including bitsandbytes. The tests use CPU tensors.
 
 ```text
 python -B -m pytest extensions/gen2_trainer/tests -q -p no:cacheprovider
-125 passed in 4.65s
+150 passed in 4.98s
 ```
 
 For the native config-file parsing test, `oyaml==1.0` was installed with
@@ -30,6 +34,42 @@ packages and the production environment were not upgraded. Without oyaml,
 that single parsing test explicitly skips; ordinary VM dependencies provide it.
 
 ## What these tests establish
+
+### Retry1 caption overflow and the approved larger budget
+
+The retry1 traceback entered `engine.step` rather than failing in initialization
+checkpoint replay. It does not establish completion of D/A/G training or validate
+the final scientific hypothesis. The overflow was the intentional fail-closed
+policy, but discovering it after initial sampling wasted work.
+
+The user approved allowing a total text budget of 3,072 while keeping overflow
+errors. This is the native Ideogram integration's default cap; the Gen2 default
+remains 2,048 for existing configs. The private retry2 config changes only the
+run name and total text cap. Neither immutable specification copy was changed.
+
+Startup now checks all training and held-out captions and enabled sample prompts
+using the same non-truncating caption/chat serializer as the encoder, before
+model weights or latent caches load. `check-captions` exposes that scan separately
+using tokenizer files only. Reports retain every offending source path and are
+included in exported diagnostics. Tests check exact budget boundaries, unchanged
+serialized IDs when the cap increases, all-source reporting, native omitted
+validation-prompt behavior, CLI pass/fail status and report persistence, and real
+startup orchestration aborting before the native model or latent loader starts.
+
+The retry2 single sample prompt was checked using locally cached Qwen tokenizer
+files without loading or downloading weights: 1,269 original positions plus four
+learned positions, within the new 3,072 budget. The VM's full training dataset
+is unavailable locally and will be checked by the new startup scan on the VM.
+
+### Sampling console progress
+
+Sampling now reports the update, each new image's count/prompt/seed/mode, first
+and quarter/final denoising progress, elapsed image completion and explicit
+failures. Five new tests exercise the real generation function with a lightweight
+backend fixture and the real evaluation sampling loop. They establish identical
+pixels/metadata/RNG with the progress callback enabled, no added explicit CUDA
+synchronization, deduplicated totals, and failure visibility without marking a
+failed image as completed. These remain CPU checks; VM runtime still needs testing.
 
 ### First VM failure and regression coverage
 

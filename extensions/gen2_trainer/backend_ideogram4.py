@@ -13,10 +13,11 @@ import math
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from .conditioning import (Conditioning, LearnedTokenBank, compile_trigger,
+from .conditioning import (Conditioning, LearnedTokenBank,
                            encoder_projection_scope, make_masked_lora_class, native_lora_residual,
                            dequantize_projection_input)
 from .gates import CubicTimeGates
+from .text_preflight import tokenize_caption, require_token_budget
 
 EXPECTED_ACTIVATION_LAYERS = (0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 35)
 DIFFUSION_PROJECTIONS = ("attention.qkv", "attention.o", "feed_forward.w1",
@@ -410,7 +411,6 @@ class Ideogram4Backend:
         return rows
 
     def encode(self, qs, styled=True, gradients=False, token_mode="learned", adapter_enabled=True):
-        from toolkit.ideogram_caption import digest_caption_string
         if gradients and not torch.is_grad_enabled():
             raise RuntimeError("A conditioning encode entered an outer no_grad context")
         self._ensure_native_device(self.model.text_encoder, "text_encoder")
@@ -419,18 +419,12 @@ class Ideogram4Backend:
         device = language_model.embed_tokens.weight.device
         with torch.set_grad_enabled(gradients):
             for example_index, caption in enumerate(qs):
-                item = compile_trigger(caption, self.trigger_word)
-                digested = digest_caption_string(item["q"])
-                serialized = self.model.tokenizer.apply_chat_template(
-                    [{"role": "user", "content": [{"type": "text", "text": digested}]}],
-                    add_generation_prompt=True, tokenize=False)
-                ids = self.model.tokenizer(serialized, add_special_tokens=False, truncation=False)["input_ids"]
+                item = tokenize_caption(caption, self.trigger_word, self.model.tokenizer)
+                serialized, ids = item["serialized_text"], item["original_ids"]
                 m = self.tokens.U.shape[0] if styled else 0
                 # Reserve M for both paired routes, so C0 never accepts a sample C+ cannot represent.
                 reserve = self.tokens.U.shape[0]
-                if not ids or len(ids)+reserve > self.model.max_text_length:
-                    raise ValueError(f"Gen2 token overflow: caption={item['q']!r}, original_length={len(ids)}, "
-                                     f"M={reserve}, limit={self.model.max_text_length}; overflow_policy=error")
+                require_token_budget(item, reserve, self.model.max_text_length)
                 token_ids = torch.tensor([ids], device=device, dtype=torch.long)
                 original = language_model.embed_tokens(token_ids)
                 inputs = original

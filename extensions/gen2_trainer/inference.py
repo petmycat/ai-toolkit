@@ -50,7 +50,7 @@ def resolve_route(mode: str | None, trigger_present: bool,
 @torch.no_grad()
 def generate(backend, prompt: str, mode: str | None = None, *, width=1024, height=1024,
              seed=42, steps=30, guidance=7., strength=None, gate_mode="learned",
-             initial_noise=None):
+             initial_noise=None, progress_callback=None):
     """Return one PIL image and reproducibility metadata, without mutating components.
 
     Explicit diagnostic modes force their route regardless of literal trigger.
@@ -59,6 +59,10 @@ def generate(backend, prompt: str, mode: str | None = None, *, width=1024, heigh
     the empty image-only pass at absolute strengths .5 and 1.; these strengths
     are independent of the conditional strength. Learned tokens and the text
     adapter remain confined to the conditional pass.
+
+    When supplied, ``progress_callback(completed_steps, total_steps)`` runs
+    after each successful denoising step. It is observational: no extra device
+    synchronization or sampling work is performed for progress reporting.
     """
     from diffusers.utils.torch_utils import randn_tensor
     from PIL import Image
@@ -93,7 +97,8 @@ def generate(backend, prompt: str, mode: str | None = None, *, width=1024, heigh
         noise = initial_noise.to(model.device_torch, torch.float32).clone()
     latents = noise*sigmas[0]
     empty = backend.empty_conditioning(1, condition.features[0].shape[-1])
-    for sigma, sigma_next in zip(sigmas[:-1], sigmas[1:]):
+    total_steps = len(sigmas) - 1
+    for completed_steps, (sigma, sigma_next) in enumerate(zip(sigmas[:-1], sigmas[1:]), start=1):
         tau = sigma.expand(1)
         with backend.branch(tau, lora_enabled=route.lora_enabled, gate_mode=route.gate_mode,
                             strength=strength, name="cfg_conditional"):
@@ -114,6 +119,8 @@ def generate(backend, prompt: str, mode: str | None = None, *, width=1024, heigh
         latents = latents+velocity.float()*(sigma_next-sigma)
         if not bool(torch.isfinite(latents).all()):
             raise FloatingPointError("Nonfinite Gen2 sampling latent")
+        if progress_callback is not None:
+            progress_callback(completed_steps, total_steps)
     pixels = model.decode_latents(latents, device=model.device_torch, dtype=model.torch_dtype)
     pixels = ((pixels.float().clamp(-1., 1.)+1.)*127.5).round().to(torch.uint8)
     image = Image.fromarray(pixels.permute(0, 2, 3, 1)[0].cpu().numpy())

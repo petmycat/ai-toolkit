@@ -373,7 +373,9 @@ def resolve_process_config(raw):
     if train["dtype"] not in ("bf16", "bfloat16", "fp16", "float16", "fp32", "float32"):
         raise ConfigError("train.dtype must be bf16, fp16, or float32 (native aliases allowed)")
     token_limit = cfg["model"]["model_kwargs"]["max_text_length"]
-    _validate_leaf(token_limit, L(2048, minimum=2, maximum=2048), "model.model_kwargs.max_text_length")
+    # User-approved 2026-09-16 override: allow the native Ideogram cap while
+    # retaining complete captions, the shared suffix reservation and errors.
+    _validate_leaf(token_limit, L(2048, minimum=2, maximum=3072), "model.model_kwargs.max_text_length")
     if gen["conditioning"]["num_tokens"] >= token_limit: raise ConfigError("num_tokens must be less than the total max_text_length")
     dg = gen["diagnostics"]
     if dg["gradient_probe_examples"] > dg["probes"]["num_examples"]:
@@ -411,6 +413,7 @@ def resolve_process_config(raw):
     _native_compatibility(cfg)
     cfg["_gen2_resolved"] = {"family_horizons": horizons, "scheduler_kwargs": scheduler_args,
         "optimizer_support": "user-approved initial standard-native subset", "trainable_master_dtype": "float32",
+        "text_token_limit_policy": "user-approved maximum 3072; default 2048; overflow remains error",
         "ablations": [f"losses.{key}=0" for key, value in gen["losses"].items() if value == 0]
                      + [f"phases.{key}=0" for key, value in gen["phases"].items() if key.endswith("_updates") and value == 0],
         "native_schema_validation": "deferred to the native process configuration constructors; no model imports during config-only validation"}

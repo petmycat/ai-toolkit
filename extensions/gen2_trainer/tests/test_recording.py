@@ -241,6 +241,7 @@ def test_summary_export_excludes_weights_and_preserves_mandatory_probes(tmp_path
     packet = load_fixed_probe_packet(run / "fixed_probe")
     assert packet["manifest"]["examples"][0]["sample_id"] == "x"
     (run / "fixed_probe_packet.pt").write_bytes(b"legacy-native-packet")
+    (run / "caption_token_report.json").write_text('{"passed":false,"failures":[{"over_by":11}]}')
     (run / "checkpoints").mkdir()
     (run / "checkpoints" / "weights.safetensors").write_bytes(b"exclude")
     (run / "samples").mkdir(exist_ok=True)
@@ -256,6 +257,7 @@ def test_summary_export_excludes_weights_and_preserves_mandatory_probes(tmp_path
     with zipfile.ZipFile(archive) as zipped:
         assert "fixed_probe/latents.safetensors" in zipped.namelist()
         assert "fixed_probe_packet.pt" in zipped.namelist()
+        assert json.loads(zipped.read("caption_token_report.json"))["failures"][0]["over_by"] == 11
         assert not any("weights.safetensors" in name or name.endswith("preview.png") for name in zipped.namelist())
 
 

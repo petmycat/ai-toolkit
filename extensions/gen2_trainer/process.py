@@ -82,6 +82,7 @@ class Gen2Runner:
         from .engine import Gen2Engine
         from .evaluation import Evaluation
         from .provenance import environment_manifest, frozen_state_hash
+        from .text_preflight import load_tokenizer, build_token_report, require_token_report
 
         config = self.config
         resume = config["gen2"]["checkpoint"]["resume_from"]
@@ -114,6 +115,14 @@ class Gen2Runner:
         self.logger = create_logger(native["logging"], json_safe(config, redact=True), str(self.save_root))
         manifest = preflight_datasets(config)
         self.recorder.event("dataset_preflight_passed", images=len(manifest))
+        tokenizer = load_tokenizer(config)
+        token_report = build_token_report(config, manifest, tokenizer)
+        report_path = write_json(self.root / "caption_token_report.json", token_report)
+        self.recorder.event("caption_preflight", passed=token_report["passed"],
+            captions_checked=token_report["captions_checked"], failures=len(token_report["failures"]),
+            original_token_budget=token_report["original_token_budget"], report=str(report_path))
+        require_token_report(token_report, report_path)
+        del tokenizer
         model = Ideogram4Model(config["device"], native["model"], dtype=config["train"]["dtype"])
         model.load_model()
         model.noise_scheduler.set_train_timesteps(config["train"]["num_train_timesteps"],

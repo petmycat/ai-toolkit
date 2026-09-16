@@ -27,6 +27,17 @@ class ConfigurationTests(unittest.TestCase):
             "assert 'transformers' not in sys.modules"], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_approved_larger_text_budget_preserves_explicit_overflow_policy(self):
+        self.assertEqual(resolve_process_config({})["model"]["model_kwargs"]["max_text_length"], 2048)
+        cfg = resolve_process_config({"model": {"model_kwargs": {"max_text_length": 3072}}})
+        self.assertEqual(cfg["model"]["model_kwargs"]["max_text_length"], 3072)
+        self.assertEqual(cfg["gen2"]["conditioning"]["overflow_policy"], "error")
+        for invalid in (3073, 0, True, 3072.0):
+            with self.subTest(limit=invalid), self.assertRaisesRegex(ConfigError, "max_text_length"):
+                resolve_process_config({"model": {"model_kwargs": {"max_text_length": invalid}}})
+        with self.assertRaises(ConfigError):
+            resolve_process_config({"gen2": {"conditioning": {"overflow_policy": "truncate"}}})
+
     def test_unconditional_visual_modes_require_cfg_and_are_opt_in(self):
         from extensions.gen2_trainer.__main__ import parser
         modes = ["base_with_tokens", "base_with_conditioning", "encoder_adapter_off",

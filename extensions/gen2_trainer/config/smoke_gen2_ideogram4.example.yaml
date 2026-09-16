@@ -79,7 +79,7 @@ config:
       unconditional_lora_path: null
       model_kwargs:
         text_encoder_path: Qwen/Qwen3-VL-8B-Instruct
-        max_text_length: 2048
+        max_text_length: 2048  # Total original + M soft positions; may be raised to 3072, overflow still errors.
     save:
       dtype: float32
       save_every: 1

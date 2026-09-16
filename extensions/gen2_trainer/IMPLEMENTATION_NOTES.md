@@ -36,6 +36,21 @@ The user approved these decisions in this task before authorizing implementation
    the reference's mandatory boundary/milestone image scheduling. Numerical
    boundary probes and protected checkpoint saves retain their original rules.
    The user's 12-update smoke uses `sample_every: 6`, producing images at 0/6/12.
+6. On 2026-09-16 the user approved a 3,072-position total text budget after a
+   complete 2,055-token training caption plus four learned positions exceeded
+   the original 2,048 limit. The configurable maximum is now 3,072, matching
+   this checkout's native Ideogram default. The default remains 2,048 for
+   existing configs. This supersedes only the reference's upper bound:
+   `overflow_policy: error`, complete chat serialization, identical neutral and
+   styled prefixes, and the M-position reservation remain enforced. The
+   immutable specification remains unchanged. Longer inputs need more compute
+   and memory; the new budget still requires real VM acceptance.
+
+Caption preflight uses the same digest, chat template and non-truncating
+tokenization as the encoder. It checks every source caption, held-out caption
+and enabled sampling prompt before model weights or latent caches load, reports
+all offending paths together, and saves `caption_token_report.json` in the run
+output. The `check-captions` CLI exposes this check with tokenizer files only.
 
 ## Inventory recorded before implementation
 
