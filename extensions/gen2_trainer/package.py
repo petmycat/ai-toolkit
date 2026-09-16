@@ -66,7 +66,8 @@ def load_package(checkpoint_path, *, device=None) -> LoadedPackage:
     from .config import resolve_process_config, SPEC_SHA256
     from .diagnostics import isolated_rng
     from .process import native_configuration
-    from .provenance import frozen_state_hash
+    from .provenance import frozen_model_hashes
+    from .original_unconditional import load_original_unconditional
     checkpoint_path = Path(checkpoint_path).expanduser().resolve()
     manifest = load_manifest(checkpoint_path, expected_spec_sha256=SPEC_SHA256)
     metadata = manifest["metadata"]
@@ -84,10 +85,8 @@ def load_package(checkpoint_path, *, device=None) -> LoadedPackage:
     with isolated_rng(config["gen2"]["execution"]["training_seed"]):
         model = Ideogram4Model(config["device"], native["model"], dtype=config["train"]["dtype"])
         model.load_model()
-        identities = {name: frozen_state_hash(component) for name, component in
-                      (("diffusion", model.transformer), ("text_encoder", model.text_encoder), ("vae", model.vae))}
-        unconditional = getattr(model, "unconditional_lora", None)
-        identities["unconditional_lora"] = frozen_state_hash(unconditional) if unconditional is not None else None
+        load_original_unconditional(model, config["gen2"])
+        identities = frozen_model_hashes(model)
         backend = Ideogram4Backend.from_native(model, config["gen2"], config["network"],
             config["trigger_word"], gradient_checkpointing=config["train"]["gradient_checkpointing"])
         expected = {"model_identities": identities, "tokenizer_identity": tokenizer_identity(model),

@@ -6,8 +6,9 @@
 loop, where a complete 2,055-token caption plus four learned positions exceeded
 the configured 2,048-position budget. Full VM acceptance remains incomplete.**
 
-**Local verification: 150 tests passed**, including caption preflight, the
-approved 3,072-token cap, and visible sampling progress.
+**Local verification: 202 tests passed**, including caption preflight, the
+approved 3,072-token cap, visible sampling progress and the new original
+unconditional-model backend.
 
 The user will manually run the smoke and actual configurations on an RTX PRO
 6000 with 96 GB VRAM, using the VM's existing ai-toolkit dependencies, weights
@@ -24,7 +25,7 @@ packages are absent, including bitsandbytes. The tests use CPU tensors.
 
 ```text
 python -B -m pytest extensions/gen2_trainer/tests -q -p no:cacheprovider
-150 passed in 4.98s
+202 passed in 6.58s
 ```
 
 For the native config-file parsing test, `oyaml==1.0` was installed with
@@ -35,6 +36,32 @@ that single parsing test explicitly skips; ordinary VM dependencies provide it.
 
 ## What these tests establish
 
+### Original unconditional transformer for retry2
+
+The user approved enabling the original separate unconditional model before
+retry2. Native loading tests execute the checked-out loader, FP8 scale
+reconstruction and strict state-loading methods against tiny CPU tensors.
+They verify component selection, required/missing/unexpected keys, native
+placement-policy forwarding, frozen state, alias/meta rejection and training
+RNG restoration. The actual large gated checkpoint was not loaded locally;
+its strict weight-key compatibility is still a VM acceptance point.
+
+Backend tests exercise the actual native LoRA factors and tiny native
+transformers, checking the shared residual equation, 0/0.5/1 strengths, block
+gates, live parameter changes and conditional versus unconditional routing.
+The unconditional bindings add no registered parameters or serialized state.
+They require image-only inference and restore branch state after exceptions.
+Lifecycle tests execute initialization ordering, frozen quantizer-buffer
+mutation detection and complete package reload. A wrong original-model identity
+fails before any personalization masters are restored. Existing packages and
+null-default resume contracts retain the previous behavior.
+
+The private retry2 config enables `ideogram-ai/ideogram-4-fp8` as the original
+unconditional source and leaves the native correction LoRA null. Native YAML
+parsing and strict Gen2 resolution pass. Both tracked example configs expose
+the new nullable field explicitly. GPU quantization, peak memory, actual
+`adamw8bit` updates and the resulting image quality remain for the VM run.
+
 ### Retry1 caption overflow and the approved larger budget
 
 The retry1 traceback entered `engine.step` rather than failing in initialization
@@ -44,8 +71,9 @@ policy, but discovering it after initial sampling wasted work.
 
 The user approved allowing a total text budget of 3,072 while keeping overflow
 errors. This is the native Ideogram integration's default cap; the Gen2 default
-remains 2,048 for existing configs. The private retry2 config changes only the
-run name and total text cap. Neither immutable specification copy was changed.
+remains 2,048 for existing configs. The private retry2 config changes the run
+name and total text cap, and now enables the separately approved original
+unconditional model. Neither immutable specification copy was changed.
 
 Startup now checks all training and held-out captions and enabled sample prompts
 using the same non-truncating caption/chat serializer as the encoder, before
@@ -108,7 +136,7 @@ changes.
 - Native extension discovery finds the new lazy `gen2_trainer` registration.
   Unrelated optional extensions are filtered in that test; it does not load the
   complete production launcher dependency tree locally.
-- All 90 Gen2 schema leaves enforce their types and constraints. Both actual and
+- All 91 Gen2 schema leaves enforce their types and constraints. Both actual and
   smoke YAMLs contain every leaf. Native config parsing resolves environment/name
   substitutions and scientific notation without importing Torch or model code.
 - Float64 normalized-token Jacobian/VJP and finite differences agree. Vocabulary

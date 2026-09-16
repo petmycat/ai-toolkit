@@ -9,6 +9,7 @@ from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 import math
+import weakref
 
 import torch
 from torch.utils.checkpoint import checkpoint
@@ -146,20 +147,87 @@ def make_gated_lora_class(native_lora_class, branch_variable, diagnostic_variabl
             if state is None:
                 raise RuntimeError("Gen2 diffusion prediction requires an explicit branch context")
             base = self.org_forward(x, *args, **kwargs)
-            if not state.enabled or not self.network_ref().is_active or state.strength == 0:
-                return base
-            residual = native_lora_residual(self, x, base.dtype)
-            gate = state.gate_values[:, self.gen2_block_id].to(residual.device)
-            if gate.shape[0] != residual.shape[0]:
-                raise RuntimeError("Gate batch and native projection batch disagree")
-            applied = residual*gate.reshape(gate.shape[0], *([1]*(residual.ndim-1)))*state.strength
-            diagnostic = diagnostic_variable.get()
-            if diagnostic is not None and not RECOMPUTING.get() and id(self) not in state.observed:
-                state.observed.add(id(self))
-                callback, regions = diagnostic
-                callback(self, dequantize_projection_input(x.detach()), base.detach(), residual.detach(), applied.detach(), regions)
-            return base+applied.to(base.dtype)
+            return _gated_projection(self, x, base, state, diagnostic_variable)
     return GatedDiffusionLoRA
+
+
+def _gated_projection(adapter, x, base, state, diagnostic_variable):
+    """One residual equation for both backbones, using the live native factors."""
+    if not state.enabled or not adapter.network_ref().is_active or state.strength == 0:
+        return base
+    residual = native_lora_residual(adapter, x, base.dtype)
+    gate = state.gate_values[:, adapter.gen2_block_id].to(residual.device)
+    if gate.shape[0] != residual.shape[0]:
+        raise RuntimeError("Gate batch and native projection batch disagree")
+    applied = residual*gate.reshape(gate.shape[0], *([1]*(residual.ndim-1)))*state.strength
+    diagnostic = diagnostic_variable.get()
+    if diagnostic is not None and not RECOMPUTING.get() and id(adapter) not in state.observed:
+        state.observed.add(id(adapter))
+        callback, regions = diagnostic
+        callback(adapter, dequantize_projection_input(x.detach()), base.detach(), residual.detach(), applied.detach(), regions)
+    return base+applied.to(base.dtype)
+
+
+def bind_unconditional_lora(transformer, diffusion_network, branch_variable, diagnostic_variable):
+    """Bind every original-unconditional projection to the existing LoRA factors.
+
+    Only forwards are wrapped. No parameters/modules are registered on the
+    frozen model and no factor copies, merges or synchronization steps exist.
+    Validate the entire mapping before replacing any forward.
+    """
+    expected = {f"layers.{block}.{projection}": block
+                for block in range(len(transformer.layers)) for projection in DIFFUSION_PROJECTIONS}
+    adapters = {}
+    for adapter in diffusion_network.unet_loras:
+        path = adapter.gen2_original_path
+        if path in adapters or path not in expected or adapter.gen2_block_id != expected[path]:
+            raise ValueError(f"Invalid or duplicate original unconditional LoRA mapping: {path}")
+        adapters[path] = adapter
+    if set(adapters) != set(expected):
+        raise ValueError(f"Missing original unconditional LoRA mappings: {sorted(set(expected)-set(adapters))}")
+    bindings, seen = [], set()
+    for path, block in expected.items():
+        adapter = adapters[path]
+        try:
+            target = transformer.get_submodule(path)
+        except AttributeError as error:
+            raise ValueError(f"Missing original unconditional projection: {path}") from error
+        source = adapter.orig_module_ref()
+        if source is None or target is source or id(target) in seen:
+            raise ValueError(f"Aliased original unconditional projection: {path}")
+        if hasattr(target, "_gen2_shared_lora"):
+            raise ValueError(f"Original unconditional projection already bound: {path}")
+        shape = (getattr(target, "out_features", None), getattr(target, "in_features", None))
+        if shape != (source.out_features, source.in_features):
+            raise ValueError(f"Original unconditional projection shape mismatch at {path}: {shape}")
+        seen.add(id(target))
+        bindings.append((path, block, target, adapter))
+    records = []
+    for path, block, target, adapter in bindings:
+        original_forward, adapter_ref = target.forward, weakref.ref(adapter)
+
+        def forward(x, *args, original_forward=original_forward, adapter_ref=adapter_ref, **kwargs):
+            state = branch_variable.get()
+            if state is None or not state.unconditional:
+                raise RuntimeError("Original unconditional projection requires an unconditional branch context")
+            if torch.is_grad_enabled():
+                raise RuntimeError("Original unconditional model is inference-only; use torch.no_grad")
+            source_adapter = adapter_ref()
+            if source_adapter is None:
+                raise RuntimeError("Original unconditional projection lost its shared diffusion LoRA")
+            base = original_forward(x, *args, **kwargs)
+            return _gated_projection(source_adapter, x, base, state, diagnostic_variable)
+
+        target.forward = forward
+        target._gen2_shared_lora = adapter_ref
+        records.append({"family": "diffusion", "branch": "unconditional",
+            "original_path": "unconditional_transformer."+path,
+            "block_id": block, "shape": [target.out_features, target.in_features],
+            "rank": adapter.lora_dim, "alpha": float(adapter.alpha),
+            "native_key": adapter.lora_name, "shared_with_native_key": adapter.lora_name,
+            "parameter_count": 0, "dtype": str(adapter.lora_down.weight.dtype),
+            "device": str(adapter.lora_down.weight.device), "frozen_base": True})
+    return records
 
 
 def _resolved_targets(root, paths, role, rank, alpha):
@@ -185,6 +253,8 @@ class Ideogram4Backend:
         from extensions_built_in.diffusion_models.ideogram4.ideogram4 import Ideogram4Model
         model = Ideogram4Model(device=device, model_config=model_config, dtype=dtype)
         model.load_model()
+        from .original_unconditional import load_original_unconditional
+        load_original_unconditional(model, gen2_config)
         return cls.from_native(model, gen2_config, network_config, trigger_word, gradient_checkpointing)
 
     @classmethod
@@ -206,6 +276,12 @@ class Ideogram4Backend:
         self.native_features = get_qwen3_vl_features
         self.gradient_checkpointing = gradient_checkpointing
         self.encoder_checkpointing = gen2_config["execution"]["encoder_gradient_checkpointing"]
+        original_unconditional = getattr(model, "unconditional_transformer", None)
+        requested_unconditional = gen2_config["inference"].get("unconditional_model_path")
+        if bool(requested_unconditional) != (original_unconditional is not None):
+            raise ValueError("Original unconditional model configuration and loaded component disagree")
+        if original_unconditional is model.transformer:
+            raise ValueError("Original unconditional model must be a separate transformer instance")
         self._branch = ContextVar(f"gen2_branch_{id(self)}", default=None)
         self._diagnostic = ContextVar(f"gen2_diagnostic_{id(self)}", default=None)
         # Native block checkpointing keeps its forward/arguments. This callback
@@ -213,7 +289,16 @@ class Ideogram4Backend:
         model.transformer._gradient_checkpointing_func = self._checkpoint
         for component in (model.transformer, model.text_encoder, model.vae):
             component.eval().requires_grad_(False)
+        if original_unconditional is not None:
+            original_unconditional.eval().requires_grad_(False)
+            original_unconditional.disable_gradient_checkpointing()
+            original_unconditional.set_attention_backend(gen2_config["execution"]["dit_attention_backend"])
+            for key in ("in_channels", "emb_dim", "num_heads", "llm_features_dim"):
+                if getattr(original_unconditional.config, key) != getattr(model.transformer.config, key):
+                    raise ValueError(f"Original unconditional architecture differs at {key}")
         uncond = getattr(model, "unconditional_lora", None)
+        if original_unconditional is not None and uncond is not None:
+            raise ValueError("Original unconditional model cannot be combined with an unconditional correction LoRA")
         if uncond is not None:
             uncond.eval().requires_grad_(False)
             uncond.is_active = False
@@ -272,10 +357,17 @@ class Ideogram4Backend:
             return net
         self.diffusion_network = create_native(model.transformer, self._diffusion_targets, rank, alpha,
             make_gated_lora_class(LoRAModule, self._branch, self._diagnostic), model)
+        self._unconditional_mapping = (bind_unconditional_lora(original_unconditional,
+            self.diffusion_network, self._branch, self._diagnostic) if original_unconditional is not None else [])
+        if self._unconditional_mapping:
+            print(f"[Gen2] Original unconditional transformer: {len(self._unconditional_mapping)} projections "
+                  "share the live diffusion LoRA parameters and time gates", flush=True)
         self.text_network = create_native(language_model, self._text_targets, c["adapter_rank"], c["adapter_alpha"],
                                          make_masked_lora_class(LoRAModule))
         # Native adapters live outside the frozen modules' parameter registration.
-        self._frozen_parameters = tuple(p for m in (model.transformer, model.text_encoder, model.vae) for p in m.parameters())
+        frozen = [model.transformer, model.text_encoder, model.vae]
+        frozen.extend(component for component in (original_unconditional, uncond) if component is not None)
+        self._frozen_parameters = tuple(p for m in frozen for p in m.parameters())
 
     def parameter_families(self):
         return {"diffusion": list(self.diffusion_network.parameters()), "embedding": list(self.tokens.parameters()),
@@ -296,7 +388,7 @@ class Ideogram4Backend:
                 if entry["family"] == "text_adapter":
                     entry["original_path"] = "language_model."+entry["original_path"]
                 records.append(entry)
-        return records
+        return records + getattr(self, "_unconditional_mapping", [])
 
     def assert_frozen(self):
         if any(p.requires_grad for p in self._frozen_parameters):
@@ -472,6 +564,9 @@ class Ideogram4Backend:
             raise ValueError("Branch tau must be a finite batch vector in [0,1]")
         if not math.isfinite(strength) or strength < 0:
             raise ValueError("Branch LoRA strength must be finite and nonnegative")
+        original_unconditional = getattr(self.model, "unconditional_transformer", None)
+        if unconditional and original_unconditional is not None and torch.is_grad_enabled():
+            raise ValueError("Original unconditional model is inference-only; use torch.no_grad")
         if unconditional and lora_enabled:
             if not allow_unconditional_lora:
                 raise ValueError("CFG unconditional personalization requires explicit inference opt-in")
@@ -481,6 +576,8 @@ class Ideogram4Backend:
         state = DiffusionBranch(tau, self.gates.values(tau, gate_mode), bool(lora_enabled),
                                 float(strength), bool(unconditional), name)
         uncond = getattr(self.model, "unconditional_lora", None)
+        if original_unconditional is not None and uncond is not None:
+            raise ValueError("Original unconditional model cannot be combined with an unconditional correction LoRA")
         old_uncond = uncond.is_active if uncond is not None else None
         old_active = self.diffusion_network.is_active
         self.diffusion_network.is_active = bool(lora_enabled)
@@ -510,7 +607,16 @@ class Ideogram4Backend:
             raise RuntimeError("Predict must run inside backend.branch through its backward")
         if not torch.equal(state.tau.to(tau.device), tau):
             raise ValueError("Prediction tau differs from its bound gate/branch context")
-        self._ensure_native_device(self.model.transformer, "transformer")
+        transformer = self.model.transformer
+        component_name = "transformer"
+        if state.unconditional and getattr(self.model, "unconditional_transformer", None) is not None:
+            if torch.is_grad_enabled():
+                raise RuntimeError("Original unconditional prediction is inference-only; use torch.no_grad")
+            if any(feature.shape[0] != 0 for feature in conditioning.features):
+                raise ValueError("Original unconditional prediction requires image-only conditioning with zero text tokens")
+            transformer = self.model.unconditional_transformer
+            component_name = "unconditional_transformer"
+        self._ensure_native_device(transformer, component_name)
         features, mask = self.pad_text_features(conditioning.features, self.model.device_torch, self.model.torch_dtype)
         current = self._diagnostic.get()
         token = None
@@ -528,7 +634,7 @@ class Ideogram4Backend:
                                                      "image": image, "padding": padding}))
         try:
             # Native helper owns both reversed model time and velocity negation.
-            result = self.predict_velocity(self.model.transformer,
+            result = self.predict_velocity(transformer,
                 latents.to(self.model.device_torch, self.model.torch_dtype), tau, features, mask)
             if torch.is_grad_enabled() and result.requires_grad:
                 state.started_components.add("transformer")

@@ -47,6 +47,20 @@ def resolve_route(mode: str | None, trigger_present: bool,
     return routes[mode]
 
 
+def unconditional_backend_metadata(backend):
+    """Identify the loaded CFG base independently of personalization strength."""
+    model = backend.model
+    original = getattr(model, "unconditional_transformer", None) is not None
+    correction = getattr(model.model_config, "unconditional_lora_path", None)
+    kind = ("original_transformer" if original else
+            "conditional_with_frozen_adapter" if correction else "conditional_transformer")
+    return {"unconditional_backend": kind,
+            "unconditional_model_source": backend.config["inference"].get("unconditional_model_path") if original else None,
+            "unconditional_model_component": "unconditional_transformer" if original else "transformer",
+            "unconditional_adapter": correction,
+            "unconditional_personalization_parameter_source": "diffusion"}
+
+
 @torch.no_grad()
 def generate(backend, prompt: str, mode: str | None = None, *, width=1024, height=1024,
              seed=42, steps=30, guidance=7., strength=None, gate_mode="learned",
@@ -140,5 +154,5 @@ def generate(backend, prompt: str, mode: str | None = None, *, width=1024, heigh
         "unconditional_image_only": True, "unconditional_text_tokens": 0,
         "unconditional_embedding_enabled": False, "unconditional_text_adapter_enabled": False,
         "unconditional_personalization_lora": route.unconditional_lora_strength > 0,
-        "unconditional_adapter": model.model_config.unconditional_lora_path}
+        **unconditional_backend_metadata(backend)}
     return image, metadata

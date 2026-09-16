@@ -232,6 +232,43 @@ complete weight identity checked. `--strength 0` leaves triggered learned condit
 present; it also leaves the explicitly requested `full_uncond_*` strength in effect.
 Use `--mode base` for a base comparison.
 
+### Original unconditional transformer
+
+To run CFG with Ideogram's separate original unconditional weights, set:
+
+```yaml
+model:
+  unconditional_lora_path: null
+gen2:
+  inference:
+    unconditional_model_path: "ideogram-ai/ideogram-4-fp8"
+```
+
+The new path is a model repository ID or local repository root containing
+`unconditional_transformer/`. It uses the native strict loader and the same
+transformer dtype, quantization and offload settings as the conditional model.
+The original unconditional weights stay frozen and run only during CFG sampling.
+All training students and the neutral teacher still use the conditional model.
+
+For `full`, `full_uncond_half` and `full_uncond_full`, the image-only model uses
+the same live trained diffusion LoRA factors at strengths 0, 0.5 and 1.0. Each
+residual is evaluated on that model's own activations, with the current shared
+time gates. There is no second trainable LoRA or optimizer. Checkpoint reloads
+restore the one diffusion parameter set used by both models.
+
+The original model cannot be combined with a native unconditional correction
+LoRA. The default `unconditional_model_path: null` preserves existing behavior:
+the image-only pass reuses the conditional backbone, optionally with the frozen
+native correction adapter. Samples record which backend and source were used;
+checkpoints verify the complete frozen original model identity when enabled.
+The original weights load again from their source when restoring a package;
+they are not duplicated inside each checkpoint.
+
+The user's retry2 config enables this original model. Local CPU tests cover
+branch routing, shared factors and strict reload identity; the full quantized
+model still needs the user's VM smoke run. More VRAM is required for the second
+backbone, and its component may need downloading if it is not cached on the VM.
+
 See the [visual diagnostics and plain-language parameter guide](docs/visual_diagnostics.md)
 for the six matched comparisons, an embedding-off reference, and configuration advice.
 These extra experiments are opt-in; existing default mode lists remain unchanged.

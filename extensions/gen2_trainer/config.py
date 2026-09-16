@@ -82,7 +82,8 @@ SCHEMA = {
     },
     "gates": {"amplitude": L(0.5, "unit_open"), "regularization_grid_points": L(65, minimum=5)},
     "inference": {"missing_trigger_policy": L("learned_neutral", choices=("learned_neutral", "base_bypass")),
-                  "lora_strength": L(1.0, minimum=0)},
+                  "lora_strength": L(1.0, minimum=0),
+                  "unconditional_model_path": L(None, "str", nullable=True)},
     "data": {"content_groups_file": L(None, "str", nullable=True), "reject_train_validation_duplicates": L(True)},
     "diagnostics": {
         "enabled": L(True, choices=(True,)), "activation_every": L(100, minimum=1),
@@ -277,6 +278,9 @@ def _native_compatibility(cfg):
     if "attention_backend" in train and train["attention_backend"] != cfg["gen2"]["execution"]["dit_attention_backend"]:
         errors.append("train.attention_backend conflicts with gen2.execution.dit_attention_backend")
     for key in ("compile", "block_compile"): _must(model, key, False, "model", errors)
+    if (cfg["gen2"]["inference"]["unconditional_model_path"] is not None
+            and model.get("unconditional_lora_path") is not None):
+        errors.append("gen2.inference.unconditional_model_path and model.unconditional_lora_path are mutually exclusive; choose the original unconditional transformer or the native correction adapter")
     for key in ("is_v2", "is_xl", "is_pixart", "is_pixart_sigma", "is_auraflow", "is_v3", "is_flux", "is_lumina2",
                 "is_ssd", "is_vega", "is_v_pred", "use_flux_cfg", "experimental_xl", "attn_masking", "split_model_over_gpus", "in_context"):
         _must(model, key, False, "model", errors)

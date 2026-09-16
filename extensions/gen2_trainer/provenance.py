@@ -83,3 +83,18 @@ weight check after hashing only a sample.
             chunk = flat[offset:offset + elements].contiguous().cpu().view(torch.uint8)
             digest.update(chunk.numpy().tobytes())
     return digest.hexdigest()
+
+
+def frozen_model_hashes(model, exclude_parameters=()):
+    """Hash every frozen model, preserving legacy identities when no new model exists."""
+    excluded = tuple(exclude_parameters)
+    identities = {name: frozen_state_hash(module, excluded) for name, module in
+                  (("diffusion", model.transformer), ("text_encoder", model.text_encoder), ("vae", model.vae))}
+    correction = getattr(model, "unconditional_lora", None)
+    identities["unconditional_lora"] = frozen_state_hash(correction) if correction is not None else None
+    original = getattr(model, "unconditional_transformer", None)
+    if original is not None:
+        # Shared personalization adapters must live outside the original model's
+        # registered state. Every original parameter and quantizer buffer counts.
+        identities["unconditional_transformer"] = frozen_state_hash(original)
+    return identities

@@ -49,6 +49,10 @@ def resume_contract(config):
     result.pop("training_folder", None)
     result["gen2"]["checkpoint"]["resume_from"] = None
     result["gen2"]["spec_path"] = "immutable_sha256:" + SPEC_SHA256
+    # The additive None default preserves the pre-original-model contract.
+    # A configured source remains part of strict resume identity.
+    if result["gen2"]["inference"].get("unconditional_model_path") is None:
+        result["gen2"]["inference"].pop("unconditional_model_path", None)
     return result
 
 
@@ -81,7 +85,8 @@ class Gen2Runner:
         from .diagnostics import capture_rng_state, restore_rng_state
         from .engine import Gen2Engine
         from .evaluation import Evaluation
-        from .provenance import environment_manifest, frozen_state_hash
+        from .provenance import environment_manifest, frozen_model_hashes
+        from .original_unconditional import load_original_unconditional
         from .text_preflight import load_tokenizer, build_token_report, require_token_report
 
         config = self.config
@@ -125,12 +130,11 @@ class Gen2Runner:
         del tokenizer
         model = Ideogram4Model(config["device"], native["model"], dtype=config["train"]["dtype"])
         model.load_model()
+        load_original_unconditional(model, config["gen2"])
         model.noise_scheduler.set_train_timesteps(config["train"]["num_train_timesteps"],
             device=model.device_torch, timestep_type="linear")
         self.recorder.event("hashing_original_weights", method="full_native_serialized_state_streaming")
-        self.initial_frozen_hashes = {name: frozen_state_hash(module) for name, module in
-            (("diffusion", model.transformer), ("text_encoder", model.text_encoder), ("vae", model.vae))}
-        self.initial_frozen_hashes["unconditional_lora"] = frozen_state_hash(model.unconditional_lora) if getattr(model, "unconditional_lora", None) is not None else None
+        self.initial_frozen_hashes = frozen_model_hashes(model)
         self.backend = Ideogram4Backend.from_native(model, config["gen2"], config["network"],
             config["trigger_word"], gradient_checkpointing=config["train"]["gradient_checkpointing"])
         self.engine = Gen2Engine(config, self.backend, accelerator=accelerator, recorder=self.recorder)
@@ -269,16 +273,12 @@ class Gen2Runner:
             timing_includes_sampling_and_checkpoint_io=True, approximate_cuda_timing=True)
 
     def _verify_frozen(self):
-        from .provenance import frozen_state_hash
+        from .provenance import frozen_model_hashes
         if self.frozen_verified_at == self.engine.logical_update:
             return
         self.backend.assert_frozen()
         excluded = [p for parameters in self.backend.parameter_families().values() for p in parameters]
-        model = self.backend.model
-        hashes = {name: frozen_state_hash(module, excluded) for name, module in
-            (("diffusion", model.transformer), ("text_encoder", model.text_encoder), ("vae", model.vae))}
-        uncond = getattr(model, "unconditional_lora", None)
-        hashes["unconditional_lora"] = frozen_state_hash(uncond) if uncond is not None else None
+        hashes = frozen_model_hashes(self.backend.model, excluded)
         if hashes != self.initial_frozen_hashes:
             raise RuntimeError("Full original model state changed during Gen2 training")
         self.frozen_verified_at = self.engine.logical_update

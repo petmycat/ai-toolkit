@@ -232,14 +232,16 @@ class Ideogram4Model(BaseModel):
         text_encoder.requires_grad_(False)
         return tokenizer, text_encoder
 
-    def _load_transformer(self, base: str):
+    def _load_transformer(self, base: str, component: str = "transformer"):
+        if component not in ("transformer", "unconditional_transformer"):
+            raise ValueError(f"Unsupported Ideogram4 transformer component: {component}")
         dtype = self.torch_dtype
-        self.print_and_status_update("Loading transformer")
+        self.print_and_status_update(f"Loading {component}")
 
         transformer_config = Ideogram4Config()
         self.print_and_status_update("  - fetching transformer weights")
         state_dict = _load_component_state_dict(
-            base, "transformer", "diffusion_pytorch_model"
+            base, component, "diffusion_pytorch_model"
         )
         self.print_and_status_update("  - dequantizing transformer weights")
         state_dict = _dequantize_fp8_state_dict(

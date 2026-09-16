@@ -447,7 +447,7 @@ class Evaluation:
 
     def sample(self, update, modes, seeds, reasons, package_hash, component_hashes):
         from .diagnostics import isolated_rng
-        from .inference import generate
+        from .inference import generate, unconditional_backend_metadata
         from .provenance import code_identity
         from toolkit.config_modules import GenerateImageConfig
         options = self.config["sample"]
@@ -473,6 +473,9 @@ class Evaluation:
         total = len(pending)
         started = time.perf_counter()
         print(f"[Gen2 sampling] update {update}: {total} new image(s) to generate", flush=True)
+        backend_info = unconditional_backend_metadata(self.backend)
+        print(f"[Gen2 sampling] unconditional backend: {backend_info['unconditional_backend']} | "
+              f"source: {backend_info['unconditional_model_source'] or backend_info['unconditional_adapter'] or 'conditional backbone'}", flush=True)
         with isolated_rng(self.seed):
             for index, (prompt_id, settings, request) in enumerate(pending, start=1):
                 prompt, seed, mode = settings["prompt"], settings["seed"], settings["mode"]

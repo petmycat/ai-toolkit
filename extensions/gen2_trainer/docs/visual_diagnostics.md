@@ -88,18 +88,25 @@ half-strength route scales that block's ordinary LoRA residual by `0.5 × 1.2`.
 During warmup and refinement the gates are held at one; calibration can change
 their curves. Disabling the LoRA removes its residual completely.
 
-`model.unconditional_lora_path` is a separate native option for an already
-existing, frozen unconditional adapter. The reviewed smoke sets it to `null`.
-Keep it fixed across this experiment if using it in another run; it is not the
-new 0/0.5/1.0 control.
+The user's retry2 config sets
+`gen2.inference.unconditional_model_path: "ideogram-ai/ideogram-4-fp8"`.
+This loads Ideogram's **original separate unconditional transformer**. In plain
+terms, the prompt-aware model and image-only model each use their own original
+weights, and can both read the one style LoRA we are training. The second model
+stays frozen; adding it does not create a second training task. Its original
+weights use the same native quantization settings as the conditional model.
 
-**Current backend limitation:** both passes reuse the conditional transformer.
-With `unconditional_lora_path: null`, the image-only pass uses conditional
-backbone weights. A configured Ostris unconditional adapter approximates the
-separate original unconditional model on that same backbone; it does not load
-the original model itself. The existing six modes therefore test the chosen
-shared-backbone baseline. Testing the actual original unconditional model
-requires a separate backend addition; this has not been implemented.
+The path points to a model repository or local repository root containing the
+`unconditional_transformer/` folder. `model.unconditional_lora_path` must stay
+`null`: that separate native option loads an approximation of the unconditional
+model as a frozen correction adapter, and is mutually exclusive with the
+original model. Neither option is the new style-LoRA 0/0.5/1.0 control.
+
+If `gen2.inference.unconditional_model_path` is `null`, existing behavior is
+preserved: the image-only pass uses the conditional backbone, with the optional
+native correction adapter. Image JSON files and sampling logs identify the
+selected backend so comparisons cannot silently mix these setups. Original-model
+loading and sampling still require the retry2 VM run for production acceptance.
 
 Gen2's neutral preservation objective still receives a content caption. It does
 not constrain the zero-text unconditional model or directly optimize the CFG

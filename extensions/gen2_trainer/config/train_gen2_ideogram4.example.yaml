@@ -190,6 +190,7 @@ config:
           # To omit calibration as an ablation, set calibration_updates=0 and adjust train.steps.
 
         inference:
+          unconditional_model_path: null  # Opt in with ideogram-ai/ideogram-4-fp8 (repository root); keep native unconditional_lora_path null.
           missing_trigger_policy: "learned_neutral"  # learned_neutral|base_bypass; see Section 8.
           lora_strength: 1.0  # Float >=0; inference only. Training strength is exactly one.
           # strength=0 still leaves learned conditioning present when the trigger is present.

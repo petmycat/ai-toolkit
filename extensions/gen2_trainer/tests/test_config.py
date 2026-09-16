@@ -102,7 +102,7 @@ assert 'transformers' not in sys.modules
 
     def test_schema_leaf_coverage_and_validation(self):
         leaves = schema_leaves()
-        self.assertEqual(len(leaves), 90)
+        self.assertEqual(len(leaves), 91)
         for path in leaves:
             raw = {}
             node = raw
@@ -110,6 +110,18 @@ assert 'transformers' not in sys.modules
             for part in keys[:-1]: node = node.setdefault(part, {})
             node[keys[-1]] = object()
             with self.subTest(path=path), self.assertRaises(ConfigError): resolve_process_config(raw)
+
+    def test_original_unconditional_source_is_optional_and_excludes_correction_adapter(self):
+        self.assertIsNone(resolve_process_config({})["gen2"]["inference"]["unconditional_model_path"])
+        for source in ("ideogram-ai/ideogram-4-fp8", "/weights/ideogram4"):
+            resolved = resolve_process_config({"gen2": {"inference": {"unconditional_model_path": source}}})
+            self.assertEqual(resolved["gen2"]["inference"]["unconditional_model_path"], source)
+            with self.assertRaisesRegex(ConfigError, "mutually exclusive"):
+                resolve_process_config({"model": {"unconditional_lora_path": "correction.safetensors"},
+                    "gen2": {"inference": {"unconditional_model_path": source}}})
+        for source in ("", "   ", True, 123):
+            with self.subTest(source=source), self.assertRaises(ConfigError):
+                resolve_process_config({"gen2": {"inference": {"unconditional_model_path": source}}})
 
     def test_zero_stage_and_empty_scheduler_horizon(self):
         cfg = resolve_process_config({"train": {"steps": 2, "lr_scheduler": "cosine_with_restarts"},

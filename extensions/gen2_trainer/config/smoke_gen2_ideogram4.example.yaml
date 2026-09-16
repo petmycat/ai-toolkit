@@ -157,6 +157,7 @@ config:
         amplitude: 0.5
         regularization_grid_points: 65
       inference:
+        unconditional_model_path: null  # Optional original model repository root; mutually exclusive with native unconditional_lora_path.
         missing_trigger_policy: learned_neutral
         lora_strength: 1.0
       data:

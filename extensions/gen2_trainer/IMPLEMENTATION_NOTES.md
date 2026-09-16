@@ -52,6 +52,40 @@ and enabled sampling prompt before model weights or latent caches load, reports
 all offending paths together, and saves `caption_token_report.json` in the run
 output. The `check-captions` CLI exposes this check with tokenizer files only.
 
+### Original unconditional model: user-approved extension on 2026-09-16
+
+The user authorized the original separate unconditional backend before retry2,
+to test community reports that applying a conditional-trained LoRA to both
+models improves generation. `gen2.inference.unconditional_model_path` opts into
+the original `unconditional_transformer` component. A null default preserves
+existing behavior and legacy resume contracts. The private retry2 YAML selects
+`ideogram-ai/ideogram-4-fp8`; native `model.unconditional_lora_path` remains null.
+Config validation rejects selecting both the original model and its native
+correction-LoRA approximation.
+
+The new transformer is frozen and inference-only. D/A/G objectives, captioned
+teacher/student routing, all four trainable families and optimizer horizons
+remain unchanged. All five adapted projections per block on the original model
+read the exact existing diffusion LoRA parameter objects, with the same residual
+equation and gates. The factors operate on each backbone's own activations.
+There is no copy, merge or synchronization operation. Bindings are fully validated
+before attachment, and shared target manifest entries count zero new parameters.
+The image-only CFG branch still receives zero text positions and requires
+`torch.no_grad`; the existing 0/0.5/1.0 diagnostic modes select its style strength.
+
+Loading uses native strict state loading, FP8 scale reconstruction, dtype,
+quantization and offload policy. RNG isolation prevents this additional frozen
+model construction from changing the training adapters' initialization. The
+complete original model state, including quantizer buffers, joins frozen-state
+and package identity checks. Both models are loaded before initial hashes and
+adapter binding; package reloads verify identity before restoring any learned
+parameters. Samples record backend kind, source and shared parameter family.
+No original model weights are embedded into the personalization checkpoints.
+
+The immutable v1 reference remains unchanged. This approved extension changes
+inference backend selection; it does not assert that unconditional training is
+needed or that one diagnostic strength is better before reviewing VM results.
+
 ## Inventory recorded before implementation
 
 Reviewed checkout: `30c82a877455e152e8ab8af6a21e6d4aa2e35fa8`. The inspected
@@ -102,6 +136,11 @@ their existing behavior. Gen2 also rejects native cache-time removals and checks
 membership independently for each source and expanded resolution; a surviving
 copy at another resolution cannot hide a missing example. No dataset algorithm
 is forked.
+
+The native Ideogram `_load_transformer` accepts an optional component name,
+defaulting to the existing `transformer`. Gen2 selects `unconditional_transformer`
+through that seam; strict loading, FP8 handling and rotary setup stay native.
+Stock calls keep their original behavior.
 
 The native Ideogram transformer has one additional optional checkpoint callback
 (`_gradient_checkpointing_func`), falling back to the original torch function
