@@ -35,8 +35,11 @@ class ConfigurationTests(unittest.TestCase):
         for invalid in (3073, 0, True, 3072.0):
             with self.subTest(limit=invalid), self.assertRaisesRegex(ConfigError, "max_text_length"):
                 resolve_process_config({"model": {"model_kwargs": {"max_text_length": invalid}}})
+        truncated = resolve_process_config({"gen2": {"conditioning": {"overflow_policy": "truncate"}}})
+        self.assertEqual(truncated["gen2"]["conditioning"]["overflow_policy"], "truncate")
+        self.assertIn("overflow=truncate", truncated["_gen2_resolved"]["text_token_limit_policy"])
         with self.assertRaises(ConfigError):
-            resolve_process_config({"gen2": {"conditioning": {"overflow_policy": "truncate"}}})
+            resolve_process_config({"gen2": {"conditioning": {"overflow_policy": "skip"}}})
 
     def test_unconditional_visual_modes_require_cfg_and_are_opt_in(self):
         from extensions.gen2_trainer.__main__ import parser

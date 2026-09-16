@@ -2,13 +2,14 @@
 
 ## Status on 2026-09-16
 
-**The retry1 VM run progressed past initialization and reached the training
-loop, where a complete 2,055-token caption plus four learned positions exceeded
-the configured 2,048-position budget. Full VM acceptance remains incomplete.**
+**Retry2 preflight found one 3,233-token caption among 41 inputs, exceeding the
+3,072 total cap when four learned positions are reserved. It stopped before
+model loading. The user approved explicit token truncation for retry3; full
+VM acceptance remains incomplete.**
 
-**Local verification: 202 tests passed**, including caption preflight, the
-approved 3,072-token cap, visible sampling progress and the new original
-unconditional-model backend.
+**Local verification: 245 tests passed**, including explicit token truncation,
+paired conditioning and gradients, caption preflight, the approved 3,072-token
+cap, visible sampling progress and the original unconditional-model backend.
 
 The user will manually run the smoke and actual configurations on an RTX PRO
 6000 with 96 GB VRAM, using the VM's existing ai-toolkit dependencies, weights
@@ -25,7 +26,7 @@ packages are absent, including bitsandbytes. The tests use CPU tensors.
 
 ```text
 python -B -m pytest extensions/gen2_trainer/tests -q -p no:cacheprovider
-202 passed in 6.58s
+245 passed in 6.50s
 ```
 
 For the native config-file parsing test, `oyaml==1.0` was installed with
@@ -35,6 +36,36 @@ packages and the production environment were not upgraded. Without oyaml,
 that single parsing test explicitly skips; ordinary VM dependencies provide it.
 
 ## What these tests establish
+
+### Retry2 overflow and user-approved token truncation
+
+The user authorized token truncation while preserving human-written source
+captions. Retry3 keeps the first 3,068 tokens of an oversized serialized caption
+and appends all four learned embeddings on the styled path. The teacher and
+neutral student use the identical retained prefix. The complete source caption
+and serialized string are retained in provenance; source files are not rewritten.
+
+Shared-helper tests cover the reported 3,233-to-3,068 boundary, complete suffix
+reservation, unchanged shorter sequences, all training/validation/sampling
+sources, explicit success reporting, empty-input rejection and invalid budgets.
+Runtime tests exercise the actual encoder bridge, learned-token normalization,
+masked encoder adapters, checkpointed gradients, prefix verification, and the
+real generation function with CPU fixtures. They verify exact paired IDs,
+retained-length masks, suffix positions, gradients and image metadata. Error mode
+continues to reject oversized inputs before their embedding/encoder execution.
+
+A separate local-only check used cached Qwen tokenizer files on a synthetic
+structured caption: 4,231 full tokens became 3,068 retained tokens. The IDs
+matched the actual native tokenizer call with `truncation=True, max_length=3068`
+exactly. Full caption strings remained unchanged; no model weights were loaded
+or downloaded. This validates token-cut equivalence, not production GPU behavior.
+
+Native YAML parsing and strict Gen2 validation pass for both tracked examples
+and the private retry3 config. Comparing parsed retry2/retry3 configurations
+confirms that only the run name and overflow policy changed. The original
+unconditional model, 3,072 cap, four learned tokens, D9/E1/T1/G2 horizons and
+sampling interval of six remain intact. The private YAML stays ignored by Git
+and must be copied to the VM separately.
 
 ### Original unconditional transformer for retry2
 
@@ -76,7 +107,8 @@ name and total text cap, and now enables the separately approved original
 unconditional model. Neither immutable specification copy was changed.
 
 Startup now checks all training and held-out captions and enabled sample prompts
-using the same non-truncating caption/chat serializer as the encoder, before
+using the same complete caption/chat tokenization as the encoder, followed by
+the shared selected overflow policy, before
 model weights or latent caches load. `check-captions` exposes that scan separately
 using tokenizer files only. Reports retain every offending source path and are
 included in exported diagnostics. Tests check exact budget boundaries, unchanged

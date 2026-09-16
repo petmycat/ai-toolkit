@@ -46,20 +46,37 @@ python -m extensions.gen2_trainer check-captions CONFIG.yaml --output output/cap
 
 This loads tokenizer files only. Omit `--local-files-only` to allow fetching
 missing tokenizer files; it never loads model weights or creates latent caches.
-The JSON report contains source paths, complete serialized token lengths and
-every overflow, and the command returns a failure status if any input cannot fit.
+The JSON report contains source paths, full and retained token lengths, hashes
+of both token sequences, and every overflow or truncation. With `error`, an
+oversized input returns failure; with `truncate`, reported truncations are
+accepted. Invalid or empty token sequences still fail.
 Normal training runs the same check automatically before loading model weights
 and saves the report as `gen2/caption_token_report.json` under the run output.
 
 `model.model_kwargs.max_text_length` counts the full chat-wrapped caption plus
 the learned tokens. Its default remains 2,048; the user-approved maximum is now
 3,072. Four learned tokens leave 3,068 original positions at the larger budget.
-`overflow_policy: error` remains mandatory: no caption or learned position is
-silently removed. Unlike Gen2, the native Ideogram trainer truncates inputs above
-its configured cap (default 3,072). Longer Gen2 inputs increase compute/memory;
-the native model's ability to accept variable lengths does not establish equal
-quality at every length. Use a new run name after changing this setting because
-it changes the strict resume contract.
+`gen2.conditioning.overflow_policy` supports two explicit choices:
+
+- `error` (default): require the complete serialized caption and learned suffix
+  to fit; report all oversized inputs and stop before model loading.
+- `truncate`: retain the first `max_text_length - num_tokens` caption/chat tokens
+  and discard only the excess token tail. Teacher, neutral student and styled
+  student use exactly the same retained prefix; the styled path appends all
+  learned positions. Source caption files and their full text are preserved.
+
+Truncation follows the native tokenizer's right-side token-cut behavior, with
+the additional Gen2 suffix reservation. It does not summarize or rewrite the
+caption, split it into chunks, repair cut JSON, or restore removed chat endings.
+Startup prints every truncated source with its full length, retained length and
+discard count, and saves the complete report. Runtime conditioning metadata
+records the full sequence length/hash as well as the actual encoded token IDs.
+The user's retry3 config selects `truncate` with the 3,072-position total cap.
+
+Longer inputs increase compute and memory use. The native model's ability to
+accept variable lengths does not establish equal quality at every length.
+Changing the token budget or overflow policy changes the strict resume contract;
+use a new run name after either change.
 
 ### 2. Run the six-update smoke configuration
 

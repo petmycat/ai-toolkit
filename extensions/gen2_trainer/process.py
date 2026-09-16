@@ -125,6 +125,8 @@ class Gen2Runner:
         report_path = write_json(self.root / "caption_token_report.json", token_report)
         self.recorder.event("caption_preflight", passed=token_report["passed"],
             captions_checked=token_report["captions_checked"], failures=len(token_report["failures"]),
+            overflow_policy=config["gen2"]["conditioning"]["overflow_policy"],
+            truncation_count=token_report.get("truncation_count", 0),
             original_token_budget=token_report["original_token_budget"], report=str(report_path))
         require_token_report(token_report, report_path)
         del tokenizer

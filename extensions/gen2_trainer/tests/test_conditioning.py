@@ -159,6 +159,7 @@ class ConditioningMathTests(unittest.TestCase):
         tokenizer = FixtureTokenizer()
         backend = Ideogram4Backend.__new__(Ideogram4Backend)
         backend.trigger_word = "<s>"
+        backend.config = {"conditioning": {"overflow_policy": "error"}}
         backend.encoder_checkpointing = False
         backend._diagnostic = ContextVar("fixture_encode_diag", default=None)
         backend._branch = ContextVar("fixture_encode_branch", default=None)

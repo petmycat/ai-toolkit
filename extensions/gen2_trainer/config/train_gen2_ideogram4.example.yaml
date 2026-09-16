@@ -131,7 +131,7 @@ config:
           initializer_seed: 271828  # Same recipe/seed may be reused for every style.
           adapter_rank: 4  # Integer >=1 and <= each targeted projection's smaller dimension.
           adapter_alpha: 4.0  # Positive; applied exactly once as alpha/rank.
-          overflow_policy: "error"  # V1 only option; report overlength prompts instead of truncating.
+          overflow_policy: "error"  # error|truncate; truncate keeps the token prefix after reserving all learned positions, with a report.
           # Fixed v1: suffix after original chat tokens, all decoder MLP down_proj targets,
           # no vocabulary update, fixed forward norms, no target-style semantic anchor or cosine loss.
 

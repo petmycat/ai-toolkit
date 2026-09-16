@@ -116,7 +116,7 @@ config:
         initializer_seed: 271828
         adapter_rank: 4
         adapter_alpha: 4.0
-        overflow_policy: error
+        overflow_policy: error  # Optional truncate cuts excess tokens on the right, reserves the learned suffix, and reports every cut.
       losses:
         neutral_weight: 1.0
         text_adapter_weight: 0.0001

@@ -296,21 +296,34 @@ only 12 updates.
   encoder. **`adapter_alpha`** sets its scale relative to that rank. Rank 4 and
   alpha 4 give an alpha/rank factor of one.
 - **`overflow_policy: error`** requires the complete content prompt and suffix
-  to fit. **`model.model_kwargs.max_text_length`** is their combined position
-  limit, not a word count. The default is 2,048; the user-approved maximum is
-  3,072. With four learned tokens, those budgets leave 2,044 or 3,068 positions
-  for the complete original caption and chat wrapper. Gen2 never silently cuts
-  an oversized caption. The retry2 smoke uses 3,072; its reported 2,055-token
-  dining-room caption requires 2,059 positions with the learned suffix.
+  to fit. This remains the default for existing configs.
+- **`overflow_policy: truncate`** keeps the beginning of an oversized token
+  sequence and drops the excess from its end. The human-written caption file
+  stays unchanged. All captioned training branches see the same retained tokens,
+  and the styled branch still receives every learned suffix position. This is
+  a token cut, without a summary, rewritten description, or JSON repair.
+- **`model.model_kwargs.max_text_length`** is the combined caption/chat and
+  learned-suffix position limit, not a word count. The default is 2,048; the
+  user-approved maximum is 3,072. With four learned positions, retry3 retains
+  at most 3,068 caption/chat tokens. The reported 3,233-token caption therefore
+  discards 165 trailing tokens and appends all four learned positions, totaling
+  3,072 on the styled path. Shorter captions retain their full token sequences.
 
 Every run now checks all training captions, held-out captions and enabled
 sampling prompts before loading model weights or preparing latents. It saves
-`caption_token_report.json` with source paths, lengths and all overflow failures.
+`caption_token_report.json` with source paths, full/retained lengths, full/retained
+token hashes, every truncation and every unresolved failure. Startup also prints
+a truncation summary and one line per affected source. A successful truncation
+is recorded explicitly and training continues; an empty token sequence still
+fails. Image and training conditioning metadata keep `original_length` for the
+actual retained caption prefix and `untruncated_length` for its full original
+length. In the preflight report, `original_length` remains the full length and
+`encoded_length` is the retained length.
 To check without starting a run, use `python -m extensions.gen2_trainer
 check-captions CONFIG.yaml --output output/caption-token-report.json` from the
 repository root. Only tokenizer files are loaded. Adding `--local-files-only`
 requires those files to exist in the VM cache already. Changing the token budget
-changes the strict resume contract; start a new run name after this change.
+or overflow policy changes the strict resume contract; start a new run name.
 
 The original text encoder remains frozen even though its small Gen2 adapter
 trains. Thus native `train_text_encoder: false` is consistent with A updates.

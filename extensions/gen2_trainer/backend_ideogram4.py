@@ -18,7 +18,7 @@ from .conditioning import (Conditioning, LearnedTokenBank,
                            encoder_projection_scope, make_masked_lora_class, native_lora_residual,
                            dequantize_projection_input)
 from .gates import CubicTimeGates
-from .text_preflight import tokenize_caption, require_token_budget
+from .text_preflight import prepare_caption_tokens
 
 EXPECTED_ACTIVATION_LAYERS = (0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 35)
 DIFFUSION_PROJECTIONS = ("attention.qkv", "attention.o", "feed_forward.w1",
@@ -511,12 +511,12 @@ class Ideogram4Backend:
         device = language_model.embed_tokens.weight.device
         with torch.set_grad_enabled(gradients):
             for example_index, caption in enumerate(qs):
-                item = tokenize_caption(caption, self.trigger_word, self.model.tokenizer)
-                serialized, ids = item["serialized_text"], item["original_ids"]
-                m = self.tokens.U.shape[0] if styled else 0
                 # Reserve M for both paired routes, so C0 never accepts a sample C+ cannot represent.
                 reserve = self.tokens.U.shape[0]
-                require_token_budget(item, reserve, self.model.max_text_length)
+                item = prepare_caption_tokens(caption, self.trigger_word, self.model.tokenizer,
+                    reserve, self.model.max_text_length, self.config["conditioning"]["overflow_policy"])
+                serialized, ids = item["serialized_text"], item["original_ids"]
+                m = reserve if styled else 0
                 token_ids = torch.tensor([ids], device=device, dtype=torch.long)
                 original = language_model.embed_tokens(token_ids)
                 inputs = original
@@ -550,7 +550,7 @@ class Ideogram4Backend:
                 item.update(serialized_text=serialized, original_ids=ids, original_length=len(ids),
                             total_length=len(ids)+m, suffix_positions=list(range(len(ids), len(ids)+m)),
                             positions=list(range(len(ids)+m)), suffix_mask=suffix_mask[0].tolist(),
-                            overflow=False, token_mode=token_mode if styled else "absent",
+                            token_mode=token_mode if styled else "absent",
                             adapter_enabled=bool(styled and adapter_enabled))
                 metadata.append(item)
         if gradients and self._branch.get() is not None:

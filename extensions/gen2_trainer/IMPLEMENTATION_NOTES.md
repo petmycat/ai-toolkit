@@ -40,17 +40,45 @@ The user approved these decisions in this task before authorizing implementation
    complete 2,055-token training caption plus four learned positions exceeded
    the original 2,048 limit. The configurable maximum is now 3,072, matching
    this checkout's native Ideogram default. The default remains 2,048 for
-   existing configs. This supersedes only the reference's upper bound:
-   `overflow_policy: error`, complete chat serialization, identical neutral and
-   styled prefixes, and the M-position reservation remain enforced. The
+   existing configs. This approval initially superseded only the reference's
+   upper bound, retaining overflow errors. The later truncation approval below
+   additionally permits an explicit token cut. Identical neutral and styled
+   prefixes and the M-position reservation remain enforced. The
    immutable specification remains unchanged. Longer inputs need more compute
    and memory; the new budget still requires real VM acceptance.
 
-Caption preflight uses the same digest, chat template and non-truncating
-tokenization as the encoder. It checks every source caption, held-out caption
-and enabled sampling prompt before model weights or latent caches load, reports
-all offending paths together, and saves `caption_token_report.json` in the run
-output. The `check-captions` CLI exposes this check with tokenizer files only.
+Caption preflight and the encoder use the same digest, chat template, full
+tokenization and explicit overflow-policy helper. Preflight checks every source
+caption, held-out caption and enabled sampling prompt before model weights or
+latent caches load. It reports all failing or truncated paths together and saves
+`caption_token_report.json` in the run output. The `check-captions` CLI exposes
+this check with tokenizer files only.
+
+### Token truncation: user-approved extension on 2026-09-16
+
+Retry2 preflight found one 3,233-token caption among 41 inputs. With four learned
+positions it exceeded the 3,072 total cap by 165 tokens. The user rejected manual
+or AI rewriting of the human-written captions and explicitly authorized tokenizer
+truncation. `overflow_policy: truncate` now retains the first `limit - M` IDs
+after the existing native digest and chat serialization. This matches native
+right-side truncation at that reserved budget without rerendering or repairing
+the discarded JSON/chat ending. The default `error` behavior remains available.
+
+The exact retained IDs feed the teacher and both students; only the styled path
+appends all M learned embeddings. Lengths, positions, region masks and native
+prefix verification use retained lengths. Metadata preserves complete source
+strings and untruncated lengths/hashes alongside retained token IDs, hashes and
+discard counts. Preflight reports retain their original full-length fields and
+add explicit encoded lengths and truncation rows. Successful cuts emit console
+messages before model loading and the count is recorded in the preflight event.
+Truncation never turns an empty sequence or invalid budget into a valid input.
+
+The private retry3 YAML changes retry2's run name and selects `truncate`, preserving
+the original unconditional model, 3,072 cap, learned-token count, optimizer and
+sample settings. A fresh run name preserves retry2's failure evidence. Overflow
+policy is already part of the strict resume contract, so checkpoints cannot
+silently switch between complete-caption and truncated-caption behavior. The
+immutable v1 reference and source caption files remain unchanged.
 
 ### Original unconditional model: user-approved extension on 2026-09-16
 
