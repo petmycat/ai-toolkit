@@ -1,6 +1,11 @@
 import copy
 import unittest
 
+# Load native extensions before other tests temporarily patch sys.modules;
+# PyO3 tokenizers cannot be unloaded and initialized again in one interpreter.
+from tokenizers import Tokenizer, models, pre_tokenizers
+from transformers import PreTrainedTokenizerFast
+
 from extensions.gen2_trainer.v2.text import NativePromptCompiler, INTERNAL_MARKER
 
 
@@ -17,12 +22,14 @@ class FixtureTokenizer:
     def get_vocab(self):
         return dict(self.vocabulary)
 
-    def add_special_tokens(self, mapping, replace_additional_special_tokens=False):
-        for value in mapping["additional_special_tokens"]:
+    def add_tokens(self, tokens, special_tokens=False):
+        assert special_tokens
+        for value in tokens:
             token = str(value)
             self.vocabulary[token] = len(self.vocabulary)
             self.special.append(token)
             self.all_special_ids.append(self.vocabulary[token])
+        return len(tokens)
 
     def convert_tokens_to_ids(self, token):
         return self.vocabulary.get(token)
@@ -42,6 +49,36 @@ class FixtureTokenizer:
 
 
 class V2TextTests(unittest.TestCase):
+    def test_marker_registration_preserves_real_fast_tokenizer_native_tokens(self):
+        native_tokens = ["<unk>", "<begin>", "<end>", "<assistant>", "user", "A", "tiger", "room", "sky"]
+        raw = Tokenizer(models.WordLevel({value: index for index, value in enumerate(native_tokens)}, unk_token="<unk>"))
+        raw.pre_tokenizer = pre_tokenizers.Whitespace()
+        tokenizer = PreTrainedTokenizerFast(tokenizer_object=raw, unk_token="<unk>", bos_token="<begin>", eos_token="<end>")
+        tokenizer.add_tokens(["<assistant>"], special_tokens=True)
+        tokenizer.chat_template = "<begin>user\n{{ messages[0]['content'][0]['text'] }}<end>\n<assistant>"
+        original_vocab = tokenizer.get_vocab()
+        original_specials = copy.deepcopy(tokenizer.special_tokens_map)
+        original_backend = tokenizer.backend_tokenizer.to_str()
+        compiler = NativePromptCompiler(tokenizer, "<s>", 4)
+
+        item = compiler.compile("A [trigger] tiger <s> room [trigger] sky", require_trigger=True)
+        self.assertEqual(item.metadata["occurrence_count"], 3)
+        self.assertEqual(item.soft_bank_indices, list(range(4))*3)
+        self.assertEqual(len(item.soft_positions), 12)
+        self.assertNotIn(compiler.marker_id, item.ids)
+        self.assertTrue(all(index in original_vocab.values() for index in item.ids))
+        self.assertEqual(tokenizer.get_vocab(), original_vocab)
+        self.assertEqual(tokenizer.special_tokens_map, original_specials)
+        self.assertEqual(tokenizer.backend_tokenizer.to_str(), original_backend)
+        self.assertEqual(compiler.soft_tokenizer.special_tokens_map, original_specials)
+        self.assertTrue(compiler.soft_tokenizer.added_tokens_decoder[compiler.marker_id].special)
+        for token, token_id in original_vocab.items():
+            self.assertEqual(compiler.soft_tokenizer.convert_tokens_to_ids(token), token_id)
+        plain = compiler.compile("A tiger room sky")
+        serialized = plain.metadata["serialized_text"]
+        self.assertEqual(plain.ids, tokenizer(serialized, add_special_tokens=False)["input_ids"])
+        self.assertEqual(plain.ids, compiler.soft_tokenizer(serialized, add_special_tokens=False)["input_ids"])
+
     def test_repeated_markers_share_ordered_bank_and_original_tokenizer(self):
         tokenizer = FixtureTokenizer(); original = tokenizer.get_vocab()
         compiler = NativePromptCompiler(tokenizer, "<s>", 4, 3072)

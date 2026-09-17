@@ -3,7 +3,7 @@
 ## Status on 2026-09-17
 
 The standalone activator path is implemented. The complete local Gen2 test suite
-passes: **399 tests**, covering both the retained v1 path and the new v2 path.
+passes: **400 tests**, covering both the retained v1 path and the new v2 path.
 This establishes the tested software behavior; it does not establish style
 quality, GPU memory fit, or execution of the full quantized Ideogram models.
 
@@ -11,13 +11,45 @@ The user will run the smoke and pilot manually on the RTX PRO 6000 96 GB VM.
 No GPU training, model-weight download, or production environment modification
 was performed during this implementation.
 
+## Smoke1 tokenizer API correction
+
+The first VM smoke stopped during caption preflight, before model loading or
+optimizer updates. Gen2 called `add_special_tokens` with the Transformers 4
+keyword `replace_additional_special_tokens`, which the pinned Transformers
+5.5.3 API renamed to `replace_extra_special_tokens`.
+
+The compiler now registers its private `AddedToken` on the isolated tokenizer
+copy with `add_tokens(..., special_tokens=True)`, an API shared by both versions.
+Native special-token mappings and token IDs are preserved. The original
+tokenizer and model embedding table remain unchanged; the private marker ID is
+expanded into the existing safe IDs and learned-vector positions before Qwen.
+
+The added real fast-tokenizer regression verifies native vocabulary, special
+tokens and serialized tokenizer state remain unchanged, all three occurrences
+expand into 12 positions sharing four vectors, no private marker ID reaches
+the model input IDs, and ordinary no-marker tokenization remains identical.
+
+All seven text-compiler tests also pass in an isolated Python 3.10.10 environment
+with the repository's pinned Transformers 5.5.3 and tokenizers 0.22.2. The old
+keyword error was reproduced there before checking the repaired compiler. That
+environment contains no PyTorch or model weights and does not replace the
+global Python environment or the VM dependencies.
+The actual cached Qwen tokenizer also passes all 40 recorded captions under
+5.5.3, with the same token counts, protected truncation, 12 learned positions
+per caption, and explosion comparison lengths recorded below. The original
+tokenizer state and user-owned dataset manifest remain unchanged.
+
+The tracked `2026_09_17_gen2_ig4_r1X1dOn9mA2_v2_smoke2.yaml` changes only the
+two run-name labels from smoke1. Use it for a clean output directory: the
+failed attempt already wrote diagnostic events with a different run identity.
+
 ## Local checks
 
 The final command was:
 
 ```text
 python -B -m pytest extensions/gen2_trainer/tests -q -p no:cacheprovider
-399 passed in 8.81s
+400 passed in 9.71s
 ```
 
 The local environment uses Windows, Python 3.10, and PyTorch 2.8.0+cpu.

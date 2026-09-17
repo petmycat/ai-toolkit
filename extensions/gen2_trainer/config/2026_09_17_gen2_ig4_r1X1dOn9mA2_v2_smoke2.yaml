@@ -1,0 +1,177 @@
+# Gen2 v2: standalone in-place activator; no diffusion LoRA, TE adapter, or gates.
+# The human-written explosion prompt and VM paths are preserved from the working v1 config.
+# Four vectors are reused at each marker; this prompt has three markers (12 soft positions).
+# Physical batch 1 x accumulation 4 = effective batch 4; 96 GB memory fit must be checked on the VM.
+# gen2.optimizer is the only optimizer configuration; eps is deliberately 1e-8.
+# named_phrase is EVALUATION ONLY. Set it to null for an unnamed-style experiment.
+# Sampling is independent of saves. Retention is one rolling resume checkpoint plus final export.
+# Keep source captions intact; runtime truncation preserves markers/chat boundaries and is reported.
+# This file is tracked. See ../docs/v2.md before launching; real-backend validation is still required.
+---
+job: extension
+config:
+  name: gen2_ig4_r1X1dOn9mA2_v2_smoke2
+  process:
+  - type: gen2_trainer
+    training_folder: /data/train/models
+    device: cuda:0
+    trigger_word: <r1X1dOn9mA2>
+    datasets:
+    - folder_path: /data/train/datasets/en_ig4_r1X1dOn9mA2
+      caption_ext: json
+      caption_dropout_rate: 0.0
+      token_dropout_rate: 0.0
+      shuffle_tokens: false
+      cache_latents_to_disk: true
+      cache_text_embeddings: false
+      resolution:
+      - 768
+      - 1280
+      num_repeats: 1
+      num_workers: 0
+    train:
+      steps: 4
+      batch_size: 1
+      gradient_accumulation_steps: 4
+      train_unet: false
+      train_text_encoder: false
+      gradient_checkpointing: true
+      dtype: bf16
+      noise_scheduler: flowmatch
+      num_train_timesteps: 1000
+      max_grad_norm: 0.0
+      skip_first_sample: false
+      disable_sampling: false
+    model:
+      name_or_path: ideogram-ai/ideogram-4-fp8
+      arch: ideogram4
+      dtype: bf16
+      quantize: true
+      qtype: qfloat8
+      quantize_te: true
+      qtype_te: qfloat8
+      low_vram: false
+      layer_offloading: false
+      compile: false
+      unconditional_lora_path: null
+      model_kwargs:
+        text_encoder_path: Qwen/Qwen3-VL-8B-Instruct
+        max_text_length: 3072
+    save:
+      dtype: float32
+      save_every: 2
+      max_step_saves_to_keep: 1
+    sample:
+      sampler: flowmatch
+      sample_every: 2
+      sample_start_step: 0
+      width: 1536
+      height: 1024
+      prompts:
+      - '{"high_level_description":"An enormous explosion rises from a destroyed urban and industrial district beside
+        a divided multilane highway. The view is from high above the roadway, looking obliquely toward the explosion
+        and distant mountains. A cluster of fireballs occupies the center-left, dense smoke rises across the upper
+        center, ruined buildings cover both sides of the highway, and burned vehicles and debris are scattered along
+        the roads. No people are visible.","style_description":{"aesthetics":"[trigger] style aesthetics","lighting":"Overcast
+        daylight combined with intense orange light from the explosion, producing illuminated smoke, glowing debris,
+        subdued surroundings, and localized reflections on road surfaces and wreckage.","medium":"[trigger] style
+        medium","art_style":"[trigger] style","color_palette":["#1C2021","#3D4141","#777B77","#B5B8AF","#6A3927","#D95A18","#FFB12B"]},"compositional_deconstruction":{"background":"A
+        cloudy sky spans the top of the frame behind a distant chain of low mountains. An urban and industrial valley
+        extends across the middle distance, with residential buildings on the left and large storage tanks, warehouses,
+        and industrial structures on the right. The camera is elevated above a divided highway in the foreground
+        and points toward the horizon. The roads begin wide along the bottom edge and converge toward the explosion
+        near the center-left. The explosion blocks much of the central background, while its smoke expands upward
+        and slightly right.","elements":[{"type":"obj","bbox":[32,210,585,571],"desc":"A towering cluster of connected
+        fireballs centered slightly left of the image midpoint. Multiple rounded lobes of flame stack vertically
+        and spread outward, with the widest burning area close to ground level. The base reaches across the roads
+        and surrounding ruins."},{"type":"obj","bbox":[0,143,508,742],"desc":"A massive smoke plume rising behind
+        and around the fireballs. Thick black smoke forms a tall column above the explosion, dark gray smoke expands
+        across the upper center and upper right, and lighter gray smoke spreads near ground level on both sides."},{"type":"obj","bbox":[0,0,321,1000],"desc":"An
+        overcast sky occupying the upper portion of the frame. It remains visible around the smoke plume, especially
+        in the upper-left and upper-right corners."},{"type":"obj","bbox":[190,0,352,249],"desc":"Low mountain ridges
+        extending across the left horizon behind the urban area. Several overlapping ridgelines recede into the
+        distance."},{"type":"obj","bbox":[187,703,327,1000],"desc":"A chain of low mountains across the right horizon,
+        with a prominent ridge near the upper-right quadrant and lower ridges receding behind it."},{"type":"obj","bbox":[230,0,592,244],"desc":"A
+        dense group of low-rise residential and commercial buildings along the left side of the blast area. Several
+        buildings closest to the explosion are damaged, partially collapsed, or obscured by smoke."},{"type":"obj","bbox":[255,724,459,1000],"desc":"An
+        industrial complex in the right middle distance containing rows of pale cylindrical storage tanks, long
+        warehouse roofs, utility structures, and connecting service areas."},{"type":"obj","bbox":[392,681,927,1000],"desc":"A
+        broad field of destroyed industrial and urban buildings covering the right side of the scene. Roofs and
+        walls have collapsed, skeletal concrete and steel frames remain standing, and small fires burn among rubble
+        and wrecked vehicles."},{"type":"obj","bbox":[432,0,1000,378],"desc":"The left carriageway of a divided
+        multilane highway. It enters from the lower-left and lower-center foreground and narrows toward the explosion.
+        Lane markings remain visible beneath scattered rubble, and several burned vehicles are positioned in different
+        lanes."},{"type":"obj","bbox":[519,263,1000,656],"desc":"A second multilane roadway running from the bottom
+        center toward the base of the explosion. A narrow central barrier and rail-like divider separate it from
+        the left carriageway. Burned cars, fragments, and patches of fire are distributed along its lanes."},{"type":"obj","bbox":[517,458,1000,1000],"desc":"The
+        right carriageway of the highway, beginning near the center of the blast area and widening toward the entire
+        lower-right edge. A concrete median separates it from the central roadway. Burned vehicles, debris, damaged
+        roadside structures, and ruined buildings line both sides."},{"type":"obj","bbox":[515,313,606,450],"desc":"A
+        long cylindrical tanker trailer lying diagonally across lanes immediately in front of the explosion. Its
+        left end is closer to the blast, and its right end points toward the lower-right."},{"type":"obj","bbox":[572,0,1000,1000],"desc":"Scattered
+        debris covering the foreground highways and roadside areas. The debris includes broken structural pieces,
+        vehicle fragments, ash, rubble, and small isolated fires."},{"type":"obj","bbox":[572,115,984,941],"desc":"Multiple
+        burned and damaged vehicles distributed across the foreground lanes. Individual cars and trucks face different
+        directions, including a dark wreck near the lower-left, damaged vehicles along the center lanes, and several
+        blackened cars on the right roadway."},{"type":"obj","bbox":[716,581,1000,765],"desc":"A tall double-arm
+        streetlight rising from the lower foreground near the highway median. Its pole leans slightly within the
+        perspective and its two lamp arms extend left and right."}]}}'
+      neg: ''
+      seed: 42
+      walk_seed: false
+      guidance_scale: 3.0
+      sample_steps: 28
+    gen2:
+      schema_version: 2.0.0
+      spec_path: docs/specs/gen2_trainer_v2.md
+      expected_spec_sha256: ec3e254c6638f1781faa449114acc17c1cc8aa454e6a5e79a4032b04ec4c7ae2
+      execution:
+        training_seed: 20260917
+        encoder_gradient_checkpointing: true
+        dit_attention_backend: native
+        deterministic_algorithms: false
+      conditioning:
+        num_tokens: 4
+        initializer_seed: 271828
+        initialization_sample_size: 4096
+        overflow_policy: truncate
+      optimizer:
+        type: adamw
+        lr: 0.0005
+        eps: 1.0e-08
+        betas:
+        - 0.9
+        - 0.999
+        weight_decay: 0.0
+      inference:
+        unconditional_model_path: ideogram-ai/ideogram-4-fp8
+      data:
+        content_groups_file: null
+        reject_train_validation_duplicates: true
+      diagnostics:
+        time_bin_edges:
+        - 0.0
+        - 0.1
+        - 0.25
+        - 0.5
+        - 0.75
+        - 0.9
+        - 1.0
+        mechanical_probes: true
+      recording:
+        flush_every_updates: 1
+        rotate_mb: 64
+        compression: none
+        writer_queue_records: 4096
+        max_core_recording_mb: 4096
+      evaluation:
+        named_phrase: Ghibli anime
+        seeds:
+        - 42
+        - 43
+        make_contact_sheets: true
+      checkpoint:
+        resume_from: null
+meta:
+  name: 'gen2_ig4_r1X1dOn9mA2_v2_smoke2'
+  version: 2.0.0

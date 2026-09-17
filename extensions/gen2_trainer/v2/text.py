@@ -42,7 +42,12 @@ class NativePromptCompiler:
             # Lightweight tokenizer fixtures can implement the same reserved
             # special-token API; real Qwen installations require tokenizers.
             marker = INTERNAL_MARKER
-        self.soft_tokenizer.add_special_tokens({"additional_special_tokens": [marker]}, replace_additional_special_tokens=False)
+        # Register only on the isolated tokenizer. add_tokens has the same API
+        # in Transformers 4/5 and preserves native special-token attributes;
+        # add_special_tokens renamed its replacement keyword in Transformers 5.
+        # The private ID is expanded into safe IDs below, never sent to Qwen's
+        # unchanged vocabulary embedding table.
+        self.soft_tokenizer.add_tokens([marker], special_tokens=True)
         self.marker_id = self.soft_tokenizer.convert_tokens_to_ids(INTERNAL_MARKER)
         if not isinstance(self.marker_id, int) or self.marker_id in tokenizer.get_vocab().values():
             raise ValueError("Isolated tokenizer did not allocate a distinct internal marker ID")
