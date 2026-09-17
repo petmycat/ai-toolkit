@@ -1,5 +1,18 @@
 # Gen2 trainer for Ideogram 4
 
+## V2: standalone activator
+
+The token-only v2 implementation uses `gen2.schema_version: "2.0.0"` with the
+same `type: gen2_trainer` registration. Start with the
+[v2 guide](docs/v2.md), [v2 smoke](config/smoke_gen2_ideogram4_v2.example.yaml),
+and [500-update pilot](config/pilot_gen2_ideogram4_v2.example.yaml).
+Its vectors occupy the original trigger positions; both Qwen and Ideogram stay
+frozen. V2 has its own lifecycle, one optimizer, small token packages, and paired
+base/named-phrase/initial/learned visual comparisons. Real CUDA and visual
+acceptance remain VM checks. The sections below document **v1**.
+
+## V1
+
 An ai-toolkit extension for one target style, trained from captioned images. It
 implements the approved v1 specification with four coupled parameter families:
 diffusion LoRA, normalized learned suffix tokens, masked encoder LoRA, and

@@ -1,5 +1,8 @@
 # Validation record
 
+For the standalone activator implementation, see the
+[v2 validation record](docs/v2_validation.md). The entries below document v1.
+
 ## Status on 2026-09-16
 
 **Retry2 preflight found one 3,233-token caption among 41 inputs, exceeding the

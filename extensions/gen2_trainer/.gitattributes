@@ -1,1 +1,3 @@
 docs/specs/gen2_trainer_v1.md -text
+# Preserve the approved bytes, including Markdown's intentional hard breaks.
+docs/specs/gen2_trainer_v2.md -text whitespace=-blank-at-eol

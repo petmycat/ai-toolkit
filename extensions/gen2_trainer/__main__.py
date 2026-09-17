@@ -11,6 +11,18 @@ from pathlib import Path
 import sys
 
 
+def versioned_config(raw):
+    if raw.get("gen2", {}).get("schema_version") == "2.0.0":
+        from .v2.config import resolve_process_config, SPEC_SHA256
+    else:
+        from .config import resolve_process_config, SPEC_SHA256
+    return resolve_process_config(raw), SPEC_SHA256
+
+
+def is_v2_package(path):
+    return json.loads((Path(path) / "manifest.json").read_text(encoding="utf-8")).get("schema_version") == "2.0.0"
+
+
 def read_config(path, process_index=0):
     from toolkit.config import get_config
     # Native lightweight parser owns ${ENV}, [name] and exponent handling.
@@ -51,7 +63,7 @@ def parser():
     infer.add_argument("--prompt", required=True)
     infer.add_argument("--output", required=True, help="PNG output; JSON metadata is saved beside it")
     infer.add_argument("--device")
-    infer.add_argument("--mode", choices=MODES,
+    infer.add_argument("--mode", choices=list(dict.fromkeys([*MODES, "learned", "init", "named"])),
         help="Omit for production literal-trigger routing")
     infer.add_argument("--width", type=int, default=1024)
     infer.add_argument("--height", type=int, default=1024)
@@ -78,24 +90,24 @@ def parser():
 def main(argv=None):
     arguments = parser().parse_args(argv)
     if arguments.command == "validate":
-        from .config import resolve_process_config, SPEC_SHA256
         from .recording import assert_writable_path
         import yaml
         raw, name = read_config(arguments.config, arguments.process_index)
-        resolved = resolve_process_config(raw)
+        resolved, spec_sha256 = versioned_config(raw)
         if arguments.output:
             output = assert_writable_path(arguments.output)
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_text(yaml.safe_dump(resolved, sort_keys=False, allow_unicode=True), encoding="utf-8")
-        print(json.dumps({"valid": True, "name": name, "spec_sha256": SPEC_SHA256,
+        print(json.dumps({"valid": True, "name": name, "spec_sha256": spec_sha256,
             "resolved": resolved, "models_loaded": False}, indent=2, ensure_ascii=False))
     elif arguments.command == "check-captions":
-        from .config import resolve_process_config
         from .data import preflight_datasets
         from .recording import assert_writable_path, write_json
         from .text_preflight import build_token_report, load_tokenizer
         raw, name = read_config(arguments.config, arguments.process_index)
-        resolved = resolve_process_config(raw)
+        resolved, _ = versioned_config(raw)
+        if resolved["gen2"]["schema_version"] == "2.0.0":
+            from .v2.process import build_token_report
         output = assert_writable_path(arguments.output) if arguments.output else None
         manifest = preflight_datasets(resolved)
         tokenizer_path = resolved["model"]["model_kwargs"].get("text_encoder_path", "Qwen/Qwen3-VL-8B-Instruct")
@@ -112,9 +124,14 @@ def main(argv=None):
         print(json.dumps(report, indent=2, ensure_ascii=False))
         return 0 if report["passed"] else 1
     elif arguments.command == "inspect":
-        from .checkpointing import load_manifest
-        from .config import SPEC_SHA256
-        print(json.dumps(load_manifest(arguments.checkpoint, expected_spec_sha256=SPEC_SHA256), indent=2, ensure_ascii=False))
+        if is_v2_package(arguments.checkpoint):
+            from .v2.checkpoint import load_manifest
+            manifest = load_manifest(arguments.checkpoint)
+        else:
+            from .checkpointing import load_manifest
+            from .config import SPEC_SHA256
+            manifest = load_manifest(arguments.checkpoint, expected_spec_sha256=SPEC_SHA256)
+        print(json.dumps(manifest, indent=2, ensure_ascii=False))
     elif arguments.command == "infer":
         from .package import load_package
         from .recording import assert_writable_path, write_json
@@ -124,11 +141,19 @@ def main(argv=None):
         metadata_path = output.with_suffix(".json")
         if output.exists() or metadata_path.exists():
             raise ValueError("Image or metadata output already exists; choose a new output path")
+        v2 = is_v2_package(arguments.checkpoint)
+        if v2:
+            from .v2.inference import load_package
+            if arguments.strength is not None:
+                raise ValueError("V2 has no diffusion LoRA strength; omit --strength")
         package = load_package(arguments.checkpoint, device=arguments.device)
         try:
-            image, metadata = package.generate(arguments.prompt, mode=arguments.mode,
+            options = dict(mode=arguments.mode,
                 width=arguments.width, height=arguments.height, seed=arguments.seed,
-                steps=arguments.steps, guidance=arguments.guidance, strength=arguments.strength)
+                steps=arguments.steps, guidance=arguments.guidance)
+            if not v2:
+                options["strength"] = arguments.strength
+            image, metadata = package.generate(arguments.prompt, **options)
             output.parent.mkdir(parents=True, exist_ok=True)
             image.save(output)
             write_json(metadata_path, metadata)
@@ -137,6 +162,11 @@ def main(argv=None):
         print(json.dumps({"image": str(output), "metadata": str(metadata_path)}, indent=2))
     elif arguments.command == "summarize":
         from .diagnostics import summarize_run
+        manifest_path = Path(arguments.run_dir) / "run_manifest.json"
+        if manifest_path.is_file():
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if manifest.get("resolved_config", {}).get("gen2", {}).get("schema_version") == "2.0.0":
+                from .v2.process import summarize_run
         print(json.dumps(summarize_run(arguments.run_dir), indent=2, ensure_ascii=False))
     elif arguments.command == "export":
         from .diagnostics import export_diagnostics
@@ -145,6 +175,8 @@ def main(argv=None):
     elif arguments.command == "acceptance":
         from .acceptance import run_acceptance
         raw, name = read_config(arguments.config, arguments.process_index)
+        if raw.get("gen2", {}).get("schema_version") == "2.0.0":
+            from .v2.acceptance import run_acceptance
         report = run_acceptance(raw, arguments.output, split_after=arguments.split_after,
                                 atol=arguments.atol, rtol=arguments.rtol)
         print(json.dumps(report, indent=2, ensure_ascii=False))

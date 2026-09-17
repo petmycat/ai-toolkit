@@ -355,6 +355,12 @@ class Gen2Runner:
 
 class Gen2TrainProcess:
     """Compose native BaseTrainProcess without inheriting its SD stepping loop."""
+    def __new__(cls, process_id, job, config):
+        if config.get("gen2", {}).get("schema_version") == "2.0.0":
+            from .v2.process import V2TrainProcess
+            return V2TrainProcess(process_id, job, config)
+        return super().__new__(cls)
+
     def __init__(self, process_id, job, config):
         resolved = resolve_process_config(config)
         name = config.get("name", job.name)
