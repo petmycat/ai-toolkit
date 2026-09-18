@@ -74,9 +74,10 @@ def select_gen2(paths):
     return (item for item in original(paths) if item.name == 'gen2_trainer')
 with patch.object(native.pkgutil, 'iter_modules', select_gen2):
     found = native.get_all_extensions()
-assert len(found) == 1 and found[0].uid == 'gen2_trainer'
-assert issubclass(found[0], native.Extension)
+assert {extension.uid for extension in found} == {'gen2_trainer', 'gen2_v2_diagnostic'}
+assert all(issubclass(extension, native.Extension) for extension in found)
 assert 'extensions.gen2_trainer.process' not in sys.modules
+assert 'extensions.gen2_trainer.v2.diagnostic_process' not in sys.modules
 assert 'torch' not in sys.modules
 assert 'transformers' not in sys.modules
 """
