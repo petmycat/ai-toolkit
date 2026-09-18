@@ -1,0 +1,45 @@
+# Retry after the scalar-buffer hashing fix; source and measurements are unchanged.
+# Run with the same VM environment and entry point used for training:
+# python run.py config/2026_09_18_gen2_ig4_r1X1dOn9mA2_v2_diagnostic1_retry1.yaml
+# The source package supplies its exact model, dataset and activator configuration.
+# Outputs are separate; the source export and training optimizer are never updated.
+# Each retry needs a fresh config.name to keep its evidence separate.
+---
+job: extension
+config:
+  name: gen2_ig4_r1X1dOn9mA2_v2_diagnostic1_retry1
+  process:
+    - type: gen2_v2_diagnostic
+      source_checkpoint: /data/train/models/gen2_ig4_r1X1dOn9mA2_v2_train_500/gen2_v2/checkpoints/inference_final
+      training_folder: /data/train/models
+      device: cuda:0
+      diagnostic:
+        # Comparison reference only. It is never used to initialize/train tokens.
+        named_phrase: Ghibli anime
+        seed: 20260918
+        # Four existing native images per resolution, spread by caption length.
+        # With the source's two resolutions: 8 examples x 2 noises x 5 timesteps
+        # = 80 fixed packets; four modes = 320 paired diffusion forwards.
+        examples_per_resolution: 4
+        noise_seeds: [1729, 1730]
+        noise_fractions: [0.1, 0.3, 0.5, 0.7, 0.9]
+        # Fresh temporary AdamW runs from initial and learned banks separately,
+        # using the source optimizer settings and four spread fixed packets.
+        # These are diagnostic updates; no training checkpoint is published.
+        descent_steps: 12
+        descent_packet_count: 4
+        # Real-model gradient comparisons use the smallest-resolution, shortest
+        # selected native caption; CUDA OOM is reported as inconclusive.
+        gradient_cosine_min: 0.999
+        gradient_relative_l2_max: 0.02
+        prediction_relative_l2_max: 0.02
+        loss_relative_error_max: 0.02
+        # Focused reference checks use actual captured inputs and the SAME
+        # represented weights; they do not compare against different BF16 weights.
+        linear_modules_per_model: 2
+        linear_input_rows: 4
+        linear_seed: 1729
+        max_packet_memory_mb: 512
+meta:
+  name: gen2_ig4_r1X1dOn9mA2_v2_diagnostic1_retry1
+  version: 1.0.0

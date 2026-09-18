@@ -27,12 +27,17 @@ def job(tmp_path, monkeypatch):
     source_root = tmp_path / "source" / "gen2_v2" / "checkpoints"
     manager = V2CheckpointManager(source_root, specification_path(source_config), SPEC_SHA256)
     metadata = {"name": "source", "resolved_config": source_config, **identities}
-    export = manager.export(BackendFixture(), metadata, logical_update=500)
+    source_backend = BackendFixture()
+    # Include the scalar buffers present in the real TokenBank. Matrix-only
+    # fixtures miss failures in whole-state hashing before measurements begin.
+    source_backend.tokens.register_buffer("initial_typical_norm", torch.tensor(1.3932))
+    source_backend.tokens.register_buffer("initializer_seed", torch.tensor(271828, dtype=torch.int64))
+    export = manager.export(source_backend, metadata, logical_update=500)
     source_bytes = {path.name: path.read_bytes() for path in export.iterdir()}
     loaded = []
 
     def fake_load(runner):
-        runner.backend = BackendFixture()
+        runner.backend = deepcopy(source_backend)
         runner.recorder = Recorder(runner.root, "fixture-diagnostic")
         runner.engine = SimpleNamespace(logical_update=0, optimizer=SimpleNamespace(state={}))
         runner.metadata = deepcopy(identities)

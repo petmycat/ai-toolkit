@@ -1,5 +1,7 @@
 from copy import deepcopy
+import hashlib
 from pathlib import Path
+import struct
 from types import SimpleNamespace
 
 import pytest
@@ -17,6 +19,34 @@ from extensions.gen2_trainer.v2.diagnostic_process import inherited_config
 def minimal():
     return {"type": "gen2_v2_diagnostic", "source_checkpoint": "/vm/source/inference_final",
             "training_folder": "/vm/results"}
+
+
+@pytest.mark.parametrize("dtype,value,expected_bytes", [
+    (torch.float32, 1.25, struct.pack("=f", 1.25)),
+    (torch.float64, 1.25, struct.pack("=d", 1.25)),
+    (torch.bfloat16, 1.25, struct.pack("=H", 0x3fa0)),
+    (torch.int64, 271828, struct.pack("=q", 271828)),
+    (torch.bool, True, b"\x01"),
+])
+def test_tensor_digest_handles_scalar_buffers_without_losing_shape_or_dtype(dtype, value, expected_bytes):
+    scalar = torch.tensor(value, dtype=dtype)
+    expected = hashlib.sha256(str(((), dtype)).encode() + expected_bytes).hexdigest()
+    assert tensor_digest(scalar) == expected
+    assert tensor_digest(scalar) != tensor_digest(scalar.reshape(1))
+    assert scalar.ndim == 0
+    assert scalar.dtype == dtype
+    assert scalar.item() == value
+
+
+def test_tensor_digest_preserves_existing_array_hashes_and_handles_empty_noncontiguous_inputs():
+    array = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    legacy = hashlib.sha256(str((tuple(array.shape), array.dtype)).encode()
+                            + array.view(torch.uint8).numpy().tobytes()).hexdigest()
+    assert tensor_digest(array) == legacy
+    assert tensor_digest(array.T) == tensor_digest(array.T.contiguous())
+    empty = torch.empty(0, dtype=torch.bfloat16)
+    expected = hashlib.sha256(str(((0,), empty.dtype)).encode()).hexdigest()
+    assert tensor_digest(empty) == expected
 
 
 def test_strict_config_is_idempotent_and_rejects_typos_and_unbounded_work():

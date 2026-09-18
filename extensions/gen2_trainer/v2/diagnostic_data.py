@@ -12,7 +12,10 @@ from ..diagnostics import isolated_rng
 def tensor_digest(value):
     value = value.detach().cpu().contiguous()
     digest = hashlib.sha256(str((tuple(value.shape), value.dtype)).encode())
-    digest.update(value.view(torch.uint8).numpy().tobytes())
+    # Dtype reinterpretation requires a dimension when element sizes differ.
+    # TokenBank also stores scalar norm/seed buffers. Preserve their original
+    # shape in the header above, then flatten only for the raw-byte view.
+    digest.update(value.reshape(-1).view(torch.uint8).numpy().tobytes())
     return digest.hexdigest()
 
 
